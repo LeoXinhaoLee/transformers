@@ -1,6 +1,7 @@
 # Copyright (c) 2023, Tri Dao, Albert Gu.
 
 import argparse
+import pdb
 import time
 import json
 
@@ -12,10 +13,14 @@ from einops import rearrange
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+from transformers.models.ttt.modeling_ttt import TttConfig, TttForCausalLM
+from transformers.models.ttt.configuration_ttt import TTT_STANDARD_CONFIGS
 
 
 parser = argparse.ArgumentParser(description="Generation benchmarking")
-parser.add_argument("--model-name", type=str, default="state-spaces/mamba-130m")
+# parser.add_argument("--model-name", type=str, default="state-spaces/mamba-130m")
+# parser.add_argument("--model-name", type=str, default="openai-community/gpt2")
+parser.add_argument("--model-name", type=str, default="ttt-125m")
 parser.add_argument("--prompt", type=str, default=None)
 parser.add_argument("--promptlen", type=int, default=100)
 parser.add_argument("--genlen", type=int, default=100)
@@ -31,9 +36,17 @@ dtype = torch.float16
 
 print(f"Loading model {args.model_name}")
 is_mamba = args.model_name.startswith("state-spaces/mamba-")
+is_ttt = args.model_name.startswith("ttt")
 if is_mamba:
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
     model = MambaLMHeadModel.from_pretrained(args.model_name, device=device, dtype=dtype)
+elif is_ttt:
+    ttt_size = args.model_name.split('-')[-1]
+    if ttt_size not in TTT_STANDARD_CONFIGS.keys():
+        raise NotImplementedError(f"TTT Config {args.model_name} Not Implemented!")
+    tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
+    ttt_config = TttConfig(tie_word_embeddings=True, **TTT_STANDARD_CONFIGS[ttt_size])
+    model = TttForCausalLM(ttt_config).to(device=device, dtype=dtype)
 else:
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     model = AutoModelForCausalLM.from_pretrained(args.model_name, device_map={"": device}, torch_dtype=dtype)
@@ -55,6 +68,7 @@ if is_mamba:
     fn = lambda: model.generate(
         input_ids=input_ids,
         max_length=max_length,
+        # min_length=max_length,  # @xinhao: Make sure an output has length=prompt_len+gen_len. Then fix seed for benchmarking speed.
         cg=True,
         return_dict_in_generate=True,
         output_scores=True,
@@ -68,6 +82,7 @@ else:
         input_ids=input_ids,
         attention_mask=attn_mask,
         max_length=max_length,
+        min_length=max_length,
         return_dict_in_generate=True,
         pad_token_id=tokenizer.eos_token_id,
         do_sample=True,
@@ -76,6 +91,7 @@ else:
         top_p=args.topp,
     )
 out = fn()
+print(out.sequences.shape)
 if args.prompt is not None:
     print(tokenizer.batch_decode(out.sequences.tolist()))
 
