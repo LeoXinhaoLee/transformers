@@ -167,3 +167,6 @@ tags
 
 # ruff
 .ruff_cache
+
+# Xinhao's dev
+*NLP*.sh

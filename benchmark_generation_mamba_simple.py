@@ -19,15 +19,16 @@ from transformers.models.ttt.configuration_ttt import TTT_STANDARD_CONFIGS
 
 parser = argparse.ArgumentParser(description="Generation benchmarking")
 # parser.add_argument("--model-name", type=str, default="state-spaces/mamba-130m")
-# parser.add_argument("--model-name", type=str, default="openai-community/gpt2")
-parser.add_argument("--model-name", type=str, default="ttt-125m")
+parser.add_argument("--model-name", type=str, default="openai-community/gpt2")
+# parser.add_argument("--model-name", type=str, default="ttt-125m")
 parser.add_argument("--prompt", type=str, default=None)
-parser.add_argument("--promptlen", type=int, default=100)
+parser.add_argument("--promptlen", type=int, default=1)
 parser.add_argument("--genlen", type=int, default=100)
 parser.add_argument("--temperature", type=float, default=1.0)
 parser.add_argument("--topk", type=int, default=1)
 parser.add_argument("--topp", type=float, default=1.0)
 parser.add_argument("--batch", type=int, default=1)
+parser.add_argument("--attn_impl", type=str, default='sdpa')  # 'eager' | 'sdpa' | 'flash_attention_2'
 args = parser.parse_args()
 
 repeats = 3
@@ -49,7 +50,10 @@ elif is_ttt:
     model = TttForCausalLM(ttt_config).to(device=device, dtype=dtype)
 else:
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    model = AutoModelForCausalLM.from_pretrained(args.model_name, device_map={"": device}, torch_dtype=dtype)
+    model = AutoModelForCausalLM.from_pretrained(args.model_name,
+                                                 attn_implementation=args.attn_impl,
+                                                 device_map={"": device},
+                                                 torch_dtype=dtype)
 model.eval()
 print(f"Number of parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
 
