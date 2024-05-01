@@ -112,7 +112,7 @@ if is_mamba:
         return_dict_in_generate=True,
         output_scores=False,
         enable_timing=False,
-        temperature=1.0,
+        temperature=1.0,  # @xinhao: mamba src code: shortcut for greedy
         top_k=0,
         top_p=0,
     )
@@ -125,10 +125,6 @@ else:
         return_dict_in_generate=True,
         pad_token_id=tokenizer.eos_token_id,
         do_sample=False,
-        num_beams=1,
-        temperature=1.0,
-        top_k=0,
-        top_p=0,
     )
 out = fn()
 logger.info(f"output.sequences.shape: {out.sequences.shape}")
