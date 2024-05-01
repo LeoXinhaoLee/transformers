@@ -30,9 +30,10 @@ TTT_STANDARD_CONFIGS = {
     "1b": {
         "hidden_size": 2048,
         "intermediate_size": 5504,
-        "num_hidden_layers": 22,
-        "num_attention_heads": 16,
+        "num_hidden_layers": 24,
+        "num_attention_heads": 32,
         "rms_norm_eps": 1e-6,
+        "tie_word_embeddings": True,
     },
     "125m": {
         "hidden_size": 768,
@@ -40,6 +41,7 @@ TTT_STANDARD_CONFIGS = {
         "num_hidden_layers": 12,
         "num_attention_heads": 12,
         "rms_norm_eps": 1e-6,
+        "tie_word_embeddings": True,
     },
 }
 
