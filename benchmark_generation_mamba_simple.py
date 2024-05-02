@@ -28,7 +28,7 @@ parser.add_argument("--temperature", type=float, default=1.0)
 parser.add_argument("--topk", type=int, default=1)
 parser.add_argument("--topp", type=float, default=1.0)
 parser.add_argument("--batch", type=int, default=1)
-parser.add_argument("--attn_impl", type=str, default='sdpa')  # 'eager' | 'sdpa' | 'flash_attention_2'
+parser.add_argument("--attn_impl", type=str, default='eager')  # 'eager' | 'sdpa' | 'flash_attention_2'
 args = parser.parse_args()
 
 repeats = 3
@@ -51,7 +51,7 @@ elif is_ttt:
 else:
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     model = AutoModelForCausalLM.from_pretrained(args.model_name,
-                                                 attn_implementation=args.attn_impl,
+                                                 # attn_implementation=args.attn_impl,
                                                  device_map={"": device},
                                                  torch_dtype=dtype)
 model.eval()
@@ -59,7 +59,7 @@ print(f"Number of parameters: {sum(p.numel() for p in model.parameters() if p.re
 
 torch.random.manual_seed(0)
 if args.prompt is None:
-    input_ids = torch.randint(1, 1000, (args.batch, args.promptlen), dtype=torch.long, device="cuda")
+    input_ids = torch.randint(1, 100, (args.batch, args.promptlen), dtype=torch.long, device="cuda")
     attn_mask = torch.ones_like(input_ids, dtype=torch.long, device="cuda")
 else:
     tokens = tokenizer(args.prompt, return_tensors="pt")
@@ -67,7 +67,6 @@ else:
     attn_mask = tokens.attention_mask.to(device=device)
 
 max_length = input_ids.shape[1] + args.genlen
-
 if is_mamba:
     fn = lambda: model.generate(
         input_ids=input_ids,
@@ -104,5 +103,8 @@ start = time.time()
 for _ in range(repeats):
     fn()
 torch.cuda.synchronize()
+avg_time = (time.time() - start) / repeats
 print(f"Prompt length: {len(input_ids[0])}, generation length: {len(out.sequences[0]) - len(input_ids[0])}")
 print(f"{args.model_name} prompt processing + decoding time: {(time.time() - start) / repeats * 1000:.0f}ms")
+print(f"Throughput (total tok = prefill + decode): {args.batch * len(out.sequences[0]) / avg_time:.3f} tokens / s")
+print(f"Throughput (total tok = decode): {args.batch * (len(out.sequences[0])  - len(input_ids[0])) / avg_time:.3f} tokens / s")

@@ -1,4 +1,21 @@
-# Copyright (c) 2023, Tri Dao, Albert Gu.
+'''Benchmarking Prefilling and Decoding
+E.g.,
+# Decoding
+python benchmark_prefill_decode.py --logdir ./exp/decode_ttt_125m \
+                                   --model-name ttt-125m \
+                                   --mode decode \
+                                   --batch 64 \
+                                   --promptlen 1 \
+                                   --genlen 512
+# Prefilling
+python benchmark_prefill_decode.py --logdir ./exp/prefill_ttt_125m \
+                                   --model-name ttt-125m \
+                                   --mode prefill \
+                                   --batch 64 \
+                                   --promptlen 512 \
+                                   --genlen 0
+'''
+import gc
 import pdb
 
 import argparse
@@ -13,7 +30,8 @@ import torch.nn.functional as F
 
 from einops import rearrange
 
-from transformers import AutoTokenizer, AutoModelForCausalLM, MambaForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, MambaForCausalLM, AutoConfig
+from transformers import GPT2Model, GPT2LMHeadModel
 
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from transformers.models.ttt.modeling_ttt import TttConfig, TttForCausalLM
@@ -23,11 +41,12 @@ from transformers.models.ttt.configuration_ttt import TTT_STANDARD_CONFIGS
 parser = argparse.ArgumentParser(description="Generation benchmarking")
 parser.add_argument("--logdir", type=str, default="./exp/clean")
 parser.add_argument("--model-name", type=str, default="openai-community/gpt2")
-# state-spaces/mamba-130m | openai-community/gpt2-xl | state-spaces/mamba-1.4b
+# state-spaces/mamba-130m | EleutherAI/pythia-1.4b | state-spaces/mamba-1.4b | ttt-125m | ttt-1b
+parser.add_argument("--mode", type=str, default="prefill", choices=["prefill", "decode"])
 parser.add_argument("--promptlen", type=int, default=1)
 parser.add_argument("--genlen", type=int, default=128)
 parser.add_argument("--batch", type=int, default=1)
-parser.add_argument("--attn_impl", type=str, default='eager')  # 'eager' | 'sdpa' | 'flash_attention_2'
+parser.add_argument("--attn_impl", type=str, default='flash_attention_2')  # 'eager' | 'flash_attention_2'
 args = parser.parse_args()
 
 def print_args(args):
@@ -78,6 +97,10 @@ elif is_ttt:
     model = TttForCausalLM(ttt_config).to(device=device, dtype=dtype)
 else:
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    # config = AutoConfig.from_pretrained(args.model_name)
+    # config.n_positions = 4096
+    # config.attn_implementation = args.attn_impl
+    # model = GPT2LMHeadModel(config).to(device=device, dtype=dtype)
     model = AutoModelForCausalLM.from_pretrained(args.model_name,
                                                  attn_implementation=args.attn_impl,
                                                  device_map={"": device},
@@ -88,46 +111,74 @@ logger.info(f"Number of parameters: {sum(p.numel() for p in model.parameters() i
 torch.random.manual_seed(0)
 input_ids = torch.randint(1, 1000, (args.batch, args.promptlen), dtype=torch.long, device="cuda")
 attn_mask = torch.ones_like(input_ids, dtype=torch.long, device="cuda")
-
 max_length = input_ids.shape[1] + args.genlen
 
-if is_mamba:
-    # fn = lambda: model.generate(
-    #     input_ids=input_ids,
-    #     attention_mask=attn_mask,
-    #     max_length=max_length,
-    #     min_length=max_length,
-    #     return_dict_in_generate=True,
-    #     pad_token_id=tokenizer.eos_token_id,
-    #     do_sample=False,
-    #     num_beams=1,
-    #     temperature=1.0,
-    #     top_k=0,
-    #     top_p=0,
-    # )
-    fn = lambda: model.generate(
-        input_ids=input_ids,
-        max_length=max_length,
-        cg=True,
-        return_dict_in_generate=True,
-        output_scores=False,
-        enable_timing=False,
-        temperature=1.0,  # @xinhao: mamba src code: shortcut for greedy
-        top_k=0,
-        top_p=0,
-    )
+if args.mode == 'decode':
+    if is_mamba:
+        # fn = lambda: model.generate(
+        #     input_ids=input_ids,
+        #     attention_mask=attn_mask,
+        #     max_length=max_length,
+        #     min_length=max_length,
+        #     return_dict_in_generate=True,
+        #     pad_token_id=tokenizer.eos_token_id,
+        #     do_sample=False,
+        #     num_beams=1,
+        #     temperature=1.0,
+        #     top_k=0,
+        #     top_p=0,
+        # )
+        fn = lambda: model.generate(
+            input_ids=input_ids,
+            max_length=max_length,
+            cg=True,
+            return_dict_in_generate=True,
+            output_scores=False,
+            enable_timing=False,
+            temperature=1.0,  # @xinhao: mamba src code: shortcut for greedy
+            top_k=0,
+            top_p=0,
+        )
+    elif is_ttt:
+        fn = lambda: model.generate(
+            input_ids=input_ids,
+            attention_mask=attn_mask,
+            use_cache=True,  # @xinhao: efficient decoding
+            max_length=max_length,
+            min_length=max_length,
+            return_dict_in_generate=True,
+            pad_token_id=tokenizer.eos_token_id,
+            do_sample=False,
+        )
+    else:
+        fn = lambda: model.generate(
+            input_ids=input_ids,
+            attention_mask=attn_mask,
+            max_length=max_length,
+            min_length=max_length,
+            return_dict_in_generate=True,
+            pad_token_id=tokenizer.eos_token_id,
+            do_sample=False,
+        )
+elif args.mode == 'prefill':
+    @torch.inference_mode()
+    def fn():
+        model(input_ids=input_ids)
+        return
 else:
-    fn = lambda: model.generate(
-        input_ids=input_ids,
-        attention_mask=attn_mask,
-        max_length=max_length,
-        min_length=max_length,
-        return_dict_in_generate=True,
-        pad_token_id=tokenizer.eos_token_id,
-        do_sample=False,
-    )
+    raise NotImplementedError(f"Invalid Mode {args.mode}!")
+
 out = fn()
-logger.info(f"output.sequences.shape: {out.sequences.shape}")
+if args.mode == 'decode':
+    logger.info(f"output.sequences.shape: {out.sequences.shape}")
+    out_len = len(out.sequences[0])
+else:
+    logger.info("prefill succeeds")
+    out_len = len(input_ids[0])
+in_len = len(input_ids[0])
+del out
+torch.cuda.empty_cache()
+gc.collect()
 
 torch.cuda.synchronize()
 start = time.time()
@@ -136,7 +187,9 @@ for _ in range(repeats):
 torch.cuda.synchronize()
 avg_time = (time.time() - start) / repeats
 
-logger.info(f"Prompt length: {len(input_ids[0])}, generation length: {len(out.sequences[0]) - len(input_ids[0])}")
+logger.info(f"Mode: {args.mode}")
+logger.info(f"Prompt length: {in_len}, generation length: {out_len - in_len}")
 logger.info(f"{args.model_name} prompt processing + decoding time: {avg_time * 1000:.0f}ms")
-logger.info(f"Throughput: {args.batch * len(out.sequences[0]) / avg_time:.3f} tokens / s")
+logger.info(f"Throughput (total tok = prefill + decode): {args.batch * out_len / avg_time:.3f} tokens / s")
+logger.info(f"Throughput (total tok = decode): {args.batch * (out_len  - in_len) / avg_time:.3f} tokens / s")
 logger.info("==================================")
