@@ -34,9 +34,10 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, MambaForCausalLM, 
 from transformers import GPT2Model, GPT2LMHeadModel
 
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
-from transformers.models.ttt.modeling_ttt import TttConfig, TttForCausalLM
-from transformers.models.ttt.configuration_ttt import TTT_STANDARD_CONFIGS
-
+# from transformers.models.ttt.modeling_ttt import TttConfig, TttForCausalLM
+# from transformers.models.ttt.configuration_ttt import TTT_STANDARD_CONFIGS
+from transformers.models.ttt_benchmark.modeling_ttt import TttConfig, TttForCausalLM
+from transformers.models.ttt_benchmark.configuration_ttt import TTT_STANDARD_CONFIGS
 
 parser = argparse.ArgumentParser(description="Generation benchmarking")
 parser.add_argument("--logdir", type=str, default="./exp/clean")
@@ -93,7 +94,7 @@ elif is_ttt:
     if ttt_size not in TTT_STANDARD_CONFIGS.keys():
         raise NotImplementedError(f"TTT Config {args.model_name} Not Implemented!")
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
-    ttt_config = TttConfig(tie_word_embeddings=True, **TTT_STANDARD_CONFIGS[ttt_size])
+    ttt_config = TttConfig(**TTT_STANDARD_CONFIGS[ttt_size])
     model = TttForCausalLM(ttt_config).to(device=device, dtype=dtype)
 else:
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
