@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import CrossEntropyLoss
+from torch.profiler import record_function
 
 from ...activations import ACT2FN
 from ...modeling_outputs import (
@@ -600,17 +601,18 @@ class TttM1BMMModule(TttBaseModule):
             def for_loop(W1_init, inputs):
                 output_tensor = torch.empty(size=(NC, B * NH, CS, HF), device=W1_init.device, dtype=input_dtype)
                 for i in range(NC):
-                    # TODO: select is slow
-                    XA_chunk = inputs["XA"][i]  # [B*nh,K,f]
-                    XB_chunk = inputs["XB"][i]
-                    XC_chunk = inputs["XC"][i]
-                    coeff_chunk = inputs["coeff"][i]  # [B*nh,K,1]
-                    coeff_chunk_last = inputs["coeff_chunk_last"][i]  # [B*nh,1,1]
+                    with record_function(f"for_iteration #{i+1}"):
+                        # TODO: select is slow
+                        XA_chunk = inputs["XA"][i]  # [B*nh,K,f]
+                        XB_chunk = inputs["XB"][i]
+                        XC_chunk = inputs["XC"][i]
+                        coeff_chunk = inputs["coeff"][i]  # [B*nh,K,1]
+                        coeff_chunk_last = inputs["coeff_chunk_last"][i]  # [B*nh,1,1]
 
-                    W1_init, Z1_bar = self.prefill_chunk(W1_init,
-                                                         XA_chunk, XB_chunk, XC_chunk,
-                                                         coeff_chunk, coeff_chunk_last)
-                    output_tensor[i] = Z1_bar
+                        W1_init, Z1_bar = self.prefill_chunk(W1_init,
+                                                            XA_chunk, XB_chunk, XC_chunk,
+                                                            coeff_chunk, coeff_chunk_last)
+                        output_tensor[i] = Z1_bar
                 return W1_init, output_tensor  # [NC, B*nh, K, f]
 
             inputs = tree_map(lambda x: x.permute(2,0,1,3,4).reshape(NC, B * NH, CS, -1), inputs)  # [B,nh,NC,CS,f] -> [NC,B,nh,CS,f] -> [NC,B*nh,CS,f]
@@ -645,50 +647,67 @@ class TttM2BMMModule(TttBaseModule):
         if cache_params is not None:
             # @xinhao: decoding
             def compute_chunk(params_dic, inputs):
-                W1_init = params_dic["W1_states"]  # [B,nh,f,f]
-                b1_init = params_dic["b1_states"]  # [B,nh,1,f]
-                W2_init = params_dic["W2_states"]  # [B,nh,f,f]
-                b2_init = params_dic["b2_states"]  # [B,nh,1,f]
+                with record_function("compute_chunk cached"):
+                    W1_init = params_dic["W1_states"]  # [B,nh,f,f]
+                    b1_init = params_dic["b1_states"]  # [B,nh,1,f]
+                    W2_init = params_dic["W2_states"]  # [B,nh,f,f]
+                    b2_init = params_dic["b2_states"]  # [B,nh,1,f]
 
-                XA_chunk = inputs["XA"]  # [B,nh,K=1,f]
-                XB_chunk = inputs["XB"]
-                XC_chunk = inputs["XC"]
-                coeff_chunk = inputs["coeff"]  # [B,nh,K=1,1]
+                    XA_chunk = inputs["XA"]  # [B,nh,K=1,f]
+                    XB_chunk = inputs["XB"]
+                    XC_chunk = inputs["XC"]
+                    coeff_chunk = inputs["coeff"]  # [B,nh,K=1,1]
 
-                X1 = XB_chunk
-                Z1 = X1 @ W1_init + b1_init  # [B,nh,K=1,f] @ [B,nh,f,f] -> [B,nh,K=1,f]
-                X2 = F.gelu(Z1)
-                Z2 = X2 @ W2_init + b2_init
+                    X1 = XB_chunk
+                    with record_function("compute Z1"):
+                        Z1 = X1 @ W1_init + b1_init  # [B,nh,K=1,f] @ [B,nh,f,f] -> [B,nh,K=1,f]
+                    with record_function("compute X2"):
+                        X2 = F.gelu(Z1)
+                    with record_function("compute Z2"):
+                        Z2 = X2 @ W2_init + b2_init
 
-                grad_l_wrt_Z2 = Z2 - XA_chunk
-                grad_W2 = X2.transpose(-2, -1) @ grad_l_wrt_Z2 + params_dic["W2_grad"]  # [B,nh,f,f]
-                grad_b2 = grad_l_wrt_Z2 + params_dic["b2_grad"]  # [B,nh,K=1,f]
+                    with record_function("compute grad_l_wrt_Z2"):
+                        grad_l_wrt_Z2 = Z2 - XA_chunk
+                    with record_function("compute grad_W2"):
+                        grad_W2 = X2.transpose(-2, -1) @ grad_l_wrt_Z2 + params_dic["W2_grad"]  # [B,nh,f,f]
+                    with record_function("compute grad_b2"):
+                        grad_b2 = grad_l_wrt_Z2 + params_dic["b2_grad"]  # [B,nh,K=1,f]
 
-                grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2_init.transpose(-2,-1) * diff_gelu(Z1)
-                grad_W1 = X1.transpose(-2, -1) @ grad_l_wrt_Z1 + params_dic["W1_grad"]  # [B,nh,f,f]
-                grad_b1 = grad_l_wrt_Z1 + params_dic["b1_grad"]  # [B,nh,K=1,f]
+                    with record_function("compute grad_l_wrt_Z1"):
+                        grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2_init.transpose(-2,-1) * diff_gelu(Z1)
+                    with record_function("compute grad_W1"):
+                        grad_W1 = X1.transpose(-2, -1) @ grad_l_wrt_Z1 + params_dic["W1_grad"]  # [B,nh,f,f]
+                    with record_function("compute grad_b1"):
+                        grad_b1 = grad_l_wrt_Z1 + params_dic["b1_grad"]  # [B,nh,K=1,f]
 
-                W1_bar = W1_init - coeff_chunk * grad_W1
-                b1_bar = b1_init - coeff_chunk * grad_b1  # [B,nh,1,f] - [B,nh,K=1,1] * [B,nh,K=1,f]
-                W2_bar = W2_init - coeff_chunk * grad_W2
-                b2_bar = b2_init - coeff_chunk * grad_b2
+                    with record_function("compute W1_bar"):
+                        W1_bar = W1_init - coeff_chunk * grad_W1
+                    with record_function("compute b1_bar"):
+                        b1_bar = b1_init - coeff_chunk * grad_b1  # [B,nh,1,f] - [B,nh,K=1,1] * [B,nh,K=1,f]
+                    with record_function("compute W2_bar"):
+                        W2_bar = W2_init - coeff_chunk * grad_W2
+                    with record_function("compute b2_bar"):
+                        b2_bar = b2_init - coeff_chunk * grad_b2
 
-                Z1_bar = XC_chunk @ W1_bar + b1_bar  # [B,nh,K=1,f]
-                X2_bar = F.gelu(Z1_bar)
-                Z2_bar = X2_bar @ W2_bar + b2_bar
-                XCW_chunk = Z2_bar
+                    with record_function("compute Z1_bar"):
+                        Z1_bar = XC_chunk @ W1_bar + b1_bar  # [B,nh,K=1,f]
+                    with record_function("compute X2_bar"):
+                        X2_bar = F.gelu(Z1_bar)
+                    with record_function("compute Z2_bar"):
+                        Z2_bar = X2_bar @ W2_bar + b2_bar
+                    XCW_chunk = Z2_bar
 
-                last_param_dic = {
-                    "W1_states": W1_bar,
-                    "b1_states": b1_bar,
-                    "W2_states": W2_bar,
-                    "b2_states": b2_bar,
-                    "W1_grad": grad_W1,
-                    "b1_grad": grad_b1,
-                    "W2_grad": grad_W2,
-                    "b2_grad": grad_b2,
-                }
-                return last_param_dic, XCW_chunk
+                    last_param_dic = {
+                        "W1_states": W1_bar,
+                        "b1_states": b1_bar,
+                        "W2_states": W2_bar,
+                        "b2_states": b2_bar,
+                        "W1_grad": grad_W1,
+                        "b1_grad": grad_b1,
+                        "W2_grad": grad_W2,
+                        "b2_grad": grad_b2,
+                    }
+                    return last_param_dic, XCW_chunk
 
             init_params_dic = {
                 "W1_states": torch.tile(self.W1, dims=(B, 1, 1, 1)),
@@ -705,46 +724,63 @@ class TttM2BMMModule(TttBaseModule):
 
         else:
             def compute_chunk(params_dic, inputs):
-                W1_init = params_dic["W1_states"]  # [B,nh,f,f]
-                b1_init = params_dic["b1_states"]  # [B,nh,1,f]
-                W2_init = params_dic["W2_states"]  # [B,nh,f,f]
-                b2_init = params_dic["b2_states"]  # [B,nh,1,f]
+                with record_function("compute_chunk uncached"):
+                    W1_init = params_dic["W1_states"]  # [B,nh,f,f]
+                    b1_init = params_dic["b1_states"]  # [B,nh,1,f]
+                    W2_init = params_dic["W2_states"]  # [B,nh,f,f]
+                    b2_init = params_dic["b2_states"]  # [B,nh,1,f]
 
-                XA_chunk = inputs["XA"]  # [B,nh,K,f]
-                XB_chunk = inputs["XB"]
-                XC_chunk = inputs["XC"]
-                coeff_chunk = inputs["coeff"]  # [B,nh,K,1]
+                    XA_chunk = inputs["XA"]  # [B,nh,K,f]
+                    XB_chunk = inputs["XB"]
+                    XC_chunk = inputs["XC"]
+                    coeff_chunk = inputs["coeff"]  # [B,nh,K,1]
 
-                X1 = XB_chunk
-                Z1 = X1 @ W1_init + b1_init  # [B,nh,K,f] @ [1,nh,f,f] + [B,nh,1,f] -> [B,nh,K,f]
-                X2 = F.gelu(Z1)
-                Z2 = X2 @ W2_init + b2_init
+                    X1 = XB_chunk
+                    with record_function("compute Z1"):
+                        Z1 = X1 @ W1_init + b1_init  # [B,nh,K,f] @ [1,nh,f,f] + [B,nh,1,f] -> [B,nh,K,f]
+                    with record_function("compute X2"):
+                        X2 = F.gelu(Z1)
+                    with record_function("compute Z2"):
+                        Z2 = X2 @ W2_init + b2_init
 
-                grad_l_wrt_Z2 = Z2 - XA_chunk  # [B,nh,K,f]
-                grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2_init.transpose(-2,-1) * diff_gelu(Z1)
+                    with record_function("compute grad_l_wrt_Z2"):
+                        grad_l_wrt_Z2 = Z2 - XA_chunk  # [B,nh,K,f]
+                    with record_function("compute grad_l_wrt_Z1"):
+                        grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2_init.transpose(-2,-1) * diff_gelu(Z1)
 
-                Attn1 = torch.tril(XC_chunk @ X1.transpose(-2,-1))  # [B,nh,K,K]
-                b1_bar = b1_init - coeff_chunk * torch.cumsum(grad_l_wrt_Z1, dim=-2)  # [B,nh,1,f] - [B,nh,K,1] * [B,nh,K,f] -> [B,nh,K,f]
-                Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1 + b1_bar  # [B,nh,K,f] @ [B,nh,f,f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,f] + [B,nh,K,f]
-                X2_bar = F.gelu(Z1_bar)
+                    with record_function("compute Attn1"):
+                        Attn1 = torch.tril(XC_chunk @ X1.transpose(-2,-1))  # [B,nh,K,K]
+                    with record_function("compute b1_bar"):
+                        b1_bar = b1_init - coeff_chunk * torch.cumsum(grad_l_wrt_Z1, dim=-2)  # [B,nh,1,f] - [B,nh,K,1] * [B,nh,K,f] -> [B,nh,K,f]
+                    with record_function("compute Z1_bar"):
+                        Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1 + b1_bar  # [B,nh,K,f] @ [1,nh,f,f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,f] + [B,nh,K,f]
+                    with record_function("compute X2_bar"):
+                        X2_bar = F.gelu(Z1_bar)
 
-                Attn2 = torch.tril(X2_bar @ X2.transpose(-2,-1))  # [B,nh,K,K]
-                b2_bar = b2_init - coeff_chunk * torch.cumsum(grad_l_wrt_Z2, dim=-2)  # [B,nh,1,f] - [B,nh,K,1] * [B,nh,K,f] -> [B,nh,K,f]
-                Z2_bar = X2_bar @ W2_init - (coeff_chunk * Attn2) @ grad_l_wrt_Z2 + b2_bar  # [B,nh,K,f] @ [1,nh,f,f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,f] + [B,nh,K,f]
-                XCW_chunk = Z2_bar  # [B,nh,K,f]
+                    with record_function("compute Attn2"):
+                        Attn2 = torch.tril(X2_bar @ X2.transpose(-2,-1))  # [B,nh,K,K]
+                    with record_function("compute b2_bar"):
+                        b2_bar = b2_init - coeff_chunk * torch.cumsum(grad_l_wrt_Z2, dim=-2)  # [1,nh,1,f] - [B,nh,K,1] * [B,nh,K,f] -> [B,nh,K,f]
+                    with record_function("compute Z2_bar"):
+                        Z2_bar = X2_bar @ W2_init - (coeff_chunk * Attn2) @ grad_l_wrt_Z2 + b2_bar  # [B,nh,K,f] @ [1,nh,f,f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,f] + [B,nh,K,f]                        
+                    XCW_chunk = Z2_bar  # [B,nh,K,f]
 
-                W1_last = W1_init - (coeff_chunk[:,:,-1:] * X1).transpose(-1,-2) @ grad_l_wrt_Z1  # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
-                b1_last = b1_bar[:,:,-1:]  # [B,nh,1,f]
-                W2_last = W2_init - (coeff_chunk[:, :, -1:] * X2).transpose(-1,-2) @ grad_l_wrt_Z2  # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
-                b2_last = b2_bar[:, :, -1:]  # [B,nh,1,f]
+                    with record_function("compute W1_last"):
+                        W1_last = W1_init - (coeff_chunk[:,:,-1:] * X1).transpose(-1,-2) @ grad_l_wrt_Z1  # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
+                    with record_function("compute b1_last"):
+                        b1_last = b1_bar[:,:,-1:]  # [B,nh,1,f]
+                    with record_function("compute W2_last"):
+                        W2_last = W2_init - (coeff_chunk[:, :, -1:] * X2).transpose(-1,-2) @ grad_l_wrt_Z2  # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
+                    with record_function("compute b2_last"):
+                        b2_last = b2_bar[:, :, -1:]  # [B,nh,1,f]
 
-                last_param_dic = {
-                    "W1_states": W1_last,
-                    "b1_states": b1_last,
-                    "W2_states": W2_last,
-                    "b2_states": b2_last,
-                }
-                return last_param_dic, XCW_chunk
+                    last_param_dic = {
+                        "W1_states": W1_last,
+                        "b1_states": b1_last,
+                        "W2_states": W2_last,
+                        "b2_states": b2_last,
+                    }
+                    return last_param_dic, XCW_chunk
 
             init_params_dic = {
                 "W1_states": torch.tile(self.W1, dims=(B, 1, 1, 1)),  # [B,nh,f,f]

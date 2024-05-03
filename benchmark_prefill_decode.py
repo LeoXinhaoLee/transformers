@@ -29,6 +29,7 @@ import logging
 
 import torch
 import torch.nn.functional as F
+from torch.profiler import profile, record_function, ProfilerActivity
 
 from einops import rearrange
 
@@ -125,53 +126,19 @@ input_ids = torch.randint(1, 1000, (args.batch, args.promptlen), dtype=torch.lon
 attn_mask = torch.ones_like(input_ids, dtype=torch.long, device="cuda")
 max_length = input_ids.shape[1] + args.genlen
 
+assert is_ttt, "profile only TTT"
+
 if args.mode == 'decode':
-    if is_mamba:
-        # fn = lambda: model.generate(
-        #     input_ids=input_ids,
-        #     attention_mask=attn_mask,
-        #     max_length=max_length,
-        #     min_length=max_length,
-        #     return_dict_in_generate=True,
-        #     pad_token_id=tokenizer.eos_token_id,
-        #     do_sample=False,
-        #     num_beams=1,
-        #     temperature=1.0,
-        #     top_k=0,
-        #     top_p=0,
-        # )
-        fn = lambda: model.generate(
-            input_ids=input_ids,
-            max_length=max_length,
-            cg=True,
-            return_dict_in_generate=True,
-            output_scores=False,
-            enable_timing=False,
-            temperature=1.0,  # @xinhao: mamba src code: shortcut for greedy
-            top_k=0,
-            top_p=0,
-        )
-    elif is_ttt:
-        fn = lambda: model.generate(
-            input_ids=input_ids,
-            attention_mask=attn_mask,
-            use_cache=True,  # @xinhao: efficient decoding
-            max_length=max_length,
-            min_length=max_length,
-            return_dict_in_generate=True,
-            pad_token_id=tokenizer.eos_token_id,
-            do_sample=False,
-        )
-    else:
-        fn = lambda: model.generate(
-            input_ids=input_ids,
-            attention_mask=attn_mask,
-            max_length=max_length,
-            min_length=max_length,
-            return_dict_in_generate=True,
-            pad_token_id=tokenizer.eos_token_id,
-            do_sample=False,
-        )
+    fn = lambda: model.generate(
+        input_ids=input_ids,
+        attention_mask=attn_mask,
+        use_cache=True,  # @xinhao: efficient decoding
+        max_length=max_length,
+        min_length=max_length,
+        return_dict_in_generate=True,
+        pad_token_id=tokenizer.eos_token_id,
+        do_sample=False,
+    )
 elif args.mode == 'prefill':
     # @torch.compile(options={"triton.cudagraphs": True}, fullgraph=True)
     # model = torch.compile(model)
@@ -195,15 +162,18 @@ torch.cuda.empty_cache()
 gc.collect()
 
 torch.cuda.synchronize()
-start = time.time()
-for _ in range(repeats):
-    fn()
+with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=True, profile_memory=True, use_cuda=True,
+        with_flops=True, with_stack=True, with_modules=True
+    ) as prof:
+       fn()
+prof.export_chrome_trace(osp.join(args.logdir, f"{args.mode}_trace.json"))
+prof.export_stacks(osp.join(args.logdir, f"{args.mode}_cuda_flamedata.txt"), "self_cuda_time_total")
+prof.export_stacks(osp.join(args.logdir, f"{args.mode}_cpu_flamedata.txt"), "self_cpu_time_total")
 torch.cuda.synchronize()
-avg_time = (time.time() - start) / repeats
 
 logger.info(f"Mode: {args.mode}")
 logger.info(f"Prompt length: {in_len}, generation length: {out_len - in_len}")
-logger.info(f"{args.model_name} prompt processing + decoding time: {avg_time * 1000:.0f}ms")
-logger.info(f"Throughput (total tok = prefill + decode): {args.batch * out_len / avg_time:.3f} tokens / s")
-logger.info(f"Throughput (total tok = decode): {args.batch * (out_len  - in_len) / avg_time:.3f} tokens / s")
+logger.info(f"SUCCESS: RECORDED TRACE TO {args.logdir}/{args.mode}_trace.json")
+logger.info(f"SUCCESS: RECORDED FLAME DATA TO {args.logdir}/{args.mode}_[cuda,cpu]_flamedata.txt")
 logger.info("==================================")
