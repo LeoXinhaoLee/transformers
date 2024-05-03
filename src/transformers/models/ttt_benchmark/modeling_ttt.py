@@ -234,13 +234,13 @@ class TttBaseModule(nn.Module):
         n_chunk = L // inner_chunk_size
         X = batch.reshape(B, n_chunk, inner_chunk_size, self.width)  # [B ,n_chunk, inner_chunk_size, C]
 
-        XC, XB, XA = self.q_proj(batch), self.k_proj(batch), self.v_proj(batch)
+        XC, XB, XA = self.q_proj(batch), self.k_proj(batch), self.v_proj(batch)  # [B,N,F]
 
-        XC = self._split_heads(XC)
+        XC = self._split_heads(XC)  # [B,N,nh,f]
         XB = self._split_heads(XB)
-        XA = self._split_heads(XA)  # [B,nh,n_chunk / g, g * K,f]
+        XA = self._split_heads(XA)
 
-        XC = self._split_chunks(XC, inner_chunk_size)
+        XC = self._split_chunks(XC, inner_chunk_size)  # [B,nh,NC / g, g * CS,f]
         XB = self._split_chunks(XB, inner_chunk_size)
         XA = self._split_chunks(XA, inner_chunk_size)
 
@@ -494,22 +494,20 @@ class TttM1Module(TttBaseModule):
 class TttM1BMMModule(TttBaseModule):
     def __init__(self, config: TttConfig, layer_idx: Optional[int] = None):
         super().__init__(config, layer_idx)
-        self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(1, self.num_heads, self.head_dim, self.head_dim)))
-        self.b1 = nn.Parameter(torch.zeros(1, self.num_heads, 1, self.head_dim))
+        self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim, self.head_dim)))
 
     def process_inner_loop(self, inputs, inner_chunk_size, last_chunk_params_dic, cache_params=None):
         # @xinhao: decoding from a prompt of length 1 will always have `inner_chunk_size=remainder=1`
         if inner_chunk_size is None:
             inner_chunk_size = self.inner_chunk_size
 
-        B = inputs['XA'].shape[0]  # [B, nh, NC/g, g*CS, f]
-        L = inputs['XA'].shape[2] * inputs['XA'].shape[3]
+        B, NH, NC, CS = inputs['XA'].shape[:-1]
+        L = NC * CS
 
         if cache_params is not None:
             # @xinhao: decoding
             def compute_chunk(params_dic, inputs):
                 W1_init = params_dic["W1_states"]  # [B,nh,f,f]
-                b1_init = params_dic["b1_states"]  # [B,nh,1,f]
 
                 XA_chunk = inputs["XA"]  # [B,nh,K=1,f]
                 XB_chunk = inputs["XB"]
@@ -517,75 +515,89 @@ class TttM1BMMModule(TttBaseModule):
                 coeff_chunk = inputs["coeff"]  # [B,nh,K=1,1]
 
                 X1 = XB_chunk
-                Z1 = X1 @ W1_init + b1_init  # [B,nh,K=1,f] @ [B,nh,f,f] -> [B,nh,K=1,f]
+                Z1 = X1 @ W1_init  # [B,nh,K=1,f] @ [B,nh,f,f] -> [B,nh,K=1,f]
 
                 grad_l_wrt_Z1 = Z1 - XA_chunk
                 grad_W1 = XB_chunk.transpose(-2, -1) @ grad_l_wrt_Z1 + params_dic["W1_grad"]  # [B,nh,f,f]
-                grad_b1 = grad_l_wrt_Z1 + params_dic["b1_grad"]  # [B,nh,K=1,f]
 
-                b1_bar = b1_init - coeff_chunk * grad_b1  # [B,nh,1,f] - [B,nh,K=1,1] * [B,nh,K=1,f]
-                Z1_bar = XC_chunk @ (W1_init - coeff_chunk * grad_W1) + b1_bar  # [B,nh,K=1,f]
+                Z1_bar = XC_chunk @ (W1_init - coeff_chunk * grad_W1)  # [B,nh,K=1,f]
                 XCW_chunk = Z1_bar
 
                 W1_last = W1_init - coeff_chunk * grad_W1
-                b1_last = b1_bar
 
                 last_param_dic = {
                     "W1_states": W1_last,
-                    "b1_states": b1_last,
                     "W1_grad": grad_W1,
-                    "b1_grad": grad_b1,
                 }
                 return last_param_dic, XCW_chunk
 
             init_params_dic = {
                 "W1_states": torch.tile(self.W1, dims=(B,1,1,1)),
-                "b1_states": torch.tile(self.b1, dims=(B,1,1,1)),
             }
             init_params_dic.update(W1_grad=torch.zeros_like(init_params_dic["W1_states"]))
-            init_params_dic.update(b1_grad=torch.zeros_like(init_params_dic["b1_states"]))
             inputs = tree_map(lambda x: x.permute(2, 0, 1, 3, 4), inputs)  # [B,nh,NC,CS,f] -> [NC,B,nh,CS,f]
             batch_params_dic, XCW_batch = scan(compute_chunk, init_params_dic, inputs)  # [NC,B,nh,CS,f]
 
         else:
-            def compute_chunk(params_dic, inputs):
-                W1_init = params_dic["W1_states"]  # [B,nh,f,f]
-                b1_init = params_dic["b1_states"]  # [B,nh,1,f]
+            # def compute_chunk(params_dic, inputs):
+            #     W1_init = params_dic["W1_states"]  # [B,nh,f,f]
+            #
+            #     XA_chunk = inputs["XA"]  # [B,nh,K,f]
+            #     XB_chunk = inputs["XB"]
+            #     XC_chunk = inputs["XC"]
+            #     coeff_chunk = inputs["coeff"]  # [B,nh,K,1]
+            #
+            #     X1 = XB_chunk
+            #
+            #     Z1 = X1 @ W1_init  # [B,nh,K,f] @ [1,nh,f,f] + [B,nh,1,f] -> [B,nh,K,f]
+            #
+            #     grad_l_wrt_Z1 = Z1 - XA_chunk  # [B,nh,K,f]
+            #
+            #     Attn1 = torch.tril(XC_chunk @ XB_chunk.transpose(-1, -2))  # [B,nh,K,K]
+            #
+            #     Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1  # [B,nh,K,f] @ [1,nh,f,f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,f] + [B,nh,K,f]
+            #
+            #     XCW_chunk = Z1_bar  # [B,nh,K,f]
+            #
+            #     W1_last = W1_init - (coeff_chunk[:,:,-1:] * X1).transpose(-1, -2) @ grad_l_wrt_Z1  # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
+            #
+            #     last_param_dic = {
+            #         "W1_states": W1_last,
+            #     }
+            #     return last_param_dic, XCW_chunk
 
-                XA_chunk = inputs["XA"]  # [B,nh,K,f]
-                XB_chunk = inputs["XB"]
-                XC_chunk = inputs["XC"]
-                coeff_chunk = inputs["coeff"]  # [B,nh,K,1]
+            def for_loop(W1_init, inputs):
+                output_list = []
+                for i in range(NC):
+                    XA_chunk = inputs["XA"][i]  # [B*nh,K,f]
+                    XB_chunk = inputs["XB"][i]
+                    XC_chunk = inputs["XC"][i]
+                    coeff_chunk = inputs["coeff"][i]  # [B*nh,K,1]
 
-                X1 = XB_chunk
-                Z1 = X1 @ W1_init + b1_init  # [B,nh,K,f] @ [1,nh,f,f] + [B,nh,1,f] -> [B,nh,K,f]
+                    Z1 = XB_chunk @ W1_init  # [B*nh,K,f] @ [B*nh,f,f] -> [B*nh,K,f]; @xinhao: can be pre-computed with XC_chunk @ W1_init, but can have mem issue
 
-                grad_l_wrt_Z1 = Z1 - XA_chunk  # [B,nh,K,f]
-                Attn1 = torch.tril(XC_chunk @ XB_chunk.transpose(-1, -2))  # [B,nh,K,K]
-                b1_bar = b1_init - coeff_chunk * torch.cumsum(grad_l_wrt_Z1, dim=-2)  # [B,nh,1,f] - [B,nh,K,1] * [B,nh,K,f] -> [B,nh,K,f]
-                Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1 + b1_bar  # [B,nh,K,f] @ [1,nh,f,f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,f] + [B,nh,K,f]
-                XCW_chunk = Z1_bar  # [B,nh,K,f]
+                    # grad_l_wrt_Z1 = Z1 - XA_chunk  # [B*nh,K,f]
+                    Z1.sub_(XA_chunk)  # Z1 -> grad_l_wrt_Z1 = Z1 - XA_chunk  # [B*nh,K,f]
 
-                W1_last = W1_init - (coeff_chunk[:,:,-1:] * X1).transpose(-1, -2) @ grad_l_wrt_Z1  # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
-                b1_last = b1_bar[:,:,-1:]  # [B,nh,1,f]
+                    Attn1 = torch.tril(XC_chunk @ XB_chunk.transpose(-1,-2))  # [B*nh,K,K]
 
-                last_param_dic = {
-                    "W1_states": W1_last,
-                    "b1_states": b1_last,
-                }
-                return last_param_dic, XCW_chunk
+                    # W1_init = W1_init - (coeff_chunk[:, :, -1:] * XB_chunk).transpose(-1,-2) @ Z1  # [B*nh,f,f] - ([B*nh,K,1]*[B*nh,K,f]).t() @ [B*nh,K,f]
+                    W1_init.sub_((coeff_chunk[:, :, -1:] * XB_chunk).transpose(-1,-2) @ Z1)
 
-            init_params_dic = {
-                "W1_states": torch.tile(self.W1, dims=(B,1,1,1)),  # [B,nh,f,f]
-                "b1_states": torch.tile(self.b1, dims=(B,1,1,1)),
-            }
-            # inputs = {"XA": XA, "XB": XB, "XC": XC, "coeff": coeff}  # [B,nh,NC,CS,f]
-            inputs = tree_map(lambda x: x.permute(2,0,1,3,4), inputs)  # [B,nh,NC,CS,f] -> [NC,B,nh,CS,f]
-            batch_params_dic, XCW_batch = scan(compute_chunk, init_params_dic, inputs)  # [NC,B,nh,CS,f]
+                    # Z1_bar
+                    Z1 = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ Z1  # [B*nh,K,f] @ [B*nh,f,f] - ([B*nh,K,1] * [B*nh,K,K]) @ [B*nh,K,f]
+                    # Z1 = torch.addbmm(input=XC_chunk @ W1_init, batch1=coeff_chunk * Attn1, batch2=Z1, alpha=-1., beta=1)
 
-        ######################
-        # XCW_batch = XCW_batch.permute(1, 2, 0, 3, 4).reshape(B, L, -1)  # [B,L,f]
-        XCW_batch = einops.rearrange(XCW_batch, "nc b nh cs f -> b (nc cs) (nh f)")  # [B,L,f]
+                    output_list.append(Z1)  # [B,nh,K,f]
+
+                return W1_init, torch.stack(output_list)
+
+            inputs = tree_map(lambda x: x.permute(2,0,1,3,4).reshape(NC, B * NH, CS, -1), inputs)  # [B,nh,NC,CS,f] -> [NC,B,nh,CS,f] -> [NC,B*nh,CS,f]
+            batch_params_dic, XCW_batch = for_loop(
+                torch.tile(self.W1, dims=(B,1,1)),  # [B*nh,f,f], cloned from W1, safe for in-place op
+                inputs)  # [NC,B,nh,CS,f]
+
+        XCW_batch = einops.rearrange(XCW_batch, "nc (b nh) cs f -> b (nc cs) (nh f)", b=B, nh=NH)  # [B,L,f]
         return XCW_batch, batch_params_dic
 
 

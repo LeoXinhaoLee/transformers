@@ -166,6 +166,7 @@ if args.mode == 'decode':
             do_sample=False,
         )
 elif args.mode == 'prefill':
+    # @torch.compile(options={"triton.cudagraphs": True}, fullgraph=True)
     @torch.inference_mode()
     def fn():
         model(input_ids=input_ids)
