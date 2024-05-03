@@ -2,15 +2,17 @@
 E.g.,
 # Decoding
 python benchmark_prefill_decode.py --logdir ./exp/decode_ttt_125m \
-                                   --model-name ttt-125m \
                                    --mode decode \
+                                   --model-name ttt-125m \
+                                   --inner_net mlp_2_dual \
                                    --batch 64 \
                                    --promptlen 1 \
                                    --genlen 512
 # Prefilling
 python benchmark_prefill_decode.py --logdir ./exp/prefill_ttt_125m \
-                                   --model-name ttt-125m \
                                    --mode prefill \
+                                   --model-name ttt-125m \
+                                   --inner_net mlp_2_dual \
                                    --batch 64 \
                                    --promptlen 512 \
                                    --genlen 0
@@ -47,7 +49,8 @@ parser.add_argument("--mode", type=str, default="prefill", choices=["prefill", "
 parser.add_argument("--promptlen", type=int, default=1)
 parser.add_argument("--genlen", type=int, default=128)
 parser.add_argument("--batch", type=int, default=1)
-parser.add_argument("--attn_impl", type=str, default='flash_attention_2')  # 'eager' | 'flash_attention_2'
+parser.add_argument("--attn_impl", type=str, default='flash_attention_2', choices=['eager', 'flash_attention_2'])
+parser.add_argument("--inner_net", type=str, default='mlp_2_dual', choices=['mlp_1_dual', 'mlp_2_dual'])
 args = parser.parse_args()
 
 def print_args(args):
@@ -95,6 +98,7 @@ elif is_ttt:
         raise NotImplementedError(f"TTT Config {args.model_name} Not Implemented!")
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
     ttt_config = TttConfig(**TTT_STANDARD_CONFIGS[ttt_size])
+    ttt_config.inner_net = args.inner_net
     model = TttForCausalLM(ttt_config).to(device=device, dtype=dtype)
 else:
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)

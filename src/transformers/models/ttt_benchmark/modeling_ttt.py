@@ -5,6 +5,7 @@ from collections import defaultdict
 from functools import partial
 from typing import Any, Dict, Optional, Tuple, Union
 
+import einops
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
@@ -132,7 +133,7 @@ def unpack_tensors(tensor_dict):
 
 
 def scan(f, init, xs, length=None):
-    """Minic jax.lax.scan function."""
+    """Mimic jax.lax.scan function."""
     if xs is None:
         xs = [None] * length
     carry = init
@@ -143,6 +144,26 @@ def scan(f, init, xs, length=None):
         carry, y = f(carry, x)
         ys.append(y)
     return carry, torch.stack(ys)
+
+
+def tree_map(fn, inputs):
+    if isinstance(inputs, dict):
+        out = {}
+        for k, val in inputs.items():
+            out[k] = fn(val)
+    elif isinstance(inputs, list):
+        out = []
+        for val in inputs:
+            out.append(fn(val))
+    else:
+        out = fn(val)
+    return out
+
+
+def diff_gelu(x):
+    tanh_out = torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x))
+    ff = 0.5 * x * ((1 - tanh_out * tanh_out) * (0.79788456 + 0.1070322243 * x * x)) + 0.5 * (1 + tanh_out)
+    return ff
 
 
 class TttBaseModule(nn.Module):
@@ -245,12 +266,10 @@ class TttBaseModule(nn.Module):
         XC, XB, XA, coeff = self.get_inner_loop_inputs(
             hidden_states, position_ids=position_ids, cache_params=cache_params, inner_chunk_size=inner_chunk_size
         )
-
+        inputs = {'XC': XC, 'XB': XB, 'XA': XA, 'coeff': coeff}
         XCW_batch, batch_params_dic = self.process_inner_loop(
-            XC,
-            XB,
-            XA,
-            coeff,
+            inputs,
+            # XC, XB, XA, coeff,
             inner_chunk_size=inner_chunk_size,
             last_chunk_params_dic=last_chunk_params_dic,
             cache_params=cache_params,
@@ -272,7 +291,10 @@ class TttBaseModule(nn.Module):
         z_batch = self.o_proj(XCW_batch)
         return z_batch
 
-    def process_inner_loop(self, XC, XB, XA, coeff, inner_chunk_size, last_chunk_params_dic, cache_params=None):
+    def process_inner_loop(self,
+                           inputs,
+                           # XC, XB, XA, coeff,
+                           inner_chunk_size, last_chunk_params_dic, cache_params=None):
         """
         Inputs:
             XA, XB, XC: [B, n_chunk, chunk_size, F] or [B, n_chunk // 4, 4 * chunk_size, F]
@@ -352,11 +374,18 @@ class TttM1Module(TttBaseModule):
         self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim, self.head_dim)))
         self.b1 = nn.Parameter(torch.zeros(self.num_heads, 1, self.head_dim))
 
-    def process_inner_loop(self, XC, XB, XA, coeff, inner_chunk_size, last_chunk_params_dic, cache_params=None):
+    def process_inner_loop(self,
+                           inputs,
+                           # XC, XB, XA, coeff,
+                           inner_chunk_size, last_chunk_params_dic, cache_params=None):
         # @xinhao: decoding from a prompt of length 1 will always have `inner_chunk_size=remainder=1`
         if inner_chunk_size is None:
             inner_chunk_size = self.inner_chunk_size
 
+        XA = inputs['XA']
+        XB = inputs['XB']
+        XC = inputs['XC']
+        coeff = inputs['coeff']
         B = XA.shape[0]  # [B, nh, NC/g, g*CS, f]
         L = XA.shape[2] * XA.shape[3]
 
@@ -381,27 +410,15 @@ class TttM1Module(TttBaseModule):
                         X1 = XB_chunk
                         Z1 = X1 @ W1_init + b1_init
 
-                        if self.config.inner_net_on_residual:
-                            reconstruction_target = XA_chunk - XB_chunk
-                        else:
-                            reconstruction_target = XA_chunk
-
-                        if self.config.use_vjp:
-                            DLN_out, LN_vjp = torch.func.vjp(
-                                lambda z: self.decoder_ln_fn(z, weight=ln_weight, bias=ln_bias), Z1
-                            )
-                            grad_l_wrt_DLN_out = DLN_out - reconstruction_target  # [K,f]
-                            grad_l_wrt_Z1 = LN_vjp(grad_l_wrt_DLN_out)[0]  # [K,f]
-                        else:
-                            grad_l_wrt_Z1 = decoder_ln_bwd(Z1, reconstruction_target, ln_weight, ln_bias)
-
+                        grad_l_wrt_Z1 = Z1 - XA_chunk
                         grad_W1 = XB_chunk.transpose(1,0) @ grad_l_wrt_Z1 + params_dic["W1_grad"]  # [f,f]
                         grad_b1 = grad_l_wrt_Z1 + params_dic["b1_grad"]  # [K=1,f]
 
-                        b1_bar = b1_init - (coeff_chunk * grad_b1)  # [K=1,f]
+                        b1_bar = b1_init - coeff_chunk * grad_b1  # [K=1,f]
                         Z1_bar = XC_chunk @ (W1_init - coeff_chunk * grad_W1) + b1_bar  # [K,f]
+                        XCW_chunk = Z1_bar
 
-                        W1_last = W1_init - (coeff_chunk * grad_W1)
+                        W1_last = W1_init - coeff_chunk * grad_W1
                         b1_last = b1_bar
 
                         last_param_dic = {
@@ -410,13 +427,6 @@ class TttM1Module(TttBaseModule):
                             "W1_grad": grad_W1,
                             "b1_grad": grad_b1,
                         }
-                        if self.config.use_post_ln:
-                            Z1_bar = self.decoder_ln_fn(Z1_bar, weight=ln_weight, bias=ln_bias)
-
-                        if self.config.inner_net_on_residual:
-                            XCW_chunk = XC_chunk + Z1_bar
-                        else:
-                            XCW_chunk = Z1_bar
                         return last_param_dic, XCW_chunk
 
                     inputs = {"XA": XA, "XB": XB, "XC": XC, "coeff": coeff}
@@ -453,23 +463,11 @@ class TttM1Module(TttBaseModule):
                         X1 = XB_chunk
                         Z1 = X1 @ W1_init + b1_init
 
-                        if self.config.inner_net_on_residual:
-                            reconstruction_target = XA_chunk - XB_chunk
-                        else:
-                            reconstruction_target = XA_chunk
-
-                        if self.config.use_vjp:
-                            DLN_out, LN_vjp = torch.func.vjp(
-                                lambda z: self.decoder_ln_fn(z, weight=ln_weight, bias=ln_bias), Z1
-                            )
-                            grad_l_wrt_DLN_out = DLN_out - reconstruction_target  # [K,f]
-                            grad_l_wrt_Z1 = LN_vjp(grad_l_wrt_DLN_out)[0]  # [K,f]
-                        else:
-                            grad_l_wrt_Z1 = decoder_ln_bwd(Z1, reconstruction_target, ln_weight, ln_bias)
-
+                        grad_l_wrt_Z1 = Z1 - XA_chunk
                         Attn1 = torch.tril(XC_chunk @ XB_chunk.transpose(1, 0))
                         b1_bar = b1_init - coeff_chunk * torch.cumsum(grad_l_wrt_Z1, dim=0)  # [K,f]
                         Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1 + b1_bar
+                        XCW_chunk = Z1_bar
 
                         W1_last = W1_init - (coeff_chunk[-1] * X1).transpose(1, 0) @ grad_l_wrt_Z1
                         b1_last = b1_bar[-1:]
@@ -478,13 +476,6 @@ class TttM1Module(TttBaseModule):
                             "W1_states": W1_last,
                             "b1_states": b1_last,
                         }
-                        if self.config.use_post_ln:
-                            Z1_bar = self.decoder_ln_fn(Z1_bar, weight=ln_weight, bias=ln_bias)
-
-                        if self.config.inner_net_on_residual:
-                            XCW_chunk = XC_chunk + Z1_bar
-                        else:
-                            XCW_chunk = Z1_bar
                         return last_param_dic, XCW_chunk
 
                     inputs = {"XA": XA, "XB": XB, "XC": XC, "coeff": coeff}
@@ -503,14 +494,252 @@ class TttM1Module(TttBaseModule):
         return XCW_batch, batch_params_dic
 
 
+class TttM1BMMModule(TttBaseModule):
+    def __init__(self, config: TttConfig, layer_idx: Optional[int] = None):
+        super().__init__(config, layer_idx)
+        self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(1, self.num_heads, self.head_dim, self.head_dim)))
+        self.b1 = nn.Parameter(torch.zeros(1, self.num_heads, 1, self.head_dim))
+
+    def process_inner_loop(self, inputs, inner_chunk_size, last_chunk_params_dic, cache_params=None):
+        # @xinhao: decoding from a prompt of length 1 will always have `inner_chunk_size=remainder=1`
+        if inner_chunk_size is None:
+            inner_chunk_size = self.inner_chunk_size
+
+        B = inputs['XA'].shape[0]  # [B, nh, NC/g, g*CS, f]
+        L = inputs['XA'].shape[2] * inputs['XA'].shape[3]
+
+        if cache_params is not None:
+            # @xinhao: decoding
+            def compute_chunk(params_dic, inputs):
+                W1_init = params_dic["W1_states"]  # [B,nh,f,f]
+                b1_init = params_dic["b1_states"]  # [B,nh,1,f]
+
+                XA_chunk = inputs["XA"]  # [B,nh,K=1,f]
+                XB_chunk = inputs["XB"]
+                XC_chunk = inputs["XC"]
+                coeff_chunk = inputs["coeff"]  # [B,nh,K=1,1]
+
+                X1 = XB_chunk
+                Z1 = X1 @ W1_init + b1_init  # [B,nh,K=1,f] @ [B,nh,f,f] -> [B,nh,K=1,f]
+
+                grad_l_wrt_Z1 = Z1 - XA_chunk
+                grad_W1 = XB_chunk.transpose(-2, -1) @ grad_l_wrt_Z1 + params_dic["W1_grad"]  # [B,nh,f,f]
+                grad_b1 = grad_l_wrt_Z1 + params_dic["b1_grad"]  # [B,nh,K=1,f]
+
+                b1_bar = b1_init - coeff_chunk * grad_b1  # [B,nh,1,f] - [B,nh,K=1,1] * [B,nh,K=1,f]
+                Z1_bar = XC_chunk @ (W1_init - coeff_chunk * grad_W1) + b1_bar  # [B,nh,K=1,f]
+                XCW_chunk = Z1_bar
+
+                W1_last = W1_init - coeff_chunk * grad_W1
+                b1_last = b1_bar
+
+                last_param_dic = {
+                    "W1_states": W1_last,
+                    "b1_states": b1_last,
+                    "W1_grad": grad_W1,
+                    "b1_grad": grad_b1,
+                }
+                return last_param_dic, XCW_chunk
+
+            init_params_dic = {
+                "W1_states": torch.tile(self.W1, dims=(B,1,1,1)),
+                "b1_states": torch.tile(self.b1, dims=(B,1,1,1)),
+            }
+            init_params_dic.update(W1_grad=torch.zeros_like(init_params_dic["W1_states"]))
+            init_params_dic.update(b1_grad=torch.zeros_like(init_params_dic["b1_states"]))
+            inputs = tree_map(lambda x: x.permute(2, 0, 1, 3, 4), inputs)  # [B,nh,NC,CS,f] -> [NC,B,nh,CS,f]
+            batch_params_dic, XCW_batch = scan(compute_chunk, init_params_dic, inputs)  # [NC,B,nh,CS,f]
+
+        else:
+            def compute_chunk(params_dic, inputs):
+                W1_init = params_dic["W1_states"]  # [B,nh,f,f]
+                b1_init = params_dic["b1_states"]  # [B,nh,1,f]
+
+                XA_chunk = inputs["XA"]  # [B,nh,K,f]
+                XB_chunk = inputs["XB"]
+                XC_chunk = inputs["XC"]
+                coeff_chunk = inputs["coeff"]  # [B,nh,K,1]
+
+                X1 = XB_chunk
+                Z1 = X1 @ W1_init + b1_init  # [B,nh,K,f] @ [1,nh,f,f] + [B,nh,1,f] -> [B,nh,K,f]
+
+                grad_l_wrt_Z1 = Z1 - XA_chunk  # [B,nh,K,f]
+                Attn1 = torch.tril(XC_chunk @ XB_chunk.transpose(-1, -2))  # [B,nh,K,K]
+                b1_bar = b1_init - coeff_chunk * torch.cumsum(grad_l_wrt_Z1, dim=-2)  # [1,nh,1,f] - [B,nh,K,1] * [B,nh,K,f] -> [B,nh,K,f]
+                Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1 + b1_bar  # [B,nh,K,f] @ [1,nh,f,f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,f] + [B,nh,K,f]
+                XCW_chunk = Z1_bar  # [B,nh,K,f]
+
+                W1_last = W1_init - (coeff_chunk[:,:,-1:] * X1).transpose(-1, -2) @ grad_l_wrt_Z1  # [1,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
+                b1_last = b1_bar[:,:,-1:]  # [B,nh,1,f]
+
+                last_param_dic = {
+                    "W1_states": W1_last,
+                    "b1_states": b1_last,
+                }
+                return last_param_dic, XCW_chunk
+
+            init_params_dic = {
+                "W1_states": torch.tile(self.W1, dims=(B,1,1,1)),  # [B,nh,f,f]
+                "b1_states": torch.tile(self.b1, dims=(B,1,1,1)),
+            }
+            # inputs = {"XA": XA, "XB": XB, "XC": XC, "coeff": coeff}  # [B,nh,NC,CS,f]
+            inputs = tree_map(lambda x: x.permute(2,0,1,3,4), inputs)  # [B,nh,NC,CS,f] -> [NC,B,nh,CS,f]
+            batch_params_dic, XCW_batch = scan(compute_chunk, init_params_dic, inputs)  # [NC,B,nh,CS,f]
+
+        ######################
+        # XCW_batch = XCW_batch.permute(1, 2, 0, 3, 4).reshape(B, L, -1)  # [B,L,f]
+        XCW_batch = einops.rearrange(XCW_batch, "nc b nh cs f -> b (nc cs) (nh f)")  # [B,L,f]
+        return XCW_batch, batch_params_dic
+
+
+class TttM2BMMModule(TttBaseModule):
+    def __init__(self, config: TttConfig, layer_idx: Optional[int] = None):
+        super().__init__(config, layer_idx)
+        self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(1, self.num_heads, self.head_dim, 4 * self.head_dim)))
+        self.b1 = nn.Parameter(torch.zeros(1, self.num_heads, 1, 4 * self.head_dim))
+        self.W2 = nn.Parameter(torch.normal(0, 0.02, size=(1, self.num_heads, 4 * self.head_dim, self.head_dim)))
+        self.b2 = nn.Parameter(torch.zeros(1, self.num_heads, 1, self.head_dim))
+
+    def process_inner_loop(self, inputs, inner_chunk_size, last_chunk_params_dic, cache_params=None):
+        # @xinhao: decoding from a prompt of length 1 will always have `inner_chunk_size=remainder=1`
+        if inner_chunk_size is None:
+            inner_chunk_size = self.inner_chunk_size
+
+        B = inputs['XA'].shape[0]  # [B, nh, NC/g, g*CS, f]
+        L = inputs['XA'].shape[2] * inputs['XA'].shape[3]
+
+        if cache_params is not None:
+            # @xinhao: decoding
+            def compute_chunk(params_dic, inputs):
+                W1_init = params_dic["W1_states"]  # [B,nh,f,f]
+                b1_init = params_dic["b1_states"]  # [B,nh,1,f]
+                W2_init = params_dic["W2_states"]  # [B,nh,f,f]
+                b2_init = params_dic["b2_states"]  # [B,nh,1,f]
+
+                XA_chunk = inputs["XA"]  # [B,nh,K=1,f]
+                XB_chunk = inputs["XB"]
+                XC_chunk = inputs["XC"]
+                coeff_chunk = inputs["coeff"]  # [B,nh,K=1,1]
+
+                X1 = XB_chunk
+                Z1 = X1 @ W1_init + b1_init  # [B,nh,K=1,f] @ [B,nh,f,f] -> [B,nh,K=1,f]
+                X2 = F.gelu(Z1)
+                Z2 = X2 @ W2_init + b2_init
+
+                grad_l_wrt_Z2 = Z2 - XA_chunk
+                grad_W2 = X2.transpose(-2, -1) @ grad_l_wrt_Z2 + params_dic["W2_grad"]  # [B,nh,f,f]
+                grad_b2 = grad_l_wrt_Z2 + params_dic["b2_grad"]  # [B,nh,K=1,f]
+
+                grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2_init.transpose(-2,-1) * diff_gelu(Z1)
+                grad_W1 = X1.transpose(-2, -1) @ grad_l_wrt_Z1 + params_dic["W1_grad"]  # [B,nh,f,f]
+                grad_b1 = grad_l_wrt_Z1 + params_dic["b1_grad"]  # [B,nh,K=1,f]
+
+                W1_bar = W1_init - coeff_chunk * grad_W1
+                b1_bar = b1_init - coeff_chunk * grad_b1  # [B,nh,1,f] - [B,nh,K=1,1] * [B,nh,K=1,f]
+                W2_bar = W2_init - coeff_chunk * grad_W2
+                b2_bar = b2_init - coeff_chunk * grad_b2
+
+                Z1_bar = XC_chunk @ W1_bar + b1_bar  # [B,nh,K=1,f]
+                X2_bar = F.gelu(Z1_bar)
+                Z2_bar = X2_bar @ W2_bar + b2_bar
+                XCW_chunk = Z2_bar
+
+                last_param_dic = {
+                    "W1_states": W1_bar,
+                    "b1_states": b1_bar,
+                    "W2_states": W2_bar,
+                    "b2_states": b2_bar,
+                    "W1_grad": grad_W1,
+                    "b1_grad": grad_b1,
+                    "W2_grad": grad_W2,
+                    "b2_grad": grad_b2,
+                }
+                return last_param_dic, XCW_chunk
+
+            init_params_dic = {
+                "W1_states": torch.tile(self.W1, dims=(B, 1, 1, 1)),
+                "b1_states": torch.tile(self.b1, dims=(B, 1, 1, 1)),
+                "W2_states": torch.tile(self.W2, dims=(B, 1, 1, 1)),
+                "b2_states": torch.tile(self.b2, dims=(B, 1, 1, 1)),
+            }
+            init_params_dic.update(W1_grad=torch.zeros_like(init_params_dic["W1_states"]))
+            init_params_dic.update(b1_grad=torch.zeros_like(init_params_dic["b1_states"]))
+            init_params_dic.update(W2_grad=torch.zeros_like(init_params_dic["W2_states"]))
+            init_params_dic.update(b2_grad=torch.zeros_like(init_params_dic["b2_states"]))
+            inputs = tree_map(lambda x: x.permute(2, 0, 1, 3, 4), inputs)  # [B,nh,NC,CS,f] -> [NC,B,nh,CS,f]
+            batch_params_dic, XCW_batch = scan(compute_chunk, init_params_dic, inputs)  # [NC,B,nh,CS,f]
+
+        else:
+            def compute_chunk(params_dic, inputs):
+                W1_init = params_dic["W1_states"]  # [B,nh,f,f]
+                b1_init = params_dic["b1_states"]  # [B,nh,1,f]
+                W2_init = params_dic["W2_states"]  # [B,nh,f,f]
+                b2_init = params_dic["b2_states"]  # [B,nh,1,f]
+
+                XA_chunk = inputs["XA"]  # [B,nh,K,f]
+                XB_chunk = inputs["XB"]
+                XC_chunk = inputs["XC"]
+                coeff_chunk = inputs["coeff"]  # [B,nh,K,1]
+
+                X1 = XB_chunk
+                Z1 = X1 @ W1_init + b1_init  # [B,nh,K,f] @ [1,nh,f,f] + [B,nh,1,f] -> [B,nh,K,f]
+                X2 = F.gelu(Z1)
+                Z2 = X2 @ W2_init + b2_init
+
+                grad_l_wrt_Z2 = Z2 - XA_chunk  # [B,nh,K,f]
+                grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2_init.transpose(-2,-1) * diff_gelu(Z1)
+
+                Attn1 = torch.tril(XC_chunk @ X1.transpose(-2,-1))  # [B,nh,K,K]
+                b1_bar = b1_init - coeff_chunk * torch.cumsum(grad_l_wrt_Z1, dim=-2)  # [B,nh,1,f] - [B,nh,K,1] * [B,nh,K,f] -> [B,nh,K,f]
+                Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1 + b1_bar  # [B,nh,K,f] @ [1,nh,f,f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,f] + [B,nh,K,f]
+                X2_bar = F.gelu(Z1_bar)
+
+                Attn2 = torch.tril(X2_bar @ X2.transpose(-2,-1))  # [B,nh,K,K]
+                b2_bar = b2_init - coeff_chunk * torch.cumsum(grad_l_wrt_Z2, dim=-2)  # [1,nh,1,f] - [B,nh,K,1] * [B,nh,K,f] -> [B,nh,K,f]
+                Z2_bar = X2_bar @ W2_init - (coeff_chunk * Attn2) @ grad_l_wrt_Z2 + b2_bar  # [B,nh,K,f] @ [1,nh,f,f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,f] + [B,nh,K,f]
+                XCW_chunk = Z2_bar  # [B,nh,K,f]
+
+                W1_last = W1_init - (coeff_chunk[:,:,-1:] * X1).transpose(-1,-2) @ grad_l_wrt_Z1  # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
+                b1_last = b1_bar[:,:,-1:]  # [B,nh,1,f]
+                W2_last = W2_init - (coeff_chunk[:, :, -1:] * X2).transpose(-1,-2) @ grad_l_wrt_Z2  # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
+                b2_last = b2_bar[:, :, -1:]  # [B,nh,1,f]
+
+                last_param_dic = {
+                    "W1_states": W1_last,
+                    "b1_states": b1_last,
+                    "W2_states": W2_last,
+                    "b2_states": b2_last,
+                }
+                return last_param_dic, XCW_chunk
+
+            init_params_dic = {
+                "W1_states": torch.tile(self.W1, dims=(B, 1, 1, 1)),  # [B,nh,f,f]
+                "b1_states": torch.tile(self.b1, dims=(B, 1, 1, 1)),
+                "W2_states": torch.tile(self.W2, dims=(B, 1, 1, 1)),  # [B,nh,f,f]
+                "b2_states": torch.tile(self.b2, dims=(B, 1, 1, 1)),
+            }
+            # inputs = {"XA": XA, "XB": XB, "XC": XC, "coeff": coeff}  # [B,nh,NC,CS,f]
+            inputs = tree_map(lambda x: x.permute(2, 0, 1, 3, 4), inputs)  # [B,nh,NC,CS,f] -> [NC,B,nh,CS,f]
+            batch_params_dic, XCW_batch = scan(compute_chunk, init_params_dic, inputs)  # [NC,B,nh,CS,f]
+
+        ######################
+        # XCW_batch = XCW_batch.permute(1, 2, 0, 3, 4).reshape(B, L, -1)  # [B,L,f]
+        XCW_batch = einops.rearrange(XCW_batch, "nc b nh cs f -> b (nc cs) (nh f)")  # [B,L,f]
+        return XCW_batch, batch_params_dic
+
+
 class TttDecoderLayer(nn.Module):
     def __init__(self, config: TttConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        # TODO(jiarui): rename `self_attn` to ttt related?
-        # self.self_attn = TttModule(config=config, layer_idx=layer_idx)
-        self.self_attn = TttM1Module(config=config, layer_idx=layer_idx)
+        # self.self_attn = TttM1Module(config=config, layer_idx=layer_idx)  # @xinhao: M1 vmap module
+        if config.inner_net == 'mlp_1_dual':
+            self.self_attn = TttM1BMMModule(config=config, layer_idx=layer_idx)
+        elif config.inner_net == 'mlp_2_dual':
+            self.self_attn = TttM2BMMModule(config=config, layer_idx=layer_idx)
+        else:
+            raise NotImplementedError(f"Inner {config.inner_net} Not Implemented!")
 
         self.mlp = TttMLP(config)
         self.input_layernorm = TttRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
