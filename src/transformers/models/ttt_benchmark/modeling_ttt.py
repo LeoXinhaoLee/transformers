@@ -205,9 +205,6 @@ class TttBaseModule(nn.Module):
 
     def _split_chunks(self, hidden_states, inner_chunk_size=None):
         B, N, num_head, head_dim = hidden_states.shape
-        # @xinhao: 2 means two chunks as a group to use gradient checkpointing
-        # T=2048, optimal ckpt num = sqrt(T) ~= 45
-        # Since CS=16, when 4 chunks are grouped, ckpt num = 2048 / 64 = 32, which is closest to 45
         if inner_chunk_size is None:
             inner_chunk_size = self.inner_chunk_size
         hidden_states = hidden_states.reshape(B, -1, inner_chunk_size, self.num_heads, self.head_dim).permute(
@@ -269,11 +266,11 @@ class TttBaseModule(nn.Module):
         inputs = {'XC': XC, 'XB': XB, 'XA': XA, 'coeff': coeff}
         XCW_batch, batch_params_dic = self.process_inner_loop(
             inputs,
-            # XC, XB, XA, coeff,
             inner_chunk_size=inner_chunk_size,
             last_chunk_params_dic=last_chunk_params_dic,
             cache_params=cache_params,
         )
+        # XCW_batch = hidden_states; batch_params_dic = None  # @xinhao: for QKVO-MLP Only
         z_batch = self.project_inner_loop_outputs(XCW_batch)
 
         if return_params:
@@ -293,7 +290,6 @@ class TttBaseModule(nn.Module):
 
     def process_inner_loop(self,
                            inputs,
-                           # XC, XB, XA, coeff,
                            inner_chunk_size, last_chunk_params_dic, cache_params=None):
         """
         Inputs:
@@ -317,6 +313,7 @@ class TttBaseModule(nn.Module):
         output_hidden_states = []
         last_chunk_params_dic = None
         # @xinhao: decoding from a prompt of length 1 will not activate this
+        # @xinhao: prefilling should only activate this
         if num_chunks > 0:
             chunk_hidden_states, last_chunk_params_dic = self.forward_chunk(
                 hidden_states[:, : num_chunks * self.inner_chunk_size],
@@ -329,6 +326,7 @@ class TttBaseModule(nn.Module):
             output_hidden_states.append(chunk_hidden_states)
 
         # @xinhao: decoding from a prompt of length 1 will activate this
+        # @xinhao: prefilling should not activate this
         if reminder_len > 0:
             output_hidden_states.append(
                 self.forward_chunk(
@@ -376,7 +374,6 @@ class TttM1Module(TttBaseModule):
 
     def process_inner_loop(self,
                            inputs,
-                           # XC, XB, XA, coeff,
                            inner_chunk_size, last_chunk_params_dic, cache_params=None):
         # @xinhao: decoding from a prompt of length 1 will always have `inner_chunk_size=remainder=1`
         if inner_chunk_size is None:
@@ -565,11 +562,11 @@ class TttM1BMMModule(TttBaseModule):
 
                 grad_l_wrt_Z1 = Z1 - XA_chunk  # [B,nh,K,f]
                 Attn1 = torch.tril(XC_chunk @ XB_chunk.transpose(-1, -2))  # [B,nh,K,K]
-                b1_bar = b1_init - coeff_chunk * torch.cumsum(grad_l_wrt_Z1, dim=-2)  # [1,nh,1,f] - [B,nh,K,1] * [B,nh,K,f] -> [B,nh,K,f]
+                b1_bar = b1_init - coeff_chunk * torch.cumsum(grad_l_wrt_Z1, dim=-2)  # [B,nh,1,f] - [B,nh,K,1] * [B,nh,K,f] -> [B,nh,K,f]
                 Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1 + b1_bar  # [B,nh,K,f] @ [1,nh,f,f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,f] + [B,nh,K,f]
                 XCW_chunk = Z1_bar  # [B,nh,K,f]
 
-                W1_last = W1_init - (coeff_chunk[:,:,-1:] * X1).transpose(-1, -2) @ grad_l_wrt_Z1  # [1,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
+                W1_last = W1_init - (coeff_chunk[:,:,-1:] * X1).transpose(-1, -2) @ grad_l_wrt_Z1  # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
                 b1_last = b1_bar[:,:,-1:]  # [B,nh,1,f]
 
                 last_param_dic = {
@@ -691,11 +688,11 @@ class TttM2BMMModule(TttBaseModule):
 
                 Attn1 = torch.tril(XC_chunk @ X1.transpose(-2,-1))  # [B,nh,K,K]
                 b1_bar = b1_init - coeff_chunk * torch.cumsum(grad_l_wrt_Z1, dim=-2)  # [B,nh,1,f] - [B,nh,K,1] * [B,nh,K,f] -> [B,nh,K,f]
-                Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1 + b1_bar  # [B,nh,K,f] @ [1,nh,f,f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,f] + [B,nh,K,f]
+                Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1 + b1_bar  # [B,nh,K,f] @ [B,nh,f,f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,f] + [B,nh,K,f]
                 X2_bar = F.gelu(Z1_bar)
 
                 Attn2 = torch.tril(X2_bar @ X2.transpose(-2,-1))  # [B,nh,K,K]
-                b2_bar = b2_init - coeff_chunk * torch.cumsum(grad_l_wrt_Z2, dim=-2)  # [1,nh,1,f] - [B,nh,K,1] * [B,nh,K,f] -> [B,nh,K,f]
+                b2_bar = b2_init - coeff_chunk * torch.cumsum(grad_l_wrt_Z2, dim=-2)  # [B,nh,1,f] - [B,nh,K,1] * [B,nh,K,f] -> [B,nh,K,f]
                 Z2_bar = X2_bar @ W2_init - (coeff_chunk * Attn2) @ grad_l_wrt_Z2 + b2_bar  # [B,nh,K,f] @ [1,nh,f,f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,f] + [B,nh,K,f]
                 XCW_chunk = Z2_bar  # [B,nh,K,f]
 
