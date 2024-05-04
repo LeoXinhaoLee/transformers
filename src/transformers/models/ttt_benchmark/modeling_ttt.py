@@ -45,20 +45,25 @@ class TttCache:
                 self.params_dic[f"{name}_states"][layer_idx].copy_(py_tree[f"{name}_states"])
                 self.params_dic[f"{name}_grad"][layer_idx].zero_()
             # print('update seq_len % self.inner_chunk_size == 0')
+
         elif seq_len < self.inner_chunk_size:
+        # @xinhao: decode always has seq_len=1
             if seq_len != 1 and self.seqlen_offset > 0 and self.seqlen_offset % self.inner_chunk_size != 0:
                 raise ValueError("fractional update not supported yet.")
+
             if (seq_len + self.seqlen_offset) % self.inner_chunk_size == 0:
                 for name in self.param_names:
                     self.params_dic[f"{name}_states"][layer_idx].copy_(py_tree[f"{name}_states"])
                     self.params_dic[f"{name}_grad"][layer_idx].zero_()
                 # print('update seq_len + self.self.seqlen_offset % self.inner_chunk_size == 0')
+
             else:
                 for name in self.param_names:
                     self.params_dic[f"{name}_grad"][layer_idx].copy_(py_tree[f"{name}_grad"])
+
         else:
             raise ValueError(f"seq_len {seq_len} is a partial update not supported yet")
-    # for vmap
+
     def to_dic(self, layer_idx):
         return {name: self.params_dic[name][layer_idx] for name in self.params_dic}
 
@@ -526,14 +531,14 @@ def m1_decode_one_token(states, XA_chunk, XB_chunk, XC_chunk, coeff_chunk):
     ###
     ## Compact logic
     ###
-    W1_init = states['W1_init']
-    grad_W1 = states['grad_W1']
+    W1_init = states['W1_states']
+    W1_grad = states['W1_grad']
     Z1 = (XB_chunk @ W1_init).sub_(XA_chunk)  # [B*nh,1,f] @ [B*nh,f,f] -> [B*nh,1,f]
-    grad_W1.add_(torch.einsum('bij,bik->bjk', XB_chunk, Z1))  # [B*nh,f,1] @ [B*nh,1,f] -> [B*nh,f,f]
-    W1_init.sub_(coeff_chunk * grad_W1)
+    W1_grad.add_(torch.einsum('bij,bik->bjk', XB_chunk, Z1))  # [B*nh,f,1] @ [B*nh,1,f] -> [B*nh,f,f]
+    W1_init.sub_(coeff_chunk * W1_grad)
     Z1 = XC_chunk @ W1_init
-    states['W1_init'] = W1_init
-    states['grad_W1'] = grad_W1
+    states['W1_states'] = W1_init
+    states['W1_grad'] = W1_grad
     return states, Z1
 
 
@@ -571,9 +576,11 @@ class TttM1BMMModule(TttBaseModule):
                 return states, Z1  # [B*nh, f]
 
             states = {
-                "W1_init": torch.tile(self.W1, dims=(B,1,1)),  # [B*nh,f,f]
+                # "W1_states": torch.tile(self.W1, dims=(B,1,1)),  # [B*nh,f,f]
+                "W1_states": cache_params.params_dic["W1_states"][self.layer_idx],
+                "W1_grad": cache_params.params_dic["W1_grad"][self.layer_idx],
             }
-            states["grad_W1"] = torch.zeros_like(states['W1_init'])
+            # states["grad_W1"] = torch.zeros_like(states['W1_init'])
             inputs = tree_map(lambda x: einops.rearrange(x, 'b nh nc cs f -> nc (b nh) cs f')[0], inputs)
             batch_params_dic, XCW_batch = decode_one_token(
                 states,  # [B*nh,f,f], cloned from W1, safe for in-place op
@@ -604,6 +611,9 @@ class TttM1BMMModule(TttBaseModule):
                 torch.tile(self.W1, dims=(B,1,1)),  # [B*nh,f,f], cloned from W1, safe for in-place op
                 inputs,                             # [NC,B,nh,CS,f]
             )
+
+        if cache_params is not None:
+            cache_params.update(batch_params_dic, self.layer_idx, L)
 
         XCW_batch = einops.rearrange(XCW_batch, "nc (b nh) cs f -> b (nc cs) (nh f)", b=B, nh=NH)  # [B,L,f]
         return XCW_batch, batch_params_dic
@@ -996,10 +1006,10 @@ class TttModel(TttPreTrainedModel):
         for layer_idx in range(self.config.num_hidden_layers):
             for name in cache.param_names:
                 weight = getattr(self.layers[layer_idx].self_attn, name)
-                tiled_weight = torch.tile(weight.unsqueeze(0), (batch_size,) + (1,) * weight.dim())
+                # tiled_weight = torch.tile(weight.unsqueeze(0), (batch_size,) + (1,) * weight.dim())
+                tiled_weight = torch.tile(weight, (batch_size,) + (1,) * (weight.dim() - 1))  # [B*nh,f,f]
                 cache.params_dic[f"{name}_states"][layer_idx] = tiled_weight
                 cache.params_dic[f"{name}_grad"][layer_idx] = torch.zeros_like(tiled_weight)
-
         return cache
 
 
