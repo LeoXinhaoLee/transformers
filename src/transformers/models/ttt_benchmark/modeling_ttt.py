@@ -234,6 +234,7 @@ class TttBaseModule(nn.Module):
             inner_chunk_size = self.inner_chunk_size
 
         if cache_params is not None:
+            # TODO: keep recompiling when decoding
             inner_chunk_step_offset = cache_params.seqlen_offset % self.inner_chunk_size
             # print('inner_chunk_step_offset', inner_chunk_step_offset)
         else:
@@ -264,9 +265,15 @@ class TttBaseModule(nn.Module):
         last_chunk_params_dic: Optional[Dict[str, torch.Tensor]] = None,
         return_params: Optional[bool] = False,
     ):
-        XC, XB, XA, coeff = self.get_inner_loop_inputs(
-            hidden_states, position_ids=position_ids, cache_params=cache_params, inner_chunk_size=inner_chunk_size
-        )
+        if cache_params is None:
+            XC, XB, XA, coeff = self.get_inner_loop_inputs(
+                hidden_states, position_ids=position_ids, cache_params=cache_params, inner_chunk_size=inner_chunk_size
+            )
+        else:
+            # @xinhao: decoding time should not compile `get_inner_loop_inputs`. Otherwise will recompile every step.
+            XC, XB, XA, coeff = self._get_inner_loop_inputs(
+                hidden_states, position_ids=position_ids, cache_params=cache_params, inner_chunk_size=inner_chunk_size
+            )
         inputs = {'XC': XC, 'XB': XB, 'XA': XA, 'coeff': coeff}
         XCW_batch, batch_params_dic = self.process_inner_loop(
             inputs,
