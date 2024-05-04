@@ -35,7 +35,8 @@ class TttCache:
         self.inner_chunk_size = config.inner_net_chunk_size
 
         self.params_dic = defaultdict(dict)
-        self.param_names = ["W1", "b1"]
+        # self.param_names = ["W1", "b1"]
+        self.param_names = ["W1",]
 
     def update(self, py_tree, layer_idx, seq_len):
         # print('update', seq_len, self.inner_chunk_size, self.seqlen_offset)
@@ -156,7 +157,7 @@ def tree_map(fn, inputs):
         for val in inputs:
             out.append(fn(val))
     else:
-        out = fn(val)
+        out = fn(inputs)
     return out
 
 
@@ -488,13 +489,56 @@ class TttM1Module(TttBaseModule):
         XCW_batch = XCW_batch.permute(0, 2, 1, 3).reshape(B, L, -1)  # [B,L,f]
         return XCW_batch, batch_params_dic
 
-def m1_compute_chunk(W1_init, XA_chunk, XB_chunk, XC_chunk,
-                   coeff_chunk, coeff_chunk_last):
+def m1_prefill_chunk(W1_init, XA_chunk, XB_chunk, XC_chunk,
+                     coeff_chunk, coeff_chunk_last):
+    ###
+    ## Legible logic
+    ###
+    # Z1 = XB_chunk @ W1_init
+    # grad_l_wrt_Z1 = Z1 - XA_chunk
+    # Attn1 = torch.tril(XC_chunk @ XB_chunk.transpose(-1, -2))
+    # W1_init = W1_init - (coeff_chunk_last * XB_chunk).transpose(-1, -2) @ grad_l_wrt_Z1
+    # Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1
+    ###
+
+    ###
+    ## Compact logic
+    ###
     Z1 = (XB_chunk @ W1_init).sub_(XA_chunk)  # [B*nh,K,f] @ [B*nh,f,f] -> [B*nh,K,f]
     Attn1 = torch.tril(XC_chunk @ XB_chunk.transpose(-1, -2))  # [B*nh,K,K]
     W1_init.sub_((coeff_chunk_last * XB_chunk).transpose(-1, -2) @ Z1)
     Z1 = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ Z1  # [B*nh,K,f] @ [B*nh,f,f] - ([B*nh,K,1] * [B*nh,K,K]) @ [B*nh,K,f]
     return W1_init, Z1
+
+def m1_decode_one_token(states, XA_chunk, XB_chunk, XC_chunk, coeff_chunk):
+    ###
+    ## Legible logic
+    ###
+    # X1 = XB_chunk
+    # Z1 = X1 @ W1_init  # [B,nh,K=1,f] @ [B,nh,f,f] -> [B,nh,K=1,f]
+    #
+    # grad_l_wrt_Z1 = Z1 - XA_chunk
+    # grad_W1 = XB_chunk.transpose(-2, -1) @ grad_l_wrt_Z1 + params_dic["W1_grad"]  # [B,nh,f,f]
+    #
+    # Z1_bar = XC_chunk @ (W1_init - coeff_chunk * grad_W1)  # [B,nh,K=1,f]
+    # XCW_chunk = Z1_bar
+    #
+    # W1_last = W1_init - coeff_chunk * grad_W1
+    ###
+
+    ###
+    ## Compact logic
+    ###
+    W1_init = states['W1_init']
+    grad_W1 = states['grad_W1']
+    Z1 = (XB_chunk @ W1_init).sub_(XA_chunk)  # [B*nh,1,f] @ [B*nh,f,f] -> [B*nh,1,f]
+    grad_W1.add_(torch.einsum('bij,bik->bjk', XB_chunk, Z1))  # [B*nh,f,1] @ [B*nh,1,f] -> [B*nh,f,f]
+    W1_init.sub_(coeff_chunk * grad_W1)
+    Z1 = XC_chunk @ W1_init
+    states['W1_init'] = W1_init
+    states['grad_W1'] = grad_W1
+    return states, Z1
+
 
 class TttM1BMMModule(TttBaseModule):
     def __init__(self, config: TttConfig, layer_idx: Optional[int] = None):
@@ -502,9 +546,11 @@ class TttM1BMMModule(TttBaseModule):
         self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim, self.head_dim)))
 
         if self.config.use_compile:
-            self.compute_chunk = torch.compile(m1_compute_chunk)
+            self.prefill_chunk = torch.compile(m1_prefill_chunk)
+            self.decode_chunk = torch.compile(m1_decode_one_token)
         else:
-            self.compute_chunk = m1_compute_chunk
+            self.prefill_chunk = m1_prefill_chunk
+            self.decode_chunk = m1_decode_one_token
 
     def process_inner_loop(self, inputs, inner_chunk_size, last_chunk_params_dic, cache_params=None):
         # @xinhao: decoding from a prompt of length 1 will always have `inner_chunk_size=remainder=1`
@@ -518,37 +564,57 @@ class TttM1BMMModule(TttBaseModule):
 
         if cache_params is not None:
             # @xinhao: decoding
-            def compute_chunk(params_dic, inputs):
-                W1_init = params_dic["W1_states"]  # [B,nh,f,f]
+            # def compute_chunk(params_dic, inputs):
+            #     W1_init = params_dic["W1_states"]  # [B,nh,f,f]
+            #     XA_chunk = inputs["XA"]  # [B,nh,K=1,f]
+            #     XB_chunk = inputs["XB"]
+            #     XC_chunk = inputs["XC"]
+            #     coeff_chunk = inputs["coeff"]  # [B,nh,K=1,1]
+            #
+            #     X1 = XB_chunk
+            #     Z1 = X1 @ W1_init  # [B,nh,K=1,f] @ [B,nh,f,f] -> [B,nh,K=1,f]
+            #
+            #     grad_l_wrt_Z1 = Z1 - XA_chunk
+            #     grad_W1 = XB_chunk.transpose(-2, -1) @ grad_l_wrt_Z1 + params_dic["W1_grad"]  # [B,nh,f,f]
+            #
+            #     Z1_bar = XC_chunk @ (W1_init - coeff_chunk * grad_W1)  # [B,nh,K=1,f]
+            #     XCW_chunk = Z1_bar
+            #
+            #     W1_last = W1_init - coeff_chunk * grad_W1
+            #
+            #     last_param_dic = {
+            #         "W1_states": W1_last,
+            #         "W1_grad": grad_W1,
+            #     }
+            #     return last_param_dic, XCW_chunk
+            #
+            # init_params_dic = {
+            #     "W1_states": torch.tile(self.W1, dims=(B,1,1,1)),
+            # }
+            # init_params_dic.update(W1_grad=torch.zeros_like(init_params_dic["W1_states"]))
+            # inputs = tree_map(lambda x: x.permute(2, 0, 1, 3, 4), inputs)  # [B,nh,NC,CS,f] -> [NC,B,nh,CS,f]
+            # batch_params_dic, XCW_batch = scan(compute_chunk, init_params_dic, inputs)  # [NC,B,nh,CS,f]
 
-                XA_chunk = inputs["XA"]  # [B,nh,K=1,f]
+            ###############
+            def decode_one_token(states, inputs):
+                XA_chunk = inputs["XA"]        # [B*nh,K,f]
                 XB_chunk = inputs["XB"]
                 XC_chunk = inputs["XC"]
-                coeff_chunk = inputs["coeff"]  # [B,nh,K=1,1]
+                coeff_chunk = inputs["coeff"]  # [B*nh,K,1]
 
-                X1 = XB_chunk
-                Z1 = X1 @ W1_init  # [B,nh,K=1,f] @ [B,nh,f,f] -> [B,nh,K=1,f]
+                states, Z1 = self.decode_chunk(states, XA_chunk, XB_chunk, XC_chunk, coeff_chunk)
+                return states, Z1  # [B*nh, f]
 
-                grad_l_wrt_Z1 = Z1 - XA_chunk
-                grad_W1 = XB_chunk.transpose(-2, -1) @ grad_l_wrt_Z1 + params_dic["W1_grad"]  # [B,nh,f,f]
-
-                Z1_bar = XC_chunk @ (W1_init - coeff_chunk * grad_W1)  # [B,nh,K=1,f]
-                XCW_chunk = Z1_bar
-
-                W1_last = W1_init - coeff_chunk * grad_W1
-
-                last_param_dic = {
-                    "W1_states": W1_last,
-                    "W1_grad": grad_W1,
-                }
-                return last_param_dic, XCW_chunk
-
-            init_params_dic = {
-                "W1_states": torch.tile(self.W1, dims=(B,1,1,1)),
+            states = {
+                "W1_init": torch.tile(self.W1, dims=(B,1,1)),  # [B*nh,f,f]
             }
-            init_params_dic.update(W1_grad=torch.zeros_like(init_params_dic["W1_states"]))
-            inputs = tree_map(lambda x: x.permute(2, 0, 1, 3, 4), inputs)  # [B,nh,NC,CS,f] -> [NC,B,nh,CS,f]
-            batch_params_dic, XCW_batch = scan(compute_chunk, init_params_dic, inputs)  # [NC,B,nh,CS,f]
+            states["grad_W1"] = torch.zeros_like(states['W1_init'])
+            inputs = tree_map(lambda x: einops.rearrange(x, 'b nh nc cs f -> nc (b nh) cs f')[0], inputs)
+            batch_params_dic, XCW_batch = decode_one_token(
+                states,  # [B*nh,f,f], cloned from W1, safe for in-place op
+                inputs,  # [B*nh,f]
+            )
+            XCW_batch = XCW_batch.unsqueeze(0)  # [NC=1,B*nh,CS=1,f]
 
         else:
             def for_loop(W1_init, inputs):
@@ -561,33 +627,17 @@ class TttM1BMMModule(TttBaseModule):
                     coeff_chunk = inputs["coeff"][i]  # [B*nh,K,1]
                     coeff_chunk_last = inputs["coeff_chunk_last"][i]  # [B*nh,1,1]
 
-                    ###
-                    ## Legible logic
-                    ###
-                    # Z1 = XB_chunk @ W1_init
-                    # grad_l_wrt_Z1 = Z1 - XA_chunk
-                    # Attn1 = torch.tril(XC_chunk @ XB_chunk.transpose(-1, -2))
-                    # W1_init = W1_init - (coeff_chunk_last * XB_chunk).transpose(-1, -2) @ grad_l_wrt_Z1
-                    # Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1
-                    ###
-
-                    # Z1 = (XB_chunk @ W1_init).sub_(XA_chunk)  # [B*nh,K,f] @ [B*nh,f,f] -> [B*nh,K,f]
-                    # Attn1 = torch.tril(XC_chunk @ XB_chunk.transpose(-1,-2))  # [B*nh,K,K]
-                    # W1_init.sub_((coeff_chunk_last * XB_chunk).transpose(-1,-2) @ Z1)
-                    # Z1 = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ Z1  # [B*nh,K,f] @ [B*nh,f,f] - ([B*nh,K,1] * [B*nh,K,K]) @ [B*nh,K,f]
-                    # output_tensor[i] = Z1
-
-                    W1_init, Z1 = self.compute_chunk(W1_init,
+                    W1_init, Z1 = self.prefill_chunk(W1_init,
                                                      XA_chunk, XB_chunk, XC_chunk,
                                                      coeff_chunk, coeff_chunk_last)
                     output_tensor[i] = Z1
-
                 return W1_init, output_tensor  # [NC, B*nh, K, f]
 
             inputs = tree_map(lambda x: x.permute(2,0,1,3,4).reshape(NC, B * NH, CS, -1), inputs)  # [B,nh,NC,CS,f] -> [NC,B,nh,CS,f] -> [NC,B*nh,CS,f]
             batch_params_dic, XCW_batch = for_loop(
                 torch.tile(self.W1, dims=(B,1,1)),  # [B*nh,f,f], cloned from W1, safe for in-place op
-                inputs)  # [NC,B,nh,CS,f]
+                inputs,                             # [NC,B,nh,CS,f]
+            )
 
         XCW_batch = einops.rearrange(XCW_batch, "nc (b nh) cs f -> b (nc cs) (nh f)", b=B, nh=NH)  # [B,L,f]
         return XCW_batch, batch_params_dic
@@ -1001,8 +1051,10 @@ class TttForCausalLM(TttPreTrainedModel):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         if config.use_compile:
             self.get_output_logits = torch.compile(self._get_output_logits)
+        else:
+            self.get_output_logits = self._get_output_logits
 
-        # Initialize weights and apply final processing
+            # Initialize weights and apply final processing
         self.post_init()
 
     def _get_output_logits(self, hidden_states):
