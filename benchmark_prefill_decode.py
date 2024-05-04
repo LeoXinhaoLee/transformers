@@ -113,7 +113,7 @@ else:
     #                                              device_map={"": device},
     #                                              torch_dtype=dtype)
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")  # meta-llama/Llama-2-7b
-    config = LlamaConfig.from_json_file('/nlp/scr/yusun/data/xinhao/llama_config/config.json')
+    config = LlamaConfig.from_json_file('./llama_config/config.json')
     config._attn_implementation = args.attn_impl  # @xinhao: llama config use `_attn_implementation` to select attn
     model = LlamaForCausalLM(config).to(device=device, dtype=dtype)
 
