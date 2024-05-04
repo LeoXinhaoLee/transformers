@@ -489,6 +489,7 @@ class TttM1Module(TttBaseModule):
         XCW_batch = XCW_batch.permute(0, 2, 1, 3).reshape(B, L, -1)  # [B,L,f]
         return XCW_batch, batch_params_dic
 
+
 def m1_prefill_chunk(W1_init, XA_chunk, XB_chunk, XC_chunk,
                      coeff_chunk, coeff_chunk_last):
     ###
@@ -497,18 +498,18 @@ def m1_prefill_chunk(W1_init, XA_chunk, XB_chunk, XC_chunk,
     # Z1 = XB_chunk @ W1_init
     # grad_l_wrt_Z1 = Z1 - XA_chunk
     # Attn1 = torch.tril(XC_chunk @ XB_chunk.transpose(-1, -2))
-    # W1_init = W1_init - (coeff_chunk_last * XB_chunk).transpose(-1, -2) @ grad_l_wrt_Z1
     # Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1
-    ###
+    # W1_last = W1_init - (coeff_chunk_last * XB_chunk).transpose(-1, -2) @ grad_l_wrt_Z1
 
     ###
     ## Compact logic
     ###
     Z1 = (XB_chunk @ W1_init).sub_(XA_chunk)  # [B*nh,K,f] @ [B*nh,f,f] -> [B*nh,K,f]
     Attn1 = torch.tril(XC_chunk @ XB_chunk.transpose(-1, -2))  # [B*nh,K,K]
+    Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ Z1  # [B*nh,K,f] @ [B*nh,f,f] - ([B*nh,K,1] * [B*nh,K,K]) @ [B*nh,K,f]
     W1_init.sub_((coeff_chunk_last * XB_chunk).transpose(-1, -2) @ Z1)
-    Z1 = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ Z1  # [B*nh,K,f] @ [B*nh,f,f] - ([B*nh,K,1] * [B*nh,K,K]) @ [B*nh,K,f]
-    return W1_init, Z1
+    return W1_init, Z1_bar
+
 
 def m1_decode_one_token(states, XA_chunk, XB_chunk, XC_chunk, coeff_chunk):
     ###
@@ -516,15 +517,11 @@ def m1_decode_one_token(states, XA_chunk, XB_chunk, XC_chunk, coeff_chunk):
     ###
     # X1 = XB_chunk
     # Z1 = X1 @ W1_init  # [B,nh,K=1,f] @ [B,nh,f,f] -> [B,nh,K=1,f]
-    #
     # grad_l_wrt_Z1 = Z1 - XA_chunk
     # grad_W1 = XB_chunk.transpose(-2, -1) @ grad_l_wrt_Z1 + params_dic["W1_grad"]  # [B,nh,f,f]
-    #
     # Z1_bar = XC_chunk @ (W1_init - coeff_chunk * grad_W1)  # [B,nh,K=1,f]
     # XCW_chunk = Z1_bar
-    #
     # W1_last = W1_init - coeff_chunk * grad_W1
-    ###
 
     ###
     ## Compact logic
@@ -563,39 +560,7 @@ class TttM1BMMModule(TttBaseModule):
         inputs.update(coeff_chunk_last=inputs['coeff'][...,-1:])  # [B,nh,NC,CS,1] -> [B,nh,NC,1,1]
 
         if cache_params is not None:
-            # @xinhao: decoding
-            # def compute_chunk(params_dic, inputs):
-            #     W1_init = params_dic["W1_states"]  # [B,nh,f,f]
-            #     XA_chunk = inputs["XA"]  # [B,nh,K=1,f]
-            #     XB_chunk = inputs["XB"]
-            #     XC_chunk = inputs["XC"]
-            #     coeff_chunk = inputs["coeff"]  # [B,nh,K=1,1]
-            #
-            #     X1 = XB_chunk
-            #     Z1 = X1 @ W1_init  # [B,nh,K=1,f] @ [B,nh,f,f] -> [B,nh,K=1,f]
-            #
-            #     grad_l_wrt_Z1 = Z1 - XA_chunk
-            #     grad_W1 = XB_chunk.transpose(-2, -1) @ grad_l_wrt_Z1 + params_dic["W1_grad"]  # [B,nh,f,f]
-            #
-            #     Z1_bar = XC_chunk @ (W1_init - coeff_chunk * grad_W1)  # [B,nh,K=1,f]
-            #     XCW_chunk = Z1_bar
-            #
-            #     W1_last = W1_init - coeff_chunk * grad_W1
-            #
-            #     last_param_dic = {
-            #         "W1_states": W1_last,
-            #         "W1_grad": grad_W1,
-            #     }
-            #     return last_param_dic, XCW_chunk
-            #
-            # init_params_dic = {
-            #     "W1_states": torch.tile(self.W1, dims=(B,1,1,1)),
-            # }
-            # init_params_dic.update(W1_grad=torch.zeros_like(init_params_dic["W1_states"]))
-            # inputs = tree_map(lambda x: x.permute(2, 0, 1, 3, 4), inputs)  # [B,nh,NC,CS,f] -> [NC,B,nh,CS,f]
-            # batch_params_dic, XCW_batch = scan(compute_chunk, init_params_dic, inputs)  # [NC,B,nh,CS,f]
 
-            ###############
             def decode_one_token(states, inputs):
                 XA_chunk = inputs["XA"]        # [B*nh,K,f]
                 XB_chunk = inputs["XB"]
@@ -617,6 +582,7 @@ class TttM1BMMModule(TttBaseModule):
             XCW_batch = XCW_batch.unsqueeze(0)  # [NC=1,B*nh,CS=1,f]
 
         else:
+
             def for_loop(W1_init, inputs):
                 output_tensor = torch.empty(size=(NC, B * NH, CS, HF), device=W1_init.device, dtype=input_dtype)
                 for i in range(NC):
@@ -627,10 +593,10 @@ class TttM1BMMModule(TttBaseModule):
                     coeff_chunk = inputs["coeff"][i]  # [B*nh,K,1]
                     coeff_chunk_last = inputs["coeff_chunk_last"][i]  # [B*nh,1,1]
 
-                    W1_init, Z1 = self.prefill_chunk(W1_init,
-                                                     XA_chunk, XB_chunk, XC_chunk,
-                                                     coeff_chunk, coeff_chunk_last)
-                    output_tensor[i] = Z1
+                    W1_init, Z1_bar = self.prefill_chunk(W1_init,
+                                                         XA_chunk, XB_chunk, XC_chunk,
+                                                         coeff_chunk, coeff_chunk_last)
+                    output_tensor[i] = Z1_bar
                 return W1_init, output_tensor  # [NC, B*nh, K, f]
 
             inputs = tree_map(lambda x: x.permute(2,0,1,3,4).reshape(NC, B * NH, CS, -1), inputs)  # [B,nh,NC,CS,f] -> [NC,B,nh,CS,f] -> [NC,B*nh,CS,f]
@@ -830,10 +796,6 @@ class TttDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
 
         # Fully Connected
-        # residual = hidden_states
-        # hidden_states = self.post_attention_layernorm(hidden_states)
-        # hidden_states = self.mlp(hidden_states)
-        # hidden_states = residual + hidden_states
         hidden_states = self.mlp_forward(hidden_states)
 
         return hidden_states
