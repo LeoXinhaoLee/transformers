@@ -200,11 +200,13 @@ class TttBaseModule(nn.Module):
 
         self.get_ilr = nn.Linear(self.width, self.num_heads, bias=True)
 
-    def _split_heads(self, hidden_states):
-        return hidden_states.reshape(hidden_states.shape[:2] + (self.num_heads, self.head_dim))
+        if config.use_compile:
+            self.get_inner_loop_inputs = torch.compile(self._get_inner_loop_inputs)
+        else:
+            self.get_inner_loop_inputs = self._get_inner_loop_inputs
 
-    def _split_chunks(self, hidden_states, inner_chunk_size=None):
-        B, N, num_head, head_dim = hidden_states.shape
+    def _split_chunks_heads(self, hidden_states, inner_chunk_size=None):
+        B, N, F = hidden_states.shape
         if inner_chunk_size is None:
             inner_chunk_size = self.inner_chunk_size
         hidden_states = hidden_states.reshape(B, -1, inner_chunk_size, self.num_heads, self.head_dim).permute(
@@ -212,7 +214,7 @@ class TttBaseModule(nn.Module):
         )  # [B,nh,n_chunk,K,f]
         return hidden_states
 
-    def get_inner_loop_inputs(
+    def _get_inner_loop_inputs(
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.LongTensor,
@@ -236,18 +238,14 @@ class TttBaseModule(nn.Module):
 
         XC, XB, XA = self.q_proj(batch), self.k_proj(batch), self.v_proj(batch)  # [B,N,F]
 
-        XC = self._split_heads(XC)  # [B,N,nh,f]
-        XB = self._split_heads(XB)
-        XA = self._split_heads(XA)
-
-        XC = self._split_chunks(XC, inner_chunk_size)  # [B,nh,NC / g, g * CS,f]
-        XB = self._split_chunks(XB, inner_chunk_size)
-        XA = self._split_chunks(XA, inner_chunk_size)
+        XC = self._split_chunks_heads(XC, inner_chunk_size)  # [B,nh,NC / g, g * CS,f]
+        XB = self._split_chunks_heads(XB, inner_chunk_size)
+        XA = self._split_chunks_heads(XA, inner_chunk_size)
 
         ilr_gated = self.get_ilr(X).permute(0,3,1,2).unsqueeze(-1)  # [B,NC,CS,nh] -> [B,nh,NC,CS,1]
         ilr_gated = F.sigmoid(ilr_gated)
         token_idx = self.token_idx[inner_chunk_step_offset : inner_chunk_step_offset + inner_chunk_size]  # [B, L]
-        coeff = (self.config.inner_net_lr * token_idx).reshape(1, 1, 1, -1, 1) * ilr_gated / self.head_dim
+        coeff = (self.config.inner_net_lr * token_idx).reshape(1, 1, 1, -1, 1) * ilr_gated / self.head_dim  # [B,nh,NC,CS,1]
         return XC, XB, XA, coeff
 
     def forward_chunk(
@@ -270,7 +268,7 @@ class TttBaseModule(nn.Module):
             last_chunk_params_dic=last_chunk_params_dic,
             cache_params=cache_params,
         )
-        # XCW_batch = hidden_states; batch_params_dic = None  # @xinhao: for QKVO-MLP Only
+        # XCW_batch = XA + XB + XC; batch_params_dic = None  # @xinhao: for QKVO-MLP Only
         z_batch = self.project_inner_loop_outputs(XCW_batch)
 
         if return_params:
@@ -490,19 +488,33 @@ class TttM1Module(TttBaseModule):
         XCW_batch = XCW_batch.permute(0, 2, 1, 3).reshape(B, L, -1)  # [B,L,f]
         return XCW_batch, batch_params_dic
 
+def m1_compute_chunk(W1_init, XA_chunk, XB_chunk, XC_chunk,
+                   coeff_chunk, coeff_chunk_last):
+    Z1 = (XB_chunk @ W1_init).sub_(XA_chunk)  # [B*nh,K,f] @ [B*nh,f,f] -> [B*nh,K,f]
+    Attn1 = torch.tril(XC_chunk @ XB_chunk.transpose(-1, -2))  # [B*nh,K,K]
+    W1_init.sub_((coeff_chunk_last * XB_chunk).transpose(-1, -2) @ Z1)
+    Z1 = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ Z1  # [B*nh,K,f] @ [B*nh,f,f] - ([B*nh,K,1] * [B*nh,K,K]) @ [B*nh,K,f]
+    return W1_init, Z1
 
 class TttM1BMMModule(TttBaseModule):
     def __init__(self, config: TttConfig, layer_idx: Optional[int] = None):
         super().__init__(config, layer_idx)
         self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim, self.head_dim)))
 
+        if self.config.use_compile:
+            self.compute_chunk = torch.compile(m1_compute_chunk)
+        else:
+            self.compute_chunk = m1_compute_chunk
+
     def process_inner_loop(self, inputs, inner_chunk_size, last_chunk_params_dic, cache_params=None):
         # @xinhao: decoding from a prompt of length 1 will always have `inner_chunk_size=remainder=1`
         if inner_chunk_size is None:
             inner_chunk_size = self.inner_chunk_size
 
-        B, NH, NC, CS = inputs['XA'].shape[:-1]
+        B, NH, NC, CS, HF = inputs['XA'].shape
+        input_dtype = inputs['XA'].dtype
         L = NC * CS
+        inputs.update(coeff_chunk_last=inputs['coeff'][...,-1:])  # [B,nh,NC,CS,1] -> [B,nh,NC,1,1]
 
         if cache_params is not None:
             # @xinhao: decoding
@@ -539,58 +551,38 @@ class TttM1BMMModule(TttBaseModule):
             batch_params_dic, XCW_batch = scan(compute_chunk, init_params_dic, inputs)  # [NC,B,nh,CS,f]
 
         else:
-            # def compute_chunk(params_dic, inputs):
-            #     W1_init = params_dic["W1_states"]  # [B,nh,f,f]
-            #
-            #     XA_chunk = inputs["XA"]  # [B,nh,K,f]
-            #     XB_chunk = inputs["XB"]
-            #     XC_chunk = inputs["XC"]
-            #     coeff_chunk = inputs["coeff"]  # [B,nh,K,1]
-            #
-            #     X1 = XB_chunk
-            #
-            #     Z1 = X1 @ W1_init  # [B,nh,K,f] @ [1,nh,f,f] + [B,nh,1,f] -> [B,nh,K,f]
-            #
-            #     grad_l_wrt_Z1 = Z1 - XA_chunk  # [B,nh,K,f]
-            #
-            #     Attn1 = torch.tril(XC_chunk @ XB_chunk.transpose(-1, -2))  # [B,nh,K,K]
-            #
-            #     Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1  # [B,nh,K,f] @ [1,nh,f,f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,f] + [B,nh,K,f]
-            #
-            #     XCW_chunk = Z1_bar  # [B,nh,K,f]
-            #
-            #     W1_last = W1_init - (coeff_chunk[:,:,-1:] * X1).transpose(-1, -2) @ grad_l_wrt_Z1  # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
-            #
-            #     last_param_dic = {
-            #         "W1_states": W1_last,
-            #     }
-            #     return last_param_dic, XCW_chunk
-
             def for_loop(W1_init, inputs):
-                output_list = []
+                output_tensor = torch.empty(size=(NC, B * NH, CS, HF), device=W1_init.device, dtype=input_dtype)
                 for i in range(NC):
+                    # TODO: select is slow
                     XA_chunk = inputs["XA"][i]  # [B*nh,K,f]
                     XB_chunk = inputs["XB"][i]
                     XC_chunk = inputs["XC"][i]
                     coeff_chunk = inputs["coeff"][i]  # [B*nh,K,1]
+                    coeff_chunk_last = inputs["coeff_chunk_last"][i]  # [B*nh,1,1]
 
-                    Z1 = XB_chunk @ W1_init  # [B*nh,K,f] @ [B*nh,f,f] -> [B*nh,K,f]; @xinhao: can be pre-computed with XC_chunk @ W1_init, but can have mem issue
+                    ###
+                    ## Legible logic
+                    ###
+                    # Z1 = XB_chunk @ W1_init
+                    # grad_l_wrt_Z1 = Z1 - XA_chunk
+                    # Attn1 = torch.tril(XC_chunk @ XB_chunk.transpose(-1, -2))
+                    # W1_init = W1_init - (coeff_chunk_last * XB_chunk).transpose(-1, -2) @ grad_l_wrt_Z1
+                    # Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1
+                    ###
 
-                    # grad_l_wrt_Z1 = Z1 - XA_chunk  # [B*nh,K,f]
-                    Z1.sub_(XA_chunk)  # Z1 -> grad_l_wrt_Z1 = Z1 - XA_chunk  # [B*nh,K,f]
+                    # Z1 = (XB_chunk @ W1_init).sub_(XA_chunk)  # [B*nh,K,f] @ [B*nh,f,f] -> [B*nh,K,f]
+                    # Attn1 = torch.tril(XC_chunk @ XB_chunk.transpose(-1,-2))  # [B*nh,K,K]
+                    # W1_init.sub_((coeff_chunk_last * XB_chunk).transpose(-1,-2) @ Z1)
+                    # Z1 = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ Z1  # [B*nh,K,f] @ [B*nh,f,f] - ([B*nh,K,1] * [B*nh,K,K]) @ [B*nh,K,f]
+                    # output_tensor[i] = Z1
 
-                    Attn1 = torch.tril(XC_chunk @ XB_chunk.transpose(-1,-2))  # [B*nh,K,K]
+                    W1_init, Z1 = self.compute_chunk(W1_init,
+                                                     XA_chunk, XB_chunk, XC_chunk,
+                                                     coeff_chunk, coeff_chunk_last)
+                    output_tensor[i] = Z1
 
-                    # W1_init = W1_init - (coeff_chunk[:, :, -1:] * XB_chunk).transpose(-1,-2) @ Z1  # [B*nh,f,f] - ([B*nh,K,1]*[B*nh,K,f]).t() @ [B*nh,K,f]
-                    W1_init.sub_((coeff_chunk[:, :, -1:] * XB_chunk).transpose(-1,-2) @ Z1)
-
-                    # Z1_bar
-                    Z1 = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ Z1  # [B*nh,K,f] @ [B*nh,f,f] - ([B*nh,K,1] * [B*nh,K,K]) @ [B*nh,K,f]
-                    # Z1 = torch.addbmm(input=XC_chunk @ W1_init, batch1=coeff_chunk * Attn1, batch2=Z1, alpha=-1., beta=1)
-
-                    output_list.append(Z1)  # [B,nh,K,f]
-
-                return W1_init, torch.stack(output_list)
+                return W1_init, output_tensor  # [NC, B*nh, K, f]
 
             inputs = tree_map(lambda x: x.permute(2,0,1,3,4).reshape(NC, B * NH, CS, -1), inputs)  # [B,nh,NC,CS,f] -> [NC,B,nh,CS,f] -> [NC,B*nh,CS,f]
             batch_params_dic, XCW_batch = for_loop(
@@ -755,6 +747,18 @@ class TttDecoderLayer(nn.Module):
         self.post_attention_layernorm = TttRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layer_idx = layer_idx
 
+        if config.use_compile:
+            self.mlp_forward = torch.compile(self._mlp_forward)
+        else:
+            self.mlp_forward = self._mlp_forward
+
+    def _mlp_forward(self, hidden_states: torch.Tensor):
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -776,10 +780,11 @@ class TttDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
 
         # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        # residual = hidden_states
+        # hidden_states = self.post_attention_layernorm(hidden_states)
+        # hidden_states = self.mlp(hidden_states)
+        # hidden_states = residual + hidden_states
+        hidden_states = self.mlp_forward(hidden_states)
 
         return hidden_states
 
@@ -994,9 +999,15 @@ class TttForCausalLM(TttPreTrainedModel):
         self.model = TttModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config.use_compile:
+            self.get_output_logits = torch.compile(self._get_output_logits)
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    def _get_output_logits(self, hidden_states):
+        logits = self.lm_head(hidden_states)
+        return logits
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -1099,7 +1110,9 @@ class TttForCausalLM(TttPreTrainedModel):
             logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
             logits = torch.cat(logits, dim=-1)
         else:
-            logits = self.lm_head(hidden_states)
+            logits = self.get_output_logits(hidden_states)
+            # logits = self.lm_head(hidden_states)
+
         logits = logits.float()
 
         loss = None

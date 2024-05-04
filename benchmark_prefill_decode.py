@@ -32,8 +32,8 @@ import torch.nn.functional as F
 
 from einops import rearrange
 
-from transformers import AutoTokenizer, AutoModelForCausalLM, MambaForCausalLM, AutoConfig
-from transformers import GPT2Model, GPT2LMHeadModel
+from transformers import AutoTokenizer, AutoModelForCausalLM, MambaForCausalLM, AutoConfig, PretrainedConfig
+from transformers import GPT2Model, GPT2LMHeadModel, LlamaForCausalLM, LlamaConfig
 
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 # from transformers.models.ttt.modeling_ttt import TttConfig, TttForCausalLM
@@ -51,6 +51,7 @@ parser.add_argument("--genlen", type=int, default=128)
 parser.add_argument("--batch", type=int, default=1)
 parser.add_argument("--attn_impl", type=str, default='flash_attention_2', choices=['eager', 'flash_attention_2'])
 parser.add_argument("--inner_net", type=str, default='mlp_2_dual', choices=['mlp_1_dual', 'mlp_2_dual'])
+parser.add_argument("--use_compile", action='store_true')
 args = parser.parse_args()
 
 def print_args(args):
@@ -99,17 +100,23 @@ elif is_ttt:
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
     ttt_config = TttConfig(**TTT_STANDARD_CONFIGS[ttt_size])
     ttt_config.inner_net = args.inner_net
+    ttt_config.use_compile = args.use_compile
     model = TttForCausalLM(ttt_config).to(device=device, dtype=dtype)
 else:
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    # tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     # config = AutoConfig.from_pretrained(args.model_name)
     # config.n_positions = 4096
     # config.attn_implementation = args.attn_impl
     # model = GPT2LMHeadModel(config).to(device=device, dtype=dtype)
-    model = AutoModelForCausalLM.from_pretrained(args.model_name,
-                                                 attn_implementation=args.attn_impl,
-                                                 device_map={"": device},
-                                                 torch_dtype=dtype)
+    # model = AutoModelForCausalLM.from_pretrained(args.model_name,
+    #                                              attn_implementation=args.attn_impl,
+    #                                              device_map={"": device},
+    #                                              torch_dtype=dtype)
+    tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")  # meta-llama/Llama-2-7b
+    config = LlamaConfig.from_json_file('/nlp/scr/yusun/data/xinhao/llama_config/config.json')
+    config._attn_implementation = args.attn_impl  # @xinhao: llama config use `_attn_implementation` to select attn
+    model = LlamaForCausalLM(config).to(device=device, dtype=dtype)
+
 model.eval()
 logger.info(f"Number of parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
 
@@ -167,6 +174,7 @@ if args.mode == 'decode':
         )
 elif args.mode == 'prefill':
     # @torch.compile(options={"triton.cudagraphs": True}, fullgraph=True)
+    # model = torch.compile(model)
     @torch.inference_mode()
     def fn():
         model(input_ids=input_ids)

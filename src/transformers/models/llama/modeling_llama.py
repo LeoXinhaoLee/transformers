@@ -399,6 +399,10 @@ class LlamaAttention(nn.Module):
         if not output_attentions:
             attn_weights = None
 
+        # @xinhao: for testing QKVO-MLP Only
+        # attn_output = self.o_proj(query_states + key_states + value_states)
+        # attn_weights = past_key_value = None
+
         return attn_output, attn_weights, past_key_value
 
 
