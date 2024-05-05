@@ -39,8 +39,10 @@ from transformers import MambaForCausalLM  # HF Mamaba (slow)
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel  # Mamba Package (fast)
 # from transformers.models.ttt.modeling_ttt import TttConfig, TttForCausalLM
 # from transformers.models.ttt.configuration_ttt import TTT_STANDARD_CONFIGS
-from transformers.models.ttt_benchmark.modeling_ttt import TttConfig, TttForCausalLM
-from transformers.models.ttt_benchmark.configuration_ttt import TTT_STANDARD_CONFIGS
+# from transformers.models.ttt_benchmark.modeling_ttt import TttConfig, TttForCausalLM
+# from transformers.models.ttt_benchmark.configuration_ttt import TTT_STANDARD_CONFIGS
+from transformers.models.ttt_benchmark_cg.modeling_ttt import TttConfig, TttForCausalLM
+from transformers.models.ttt_benchmark_cg.configuration_ttt import TTT_STANDARD_CONFIGS
 
 parser = argparse.ArgumentParser(description="Generation benchmarking")
 parser.add_argument("--logdir", type=str, default="./exp/clean")
