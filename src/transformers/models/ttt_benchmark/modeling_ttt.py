@@ -22,7 +22,6 @@ from ...pytorch_utils import ALL_LAYERNORM_LAYERS
 from ...utils import ModelOutput, logging
 from .configuration_ttt import TttConfig
 
-
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "TttConfig"

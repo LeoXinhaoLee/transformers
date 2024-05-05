@@ -32,10 +32,11 @@ import torch.nn.functional as F
 
 from einops import rearrange
 
-from transformers import AutoTokenizer, AutoModelForCausalLM, MambaForCausalLM, AutoConfig, PretrainedConfig
-from transformers import GPT2Model, GPT2LMHeadModel, LlamaForCausalLM, LlamaConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, PretrainedConfig
+from transformers import LlamaForCausalLM, LlamaConfig
+from transformers import MambaForCausalLM  # HF Mamaba (slow)
 
-from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel  # Mamba Package (fast)
 # from transformers.models.ttt.modeling_ttt import TttConfig, TttForCausalLM
 # from transformers.models.ttt.configuration_ttt import TTT_STANDARD_CONFIGS
 from transformers.models.ttt_benchmark.modeling_ttt import TttConfig, TttForCausalLM
@@ -127,6 +128,7 @@ max_length = input_ids.shape[1] + args.genlen
 
 if args.mode == 'decode':
     if is_mamba:
+        # model = torch.compile(model)
         # fn = lambda: model.generate(
         #     input_ids=input_ids,
         #     attention_mask=attn_mask,
@@ -135,10 +137,7 @@ if args.mode == 'decode':
         #     return_dict_in_generate=True,
         #     pad_token_id=tokenizer.eos_token_id,
         #     do_sample=False,
-        #     num_beams=1,
-        #     temperature=1.0,
-        #     top_k=0,
-        #     top_p=0,
+        #     use_cache=True,
         # )
         fn = lambda: model.generate(
             input_ids=input_ids,
@@ -147,11 +146,12 @@ if args.mode == 'decode':
             return_dict_in_generate=True,
             output_scores=False,
             enable_timing=False,
-            temperature=1.0,  # @xinhao: mamba src code: shortcut for greedy
-            top_k=0,
+            temperature=1.0,
+            top_k=1, # @xinhao: mamba src code: shortcut for greedy
             top_p=0,
         )
     elif is_ttt:
+        # model = torch.compile(model)
         fn = lambda: model.generate(
             input_ids=input_ids,
             attention_mask=attn_mask,
@@ -163,6 +163,7 @@ if args.mode == 'decode':
             do_sample=False,
         )
     else:
+        # model = torch.compile(model)
         fn = lambda: model.generate(
             input_ids=input_ids,
             attention_mask=attn_mask,
