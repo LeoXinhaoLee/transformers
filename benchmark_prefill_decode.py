@@ -53,7 +53,7 @@ parser.add_argument("--promptlen", type=int, default=1)
 parser.add_argument("--genlen", type=int, default=128)
 parser.add_argument("--batch", type=int, default=1)
 parser.add_argument("--attn_impl", type=str, default='flash_attention_2', choices=['eager', 'flash_attention_2'])
-parser.add_argument("--inner_net", type=str, default='mlp_2_dual', choices=['mlp_1_dual', 'mlp_2_dual'])
+parser.add_argument("--inner_net", type=str, default='mlp_2_dual', choices=['mlp_1_dual', 'mlp_2_dual', 'mlp_1_dual_triton'])
 parser.add_argument("--use_compile", action='store_true')
 args = parser.parse_args()
 
@@ -193,14 +193,13 @@ if args.mode == 'decode':
             do_sample=False,
         )
 elif args.mode == 'prefill':
-    # @torch.compile(options={"triton.cudagraphs": True}, fullgraph=True)
     # model = torch.compile(model)
     if is_ttt:
         kwargs = {'input_ids': input_ids, 'is_prefill': True}
     else:
         kwargs = {'input_ids': input_ids}
     @torch.inference_mode()
-    def fn():
+    def fn(*args):
         model(**kwargs)
         return
 else:
@@ -214,8 +213,9 @@ else:
     logger.info("Prefill succeeds.")
     out_len = len(input_ids[0])
 in_len = len(input_ids[0])
-print(tokenizer.batch_decode(out.sequences[0].tolist()[:5]))
-print('=================')
+if args.mode == 'decode':
+    print(tokenizer.batch_decode(out.sequences[0].tolist()[:5]))
+    print('=================')
 del out
 torch.cuda.empty_cache()
 gc.collect()
@@ -224,8 +224,9 @@ torch.cuda.synchronize()
 start = time.time()
 for i in range(repeats):
     out = fn(i)
-    print(tokenizer.batch_decode(out.sequences[0].tolist()[:5]))
-    print('=================')
+    if args.mode == 'decode':
+        print(tokenizer.batch_decode(out.sequences[0].tolist()[:5]))
+        print('=================')
 torch.cuda.synchronize()
 avg_time = (time.time() - start) / repeats
 

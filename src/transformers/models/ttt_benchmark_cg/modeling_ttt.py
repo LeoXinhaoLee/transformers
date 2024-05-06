@@ -11,6 +11,8 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import CrossEntropyLoss
+import triton
+import triton.language as tl
 
 from ...activations import ACT2FN
 from ...modeling_outputs import (
@@ -420,6 +422,142 @@ class TttM1BMMModule(TttBaseModule):
         return XCW_batch, batch_params_dict
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_stages=7, num_warps=8),
+        triton.Config({}, num_stages=6, num_warps=8),
+        triton.Config({}, num_stages=5, num_warps=8),
+        triton.Config({}, num_stages=4, num_warps=8),
+        triton.Config({}, num_stages=3, num_warps=8),
+        triton.Config({}, num_stages=3, num_warps=4),
+        triton.Config({}, num_stages=4, num_warps=4),
+        triton.Config({}, num_stages=6, num_warps=4),
+    ],
+    key=['N_CHUNK'],
+)
+@triton.jit
+def _m1_kernel(W1, XA, XB, XC, coeff_last, coeff, Out,
+               stride_ab, stride_ah, stride_an, stride_ac, stride_af,
+               stride_eb, stride_eh, stride_en, stride_ec,
+               stride_pb, stride_ph, stride_pn,
+               stride_wb, stride_wh, stride_wf, stride_wd,
+               CS: tl.constexpr, HF: tl.constexpr,
+               N_CHUNK: tl.constexpr):
+    batch = tl.program_id(0)
+    head = tl.program_id(1)
+    abco_offset = batch * stride_ab + head * stride_ah
+    w_offset = batch * stride_wb + head * stride_wh
+    coeff_offset = batch * stride_eb + head * stride_eh
+    coeff_last_offset = batch * stride_pb + head * stride_ph
+
+    rc = tl.arange(0, CS)
+    rf = tl.arange(0, HF)
+    XA = XA + abco_offset
+    XB = XB + abco_offset
+    XC = XC + abco_offset
+    Out = Out + abco_offset
+    W1_data = tl.load(W1 + w_offset + rf[:, None] * stride_wf + rf[None, :] * stride_wd)
+    coeff = coeff + coeff_offset
+    coeff_last = coeff_last + coeff_last_offset
+    for i in range(N_CHUNK):
+        local_abco_offset = i * stride_an
+        local_coeff_offset = i * stride_en
+        local_coeff_last_offset = i * stride_pn
+        XA_chunk = tl.load(XA + local_abco_offset + (rc[:, None] * stride_ac + rf[None, :] * stride_af))
+        XB_chunk = tl.load(XB + local_abco_offset + (rc[:, None] * stride_ac + rf[None, :] * stride_af))
+        XC_chunk = tl.load(XC + local_abco_offset + (rc[:, None] * stride_ac + rf[None, :] * stride_af))
+        coeff_chunk = tl.load(coeff + local_coeff_offset + rc * stride_ec)
+        coeff_chunk_last = tl.load(coeff_last + local_coeff_last_offset)
+
+        Z1 = tl.dot(XB_chunk, W1_data) - XA_chunk
+        mask = rc[:, None] >= rc[None, :]
+        Attn1_full = tl.dot(XC_chunk, tl.trans(XB_chunk))
+        Attn1 = tl.where(mask, Attn1_full, 0)
+        Z1_bar = tl.dot(XC_chunk, W1_data) - tl.dot((coeff_chunk[:, None] * Attn1), Z1)
+        W1_data -= tl.dot(tl.trans(coeff_chunk_last * XB_chunk).to(Z1.dtype), Z1).to(W1.type.element_ty)
+        Out_chunk = Out + local_abco_offset + (rc[:, None] * stride_ac + rf[None, :] * stride_af)
+        tl.store(Out_chunk, Z1_bar.to(Out.type.element_ty))
+
+
+class TttM1BMMTritonModule(TttBaseModule):
+    def __init__(self, config: TttConfig, layer_idx: Optional[int] = None):
+        super().__init__(config, layer_idx)
+        self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim, self.head_dim)))
+
+        if self.config.use_compile:
+            self.prefill_chunk = torch.compile(m1_prefill_chunk)
+            self.decode_chunk = torch.compile(m1_decode_one_token)
+        else:
+            self.prefill_chunk = m1_prefill_chunk
+            self.decode_chunk = m1_decode_one_token
+
+    def process_inner_loop(self, inputs, inner_chunk_size, last_chunk_params_dic,
+                           is_prefill=False,
+                           is_last_in_chunk=False,
+                           cache_params=None):
+        # @xinhao: decoding from a prompt of length 1 will always have `inner_chunk_size=remainder=1`
+        if inner_chunk_size is None:
+            inner_chunk_size = self.inner_chunk_size
+
+        B, NH, NC, CS, HF = inputs['XA'].shape
+        input_dtype = inputs['XA'].dtype
+        L = NC * CS
+        inputs.update(coeff_chunk_last=inputs['coeff'][...,-1:])  # [B,nh,NC,CS,1] -> [B,nh,NC,1,1]
+
+        if is_prefill:
+
+            grid = (B, NH, 1)
+            output = torch.empty(size=(B, NH, NC, CS, HF), device=self.W1.device, dtype=input_dtype)
+            W1_expand = torch.tile(self.W1.unsqueeze(0), dims=(B, 1, 1, 1))  # [B,nh,f,f]
+            XA, XB, XC, coeff, coeff_last = inputs['XA'], inputs['XB'], inputs['XC'], \
+                                            inputs['coeff'], inputs['coeff_chunk_last']  # [B,nh,NC,CS,f]
+            _m1_kernel[grid](W1_expand,  # [B,nh,f,f], cloned from W1, safe for in-place op
+                             XA, XB, XC, coeff_last, coeff, output,
+                             NH * NC * CS * HF, NC * CS * HF, CS * HF, HF, 1,  # strides for A,B,C,O
+                             NH * NC * CS, NC * CS, CS, 1,  # strides for E
+                             NH * NC, NC, 1,  # strides for last coeff
+                             NH * HF * HF, HF * HF, HF, 1,  # strides for W1
+                             CS, HF,
+                             NC
+                             )
+            XCW_batch = einops.rearrange(output, "b nh nc cs f -> nc (b nh) cs f")
+            batch_params_dict = einops.rearrange(W1_expand, "b nh f d -> (b nh) f d")
+
+        else:
+
+            def decode_one_token(states, inputs):
+                XA_chunk = inputs["XA"]        # [B*nh,K,f]
+                XB_chunk = inputs["XB"]
+                XC_chunk = inputs["XC"]
+                coeff_chunk = inputs["coeff"]  # [B*nh,K,1]
+
+                states, Z1 = self.decode_chunk(states, XA_chunk, XB_chunk, XC_chunk, coeff_chunk)
+                return states, Z1  # [B*nh, f]
+
+            states = {
+                "W1_states": cache_params.params_dict["W1_states"][self.layer_idx],
+                "W1_grad": cache_params.params_dict["W1_grad"][self.layer_idx],
+            }
+            inputs = tree_map(lambda x: einops.rearrange(x, 'b nh nc cs f -> nc (b nh) cs f')[0], inputs)
+            batch_params_dict, XCW_batch = decode_one_token(
+                states,  # [B*nh,f,f], cloned from W1, safe for in-place op
+                inputs,  # [B*nh,f]
+            )
+            XCW_batch = XCW_batch.unsqueeze(0)  # [NC=1,B*nh,CS=1,f]
+
+        if cache_params is not None:
+            # @xinhao: can skip this for model() forward test by setting cache_params=None
+            # As for prefill in .generate(), will not skip the below
+            if is_last_in_chunk:
+                cache_params.update_last_in_chunk(batch_params_dict, self.layer_idx)
+            else:
+                cache_params.update_non_last_in_chunk(batch_params_dict, self.layer_idx)
+
+        XCW_batch = einops.rearrange(XCW_batch, "nc (b nh) cs f -> b (nc cs) (nh f)", b=B, nh=NH)  # [B,L,f]
+
+        return XCW_batch, batch_params_dict
+
+
 class TttDecoderLayer(nn.Module):
     def __init__(self, config: TttConfig, layer_idx: int):
         super().__init__()
@@ -428,6 +566,8 @@ class TttDecoderLayer(nn.Module):
         # self.self_attn = TttM1Module(config=config, layer_idx=layer_idx)  # @xinhao: M1 vmap module
         if config.inner_net == 'mlp_1_dual':
             self.self_attn = TttM1BMMModule(config=config, layer_idx=layer_idx)
+        elif config.inner_net == 'mlp_1_dual_triton':
+            self.self_attn = TttM1BMMTritonModule(config=config, layer_idx=layer_idx)
         elif config.inner_net == 'mlp_2_dual':
             raise NotImplementedError("M2 is not Implemented !")
             # self.self_attn = TttM2BMMModule(config=config, layer_idx=layer_idx)
