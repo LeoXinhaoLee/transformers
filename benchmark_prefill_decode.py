@@ -33,25 +33,28 @@ from torch.profiler import profile, record_function, ProfilerActivity
 
 from einops import rearrange
 
-from transformers import AutoTokenizer, AutoModelForCausalLM, MambaForCausalLM, AutoConfig, PretrainedConfig
-from transformers import GPT2Model, GPT2LMHeadModel, LlamaForCausalLM, LlamaConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, PretrainedConfig
+from transformers import LlamaForCausalLM, LlamaConfig
+from transformers import MambaForCausalLM  # HF Mamaba (slow)
 
-from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel  # Mamba Package (fast)
 # from transformers.models.ttt.modeling_ttt import TttConfig, TttForCausalLM
 # from transformers.models.ttt.configuration_ttt import TTT_STANDARD_CONFIGS
-from transformers.models.ttt_benchmark.modeling_ttt import TttConfig, TttForCausalLM
-from transformers.models.ttt_benchmark.configuration_ttt import TTT_STANDARD_CONFIGS
+# from transformers.models.ttt_benchmark.modeling_ttt import TttConfig, TttForCausalLM
+# from transformers.models.ttt_benchmark.configuration_ttt import TTT_STANDARD_CONFIGS
+from transformers.models.ttt_benchmark_cg.modeling_ttt import TttConfig, TttForCausalLM
+from transformers.models.ttt_benchmark_cg.configuration_ttt import TTT_STANDARD_CONFIGS
 
 parser = argparse.ArgumentParser(description="Generation benchmarking")
 parser.add_argument("--logdir", type=str, default="./exp/clean")
 parser.add_argument("--model-name", type=str, default="openai-community/gpt2")
-# state-spaces/mamba-130m | EleutherAI/pythia-1.4b | state-spaces/mamba-1.4b | ttt-125m | ttt-1b
+# state-spaces/mamba-130m | EleutherAI/pythia-1.4b | state-spaces/mamba-1.4b | ttt-125m | ttt-1b | ttt-profile
 parser.add_argument("--mode", type=str, default="prefill", choices=["prefill", "decode"])
 parser.add_argument("--promptlen", type=int, default=1)
 parser.add_argument("--genlen", type=int, default=128)
 parser.add_argument("--batch", type=int, default=1)
 parser.add_argument("--attn_impl", type=str, default='flash_attention_2', choices=['eager', 'flash_attention_2'])
-parser.add_argument("--inner_net", type=str, default='mlp_2_dual', choices=['mlp_1_dual', 'mlp_2_dual'])
+parser.add_argument("--inner_net", type=str, default='mlp_2_dual', choices=['mlp_1_dual', 'mlp_2_dual', 'mlp_1_dual_triton'])
 parser.add_argument("--use_compile", action='store_true')
 args = parser.parse_args()
 
@@ -81,8 +84,13 @@ logger.info(f"\n============== Model Name: {args.model_name} ==============")
 config_str = print_args(args)
 logger.info(config_str)
 
+torch.random.manual_seed(0)  # @xinhao: make sure model init is fixed
+
 repeats = 3
-device = "cuda"
+if torch.cuda.is_available():
+    device = "cuda"
+else:
+    device = 'cpu'
 dtype = torch.float16
 logger.info("dtype: " + str(dtype))
 
@@ -96,12 +104,17 @@ if is_mamba:
     # model = model.to(device=device, dtype=dtype)
 elif is_ttt:
     ttt_size = args.model_name.split('-')[-1]
-    if ttt_size not in TTT_STANDARD_CONFIGS.keys():
+    if ttt_size == 'debug':
+        ttt_size = '1b'
+    elif ttt_size not in TTT_STANDARD_CONFIGS.keys():
         raise NotImplementedError(f"TTT Config {args.model_name} Not Implemented!")
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
     ttt_config = TttConfig(**TTT_STANDARD_CONFIGS[ttt_size])
     ttt_config.inner_net = args.inner_net
     ttt_config.use_compile = args.use_compile
+    ttt_config.dtype = dtype
+    if args.model_name.split('-')[-1] == 'debug':
+        ttt_config.num_hidden_layers = 1
     model = TttForCausalLM(ttt_config).to(device=device, dtype=dtype)
 else:
     # tokenizer = AutoTokenizer.from_pretrained(args.model_name)
@@ -121,52 +134,105 @@ else:
 model.eval()
 logger.info(f"Number of parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
 
-torch.random.manual_seed(0)
-input_ids = torch.randint(1, 1000, (args.batch, args.promptlen), dtype=torch.long, device="cuda")
-attn_mask = torch.ones_like(input_ids, dtype=torch.long, device="cuda")
+input_ids = torch.randint(1, 1000, (args.batch, args.promptlen), dtype=torch.long, device=device)
+attn_mask = torch.ones_like(input_ids, dtype=torch.long, device=device)
 max_length = input_ids.shape[1] + args.genlen
 
 assert is_ttt, "profile only TTT"
 
 if args.mode == 'decode':
-    fn = lambda: model.generate(
-        input_ids=input_ids,
-        attention_mask=attn_mask,
-        use_cache=True,  # @xinhao: efficient decoding
-        max_length=max_length,
-        min_length=max_length,
-        return_dict_in_generate=True,
-        pad_token_id=tokenizer.eos_token_id,
-        do_sample=False,
-    )
+    if is_mamba:
+        # model = torch.compile(model)
+        # fn = lambda: model.generate(
+        #     input_ids=input_ids,
+        #     attention_mask=attn_mask,
+        #     max_length=max_length,
+        #     min_length=max_length,
+        #     return_dict_in_generate=True,
+        #     pad_token_id=tokenizer.eos_token_id,
+        #     do_sample=False,
+        #     use_cache=True,
+        # )
+        fn = lambda i: model.generate(
+            input_ids=input_ids,
+            max_length=max_length,
+            cg=True,
+            return_dict_in_generate=True,
+            output_scores=False,
+            enable_timing=False,
+            temperature=1.0,
+            top_k=1, # @xinhao: mamba src code: shortcut for greedy
+            top_p=0,
+        )
+    elif is_ttt:
+        # model = torch.compile(model)
+        # fn = lambda: model.generate(
+        #     input_ids=input_ids,
+        #     attention_mask=attn_mask,
+        #     use_cache=True,  # @xinhao: efficient decoding
+        #     max_length=max_length,
+        #     min_length=max_length,
+        #     return_dict_in_generate=True,
+        #     pad_token_id=tokenizer.eos_token_id,
+        #     do_sample=False,
+        # )
+        fn = lambda i: model.generate(
+            input_ids=input_ids,
+            max_length=max_length,
+            cg=True,
+            return_dict_in_generate=True,
+            output_scores=False,
+            enable_timing=False,
+            temperature=1.0,
+            top_k=1,  # @xinhao: mamba src code: shortcut for greedy
+            top_p=0,
+            i=i  # @xinhao: for debug output
+        )
+    else:
+        # model = torch.compile(model)
+        fn = lambda i: model.generate(
+            input_ids=input_ids,
+            attention_mask=attn_mask,
+            max_length=max_length,
+            min_length=max_length,
+            return_dict_in_generate=True,
+            pad_token_id=tokenizer.eos_token_id,
+            do_sample=False,
+        )
 elif args.mode == 'prefill':
-    # @torch.compile(options={"triton.cudagraphs": True}, fullgraph=True)
     # model = torch.compile(model)
+    if is_ttt:
+        kwargs = {'input_ids': input_ids, 'is_prefill': True}
+    else:
+        kwargs = {'input_ids': input_ids}
     @torch.inference_mode()
-    def fn():
-        model(input_ids=input_ids)
+    def fn(*args):
+        model(**kwargs)
         return
 else:
     raise NotImplementedError(f"Invalid Mode {args.mode}!")
 
-out = fn()
+out = fn(0)  # capture graph if cg=True, will not be timed
 if args.mode == 'decode':
-    logger.info(f"output.sequences.shape: {out.sequences.shape}")
+    logger.info(f"Decode succeeds. output.sequences.shape: {out.sequences.shape}")
     out_len = len(out.sequences[0])
 else:
-    logger.info("prefill succeeds")
+    logger.info("Prefill succeeds.")
     out_len = len(input_ids[0])
 in_len = len(input_ids[0])
+if args.mode == 'decode':
+    print(tokenizer.batch_decode(out.sequences[0].tolist()[:5]))
+    print('=================')
 del out
 torch.cuda.empty_cache()
 gc.collect()
 
 torch.cuda.synchronize()
 with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        record_shapes=True, profile_memory=True, use_cuda=True,
-        with_flops=True, with_stack=True, with_modules=True
+             record_shapes=True, profile_memory=True, use_cuda=True,
+             with_flops=True, with_stack=True, with_modules=True
     ) as prof:
-       fn()
+       fn(0)
 prof.export_chrome_trace(osp.join(args.logdir, f"{args.mode}_trace.json"))
 prof.export_stacks(osp.join(args.logdir, f"{args.mode}_cuda_flamedata.txt"), "self_cuda_time_total")
 prof.export_stacks(osp.join(args.logdir, f"{args.mode}_cpu_flamedata.txt"), "self_cpu_time_total")
