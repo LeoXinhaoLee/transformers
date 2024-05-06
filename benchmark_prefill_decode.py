@@ -83,8 +83,13 @@ logger.info(f"\n============== Model Name: {args.model_name} ==============")
 config_str = print_args(args)
 logger.info(config_str)
 
+torch.random.manual_seed(0)  # @xinhao: make sure model init is fixed
+
 repeats = 3
-device = "cuda"
+if torch.cuda.is_available():
+    device = "cuda"
+else:
+    device = 'cpu'
 dtype = torch.float16
 logger.info("dtype: " + str(dtype))
 
@@ -104,6 +109,7 @@ elif is_ttt:
     ttt_config = TttConfig(**TTT_STANDARD_CONFIGS[ttt_size])
     ttt_config.inner_net = args.inner_net
     ttt_config.use_compile = args.use_compile
+    ttt_config.dtype = dtype
     model = TttForCausalLM(ttt_config).to(device=device, dtype=dtype)
 else:
     # tokenizer = AutoTokenizer.from_pretrained(args.model_name)
@@ -123,9 +129,8 @@ else:
 model.eval()
 logger.info(f"Number of parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
 
-torch.random.manual_seed(0)
-input_ids = torch.randint(1, 1000, (args.batch, args.promptlen), dtype=torch.long, device="cuda")
-attn_mask = torch.ones_like(input_ids, dtype=torch.long, device="cuda")
+input_ids = torch.randint(1, 1000, (args.batch, args.promptlen), dtype=torch.long, device=device)
+attn_mask = torch.ones_like(input_ids, dtype=torch.long, device=device)
 max_length = input_ids.shape[1] + args.genlen
 
 if args.mode == 'decode':
@@ -141,7 +146,7 @@ if args.mode == 'decode':
         #     do_sample=False,
         #     use_cache=True,
         # )
-        fn = lambda: model.generate(
+        fn = lambda i: model.generate(
             input_ids=input_ids,
             max_length=max_length,
             cg=True,
@@ -154,19 +159,31 @@ if args.mode == 'decode':
         )
     elif is_ttt:
         # model = torch.compile(model)
-        fn = lambda: model.generate(
+        # fn = lambda: model.generate(
+        #     input_ids=input_ids,
+        #     attention_mask=attn_mask,
+        #     use_cache=True,  # @xinhao: efficient decoding
+        #     max_length=max_length,
+        #     min_length=max_length,
+        #     return_dict_in_generate=True,
+        #     pad_token_id=tokenizer.eos_token_id,
+        #     do_sample=False,
+        # )
+        fn = lambda i: model.generate(
             input_ids=input_ids,
-            attention_mask=attn_mask,
-            use_cache=True,  # @xinhao: efficient decoding
             max_length=max_length,
-            min_length=max_length,
+            cg=True,
             return_dict_in_generate=True,
-            pad_token_id=tokenizer.eos_token_id,
-            do_sample=False,
+            output_scores=False,
+            enable_timing=False,
+            temperature=1.0,
+            top_k=1,  # @xinhao: mamba src code: shortcut for greedy
+            top_p=0,
+            i=i  # @xinhao: for debug output
         )
     else:
         # model = torch.compile(model)
-        fn = lambda: model.generate(
+        fn = lambda i: model.generate(
             input_ids=input_ids,
             attention_mask=attn_mask,
             max_length=max_length,
@@ -178,29 +195,37 @@ if args.mode == 'decode':
 elif args.mode == 'prefill':
     # @torch.compile(options={"triton.cudagraphs": True}, fullgraph=True)
     # model = torch.compile(model)
+    if is_ttt:
+        kwargs = {'input_ids': input_ids, 'is_prefill': True}
+    else:
+        kwargs = {'input_ids': input_ids}
     @torch.inference_mode()
     def fn():
-        model(input_ids=input_ids)
+        model(**kwargs)
         return
 else:
     raise NotImplementedError(f"Invalid Mode {args.mode}!")
 
-out = fn()
+out = fn(0)  # capture graph if cg=True, will not be timed
 if args.mode == 'decode':
-    logger.info(f"output.sequences.shape: {out.sequences.shape}")
+    logger.info(f"Decode succeeds. output.sequences.shape: {out.sequences.shape}")
     out_len = len(out.sequences[0])
 else:
-    logger.info("prefill succeeds")
+    logger.info("Prefill succeeds.")
     out_len = len(input_ids[0])
 in_len = len(input_ids[0])
+print(tokenizer.batch_decode(out.sequences[0].tolist()[:5]))
+print('=================')
 del out
 torch.cuda.empty_cache()
 gc.collect()
 
 torch.cuda.synchronize()
 start = time.time()
-for _ in range(repeats):
-    fn()
+for i in range(repeats):
+    out = fn(i)
+    print(tokenizer.batch_decode(out.sequences[0].tolist()[:5]))
+    print('=================')
 torch.cuda.synchronize()
 avg_time = (time.time() - start) / repeats
 

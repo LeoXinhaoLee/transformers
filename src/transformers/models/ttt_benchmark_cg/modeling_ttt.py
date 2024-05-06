@@ -561,7 +561,8 @@ class TttModel(TttPreTrainedModel):
     """
 
     def __init__(self, config: TttConfig):
-        super().__init__(config)
+        # super().__init__(config)
+        super().__init__()
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
@@ -574,9 +575,10 @@ class TttModel(TttPreTrainedModel):
 
         self.num_hidden_layers = config.num_hidden_layers
         self.inner_net_chunk_size = config.inner_net_chunk_size
+        self.config = config
 
         # Initialize weights and apply final processing
-        self.post_init()
+        # self.post_init()
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -694,7 +696,8 @@ class TttForCausalLM(TttPreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config):
-        super().__init__(config)
+        # super().__init__(config)
+        super().__init__()
         self.model = TttModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -704,7 +707,8 @@ class TttForCausalLM(TttPreTrainedModel):
             self.get_output_logits = self._get_output_logits
 
             # Initialize weights and apply final processing
-        self.post_init()
+        # self.post_init()
+        self.config = config
 
     def _get_output_logits(self, hidden_states):
         logits = self.lm_head(hidden_states)

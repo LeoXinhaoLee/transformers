@@ -1,5 +1,6 @@
 # Copyright (c) 2023, Albert Gu, Tri Dao.
 import gc
+import pdb
 import time
 from collections import namedtuple
 from dataclasses import dataclass, field
@@ -41,15 +42,15 @@ class TttCache:
         self.max_seqlen = max_seqlen
         self.max_batch_size = max_batch_size
         self.seqlen_offset = 0
-        self.dtype = model.dtype
-        self.inner_chunk_size = model.inner_net_chunk_size
+        self.dtype = model.config.dtype
+        self.inner_chunk_size = model.config.inner_net_chunk_size
         self.params_dict = defaultdict(dict)
         self.param_names = ["W1",]
 
     def allocate_inference_cache(self):
-        for layer_idx in range(self.model.num_hidden_layers):
+        for layer_idx in range(self.model.config.num_hidden_layers):
             for name in self.param_names:
-                weight = getattr(self.model.layers[layer_idx].self_attn, name)
+                weight = getattr(self.model.model.layers[layer_idx].self_attn, name)
                 tiled_weight = torch.tile(weight, (self.max_batch_size,) + (1,) * (weight.dim() - 1))  # [B*nh,f,f]
                 self.params_dict[f"{name}_states"][layer_idx] = tiled_weight
                 self.params_dict[f"{name}_grad"][layer_idx] = torch.zeros_like(tiled_weight)
@@ -66,16 +67,16 @@ class TttCache:
     def to_dic(self, layer_idx):
         return {name: self.params_dict[name][layer_idx] for name in self.params_dict}
 
-    def reset(self, max_seqlen, max_batch_size, model):
+    def reset(self, max_seqlen, max_batch_size, model, i=0):
         self.max_seqlen = max_seqlen
         self.max_batch_size = max_batch_size
         self.seqlen_offset = 0
         self.model = model
-        for layer_idx in range(self.model.num_hidden_layers):
+        for layer_idx in range(self.model.config.num_hidden_layers):
             for name in self.param_names:
-                weight = getattr(model.layers[layer_idx].self_attn, name)
+                weight = getattr(self.model.model.layers[layer_idx].self_attn, name)
                 tiled_weight = torch.tile(weight, (max_batch_size,) + (1,) * (weight.dim() - 1))  # [B*nh,f,f]
-                self.params_dict[f"{name}_states"][layer_idx].copy_(tiled_weight)
+                self.params_dict[f"{name}_states"][layer_idx].copy_(tiled_weight  + i * 0.1)
                 self.params_dict[f"{name}_grad"][layer_idx].zero_()
 
 
@@ -148,6 +149,7 @@ def decode(
     tensor_parallel=1,
     cg=False,
     enable_timing=False,
+    i = 0,
 ):
     """Decoding, either greedy or with top-k or top-p sampling.
     If top-k = 0, don't limit the number of candidates (pure sampling).
@@ -181,22 +183,24 @@ def decode(
             is_prefill=False,
             is_last_in_chunk=False,
         )
+
         inference_params = model._decoding_cache.inference_params
-        inference_params.reset(max_length, batch_size, model)  # TODO: must reset keep the shape of inference_params?
+
+        inference_params.reset(max_length, batch_size, model, i)  # TODO: must reset keep the shape of inference_params?
 
         ## Capture is_last_in_chunk = True
-        model._decoding_cache = update_graph_cache(
-            model,
-            model._decoding_cache,
-            batch_size,
-            seqlen_og,
-            max_length,
-            tensor_parallel=tensor_parallel,
-            is_prefill=False,
-            is_last_in_chunk=True,
-        )
-        inference_params = model._decoding_cache.inference_params
-        inference_params.reset(max_length, batch_size, model)  # TODO: must reset keep the shape of inference_params?
+        # model._decoding_cache = update_graph_cache(
+        #     model,
+        #     model._decoding_cache,
+        #     batch_size,
+        #     seqlen_og,
+        #     max_length,
+        #     tensor_parallel=tensor_parallel,
+        #     is_prefill=False,
+        #     is_last_in_chunk=True,
+        # )
+        # inference_params = model._decoding_cache.inference_params
+        # inference_params.reset(max_length, batch_size, model)  # TODO: must reset keep the shape of inference_params?
 
     else:
         inference_params = TttCache(max_seqlen=max_length, max_batch_size=batch_size, model=model)
@@ -217,10 +221,11 @@ def decode(
         else:
             # after prompt: continue generating
             is_prefill = False
-            is_last_in_chunk = (inference_params.seqlen_offset % inference_params.inner_chunk_size + 1 == 0)
+            # is_last_in_chunk = ((inference_params.seqlen_offset + 1) % inference_params.inner_chunk_size == 0)
+            is_last_in_chunk = False
             logits = model._decoding_cache.run(
                 input_ids, is_prefill, is_last_in_chunk
-            ).squeeze(dim=1)
+            ).squeeze(dim=1)  # [BS,decode_len,vocab_size]
 
         return logits[..., :vocab_size] if vocab_size is not None else logits
 
@@ -251,6 +256,8 @@ def decode(
         start.record()
 
     scores, sequences = [], [input_ids]
+    if input_ids.shape[1] == 1:
+        inference_params.seqlen_offset = 1  # @xinhao: prompt=1 use decode mode directly as a hack
 
     while not should_stop(sequences[-1], inference_params):
 
@@ -350,12 +357,13 @@ def update_graph_cache(
             max_batch_size=batch_size,
             model=model,
         )
+        cache.inference_params.allocate_inference_cache()
         cache.mempool = torch.cuda.graphs.graph_pool_handle()
 
     ###
     for decoding_seqlen in decoding_seqlens:
 
-        if (batch_size, decoding_seqlen) not in cache.callables:
+        if (batch_size, decoding_seqlen, is_prefill, is_last_in_chunk) not in cache.callables:
 
             # key: (batch_size, decoding_seqlen)=(bs, 1), val: a function returned by capture_graph
             cache.callables[batch_size, decoding_seqlen, is_prefill, is_last_in_chunk] = capture_graph(
