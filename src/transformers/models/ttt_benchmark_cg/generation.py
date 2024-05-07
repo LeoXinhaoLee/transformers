@@ -43,9 +43,13 @@ class TttCache:
         self.max_batch_size = max_batch_size
         self.seqlen_offset = 0
         self.dtype = model.config.dtype
+        self.inner_net = model.config.inner_net
         self.inner_chunk_size = model.config.inner_net_chunk_size
         self.params_dict = defaultdict(dict)
-        self.param_names = ["W1",]
+        if 'mlp_1' in self.inner_net:
+            self.param_names = ["W1",]
+        else:
+            self.param_names = ["W1", "W2"]
 
     def allocate_inference_cache(self):
         for layer_idx in range(self.model.config.num_hidden_layers):
