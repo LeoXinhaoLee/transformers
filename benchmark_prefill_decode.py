@@ -47,7 +47,7 @@ from transformers.models.ttt_benchmark_cg.configuration_ttt import TTT_STANDARD_
 parser = argparse.ArgumentParser(description="Generation benchmarking")
 parser.add_argument("--logdir", type=str, default="./exp/clean")
 parser.add_argument("--model-name", type=str, default="openai-community/gpt2")
-# state-spaces/mamba-130m | EleutherAI/pythia-1.4b | state-spaces/mamba-1.4b | ttt-125m | ttt-1b
+# state-spaces/mamba-130m | meta-llama/Llama-2-7b | state-spaces/mamba-1.4b | ttt-125m | ttt-1b
 parser.add_argument("--mode", type=str, default="prefill", choices=["prefill", "decode"])
 parser.add_argument("--promptlen", type=int, default=1)
 parser.add_argument("--genlen", type=int, default=128)
@@ -86,10 +86,7 @@ logger.info(config_str)
 torch.random.manual_seed(0)  # @xinhao: make sure model init is fixed
 
 repeats = 3
-if torch.cuda.is_available():
-    device = "cuda"
-else:
-    device = 'cpu'
+device = "cuda"
 dtype = torch.float16
 logger.info("dtype: " + str(dtype))
 
@@ -97,10 +94,9 @@ logger.info(f"Loading model {args.model_name}")
 is_mamba = args.model_name.startswith("state-spaces/mamba-")
 is_ttt = args.model_name.startswith("ttt")
 if is_mamba:
+    assert not args.use_compile, "Mamba does not support torch.compile!"
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
     model = MambaLMHeadModel.from_pretrained(args.model_name, device=device, dtype=dtype)
-    # model = MambaForCausalLM.from_pretrained(args.model_name)
-    # model = model.to(device=device, dtype=dtype)
 elif is_ttt:
     ttt_size = args.model_name.split('-')[-1]
     if ttt_size not in TTT_STANDARD_CONFIGS.keys():
@@ -112,15 +108,6 @@ elif is_ttt:
     ttt_config.dtype = dtype
     model = TttForCausalLM(ttt_config).to(device=device, dtype=dtype)
 else:
-    # tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    # config = AutoConfig.from_pretrained(args.model_name)
-    # config.n_positions = 4096
-    # config.attn_implementation = args.attn_impl
-    # model = GPT2LMHeadModel(config).to(device=device, dtype=dtype)
-    # model = AutoModelForCausalLM.from_pretrained(args.model_name,
-    #                                              attn_implementation=args.attn_impl,
-    #                                              device_map={"": device},
-    #                                              torch_dtype=dtype)
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")  # meta-llama/Llama-2-7b
     config = LlamaConfig.from_json_file('./llama_config/config.json')
     config._attn_implementation = args.attn_impl  # @xinhao: llama config use `_attn_implementation` to select attn
@@ -135,17 +122,6 @@ max_length = input_ids.shape[1] + args.genlen
 
 if args.mode == 'decode':
     if is_mamba:
-        # model = torch.compile(model)
-        # fn = lambda: model.generate(
-        #     input_ids=input_ids,
-        #     attention_mask=attn_mask,
-        #     max_length=max_length,
-        #     min_length=max_length,
-        #     return_dict_in_generate=True,
-        #     pad_token_id=tokenizer.eos_token_id,
-        #     do_sample=False,
-        #     use_cache=True,
-        # )
         fn = lambda i: model.generate(
             input_ids=input_ids,
             max_length=max_length,
@@ -158,17 +134,6 @@ if args.mode == 'decode':
             top_p=0,
         )
     elif is_ttt:
-        # model = torch.compile(model)
-        # fn = lambda: model.generate(
-        #     input_ids=input_ids,
-        #     attention_mask=attn_mask,
-        #     use_cache=True,  # @xinhao: efficient decoding
-        #     max_length=max_length,
-        #     min_length=max_length,
-        #     return_dict_in_generate=True,
-        #     pad_token_id=tokenizer.eos_token_id,
-        #     do_sample=False,
-        # )
         fn = lambda i: model.generate(
             input_ids=input_ids,
             max_length=max_length,
@@ -182,7 +147,8 @@ if args.mode == 'decode':
             i=i  # @xinhao: for debug output
         )
     else:
-        # model = torch.compile(model)
+        if args.use_compile:
+            model = torch.compile(model)  # @xinhao: can compile the whole Transformer for decode, though doesn't help
         fn = lambda i: model.generate(
             input_ids=input_ids,
             attention_mask=attn_mask,
@@ -193,7 +159,8 @@ if args.mode == 'decode':
             do_sample=False,
         )
 elif args.mode == 'prefill':
-    # model = torch.compile(model)
+    if (not (is_mamba or is_ttt)) and args.use_compile:
+        model = torch.compile(model)  # @xinhao: can compile the whole Transformer, will help
     if is_ttt:
         kwargs = {'input_ids': input_ids, 'is_prefill': True}
     else:
