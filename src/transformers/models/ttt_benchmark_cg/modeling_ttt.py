@@ -291,7 +291,7 @@ class TttBaseModule(nn.Module):
         return output_hidden_states
 
 
-def m1_prefill_chunk(W1_init, XA_chunk, XB_chunk, XC_chunk,
+def m1_prefill_chunk(states, XA_chunk, XB_chunk, XC_chunk,
                      coeff_chunk, coeff_chunk_last):
     ###
     ## Legible logic
@@ -305,11 +305,13 @@ def m1_prefill_chunk(W1_init, XA_chunk, XB_chunk, XC_chunk,
     ###
     ## Compact logic
     ###
+    W1_init = states['W1_states']
     Z1 = (XB_chunk @ W1_init).sub_(XA_chunk)  # [B*nh,K,f] @ [B*nh,f,f] -> [B*nh,K,f]
     Attn1 = torch.tril(XC_chunk @ XB_chunk.transpose(-1, -2))  # [B*nh,K,K]
     Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ Z1  # [B*nh,K,f] @ [B*nh,f,f] - ([B*nh,K,1] * [B*nh,K,K]) @ [B*nh,K,f]
     W1_init.sub_((coeff_chunk_last * XB_chunk).transpose(-1, -2) @ Z1)
-    return W1_init, Z1_bar
+    states['W1_states'] = W1_init
+    return states, Z1_bar
 
 
 def m1_decode_one_token(states, XA_chunk, XB_chunk, XC_chunk, coeff_chunk):
@@ -360,13 +362,14 @@ class TttM1BMMModule(TttBaseModule):
 
         B, NH, NC, CS, HF = inputs['XA'].shape
         input_dtype = inputs['XA'].dtype
+        input_device = inputs['XA'].device
         L = NC * CS
         inputs.update(coeff_chunk_last=inputs['coeff'][...,-1:])  # [B,nh,NC,CS,1] -> [B,nh,NC,1,1]
 
         if is_prefill:
 
-            def for_loop(W1_init, inputs):
-                output_tensor = torch.empty(size=(NC, B * NH, CS, HF), device=W1_init.device, dtype=input_dtype)
+            def for_loop(states, inputs):
+                output_tensor = torch.empty(size=(NC, B * NH, CS, HF), device=input_device, dtype=input_dtype)
                 for i in range(NC):
                     # TODO: select is slow
                     XA_chunk = inputs["XA"][i]  # [B*nh,K,f]
@@ -375,16 +378,19 @@ class TttM1BMMModule(TttBaseModule):
                     coeff_chunk = inputs["coeff"][i]  # [B*nh,K,1]
                     coeff_chunk_last = inputs["coeff_chunk_last"][i]  # [B*nh,1,1]
 
-                    W1_init, Z1_bar = self.prefill_chunk(W1_init,
-                                                         XA_chunk, XB_chunk, XC_chunk,
-                                                         coeff_chunk, coeff_chunk_last)
+                    states, Z1_bar = self.prefill_chunk(states,
+                                                        XA_chunk, XB_chunk, XC_chunk,
+                                                        coeff_chunk, coeff_chunk_last)
                     output_tensor[i] = Z1_bar
-                return W1_init, output_tensor  # [NC, B*nh, K, f]
+                return states, output_tensor  # [NC, B*nh, K, f]
 
+            states = {
+                'W1_states': torch.tile(self.W1, dims=(B,1,1)),
+            }
             inputs = tree_map(lambda x: x.permute(2,0,1,3,4).reshape(NC, B * NH, CS, -1), inputs)  # [B,nh,NC,CS,f] -> [NC,B,nh,CS,f] -> [NC,B*nh,CS,f]
             batch_params_dict, XCW_batch = for_loop(
-                torch.tile(self.W1, dims=(B,1,1)),  # [B*nh,f,f], cloned from W1, safe for in-place op
-                inputs,                             # [NC,B,nh,CS,f]
+                states,  # [B*nh,f,f], cloned from W1, safe for in-place op
+                inputs,  # [NC,B,nh,CS,f]
             )
 
         else:
@@ -424,25 +430,6 @@ class TttM1BMMModule(TttBaseModule):
 
 def m2_prefill_chunk(states, XA_chunk, XB_chunk, XC_chunk,
                      coeff_chunk, coeff_chunk_last):
-    ###
-    ## Legible logic
-    ###
-    # Z1 = XB_chunk @ W1_init
-    # Z2 = Z1 @ W2_init
-    # grad_l_wrt_Z2 = Z2 - XA_chunk
-    # grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2_init.transpose(-1, -2)
-    #
-    # Attn1 = torch.tril(XC_chunk @ XB_chunk.transpose(-1, -2))
-    # Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1
-    # W1_last = W1_init - (coeff_chunk_last * XB_chunk).transpose(-1, -2) @ grad_l_wrt_Z1
-    #
-    # Attn2 = torch.tril(Z1_bar @ Z1.transpose(-1, -2))
-    # Z2_bar = Z1_bar @ W2_init - (coeff_chunk * Attn2) @ grad_l_wrt_Z2
-    # W2_last = W2_init - (coeff_chunk_last * Z1).transpose(-1, -2) @ grad_l_wrt_Z2
-
-    ###
-    ## Compact logic
-    ###
     W1_init = states['W1_states']
     W2_init = states['W2_states']
 
@@ -465,20 +452,6 @@ def m2_prefill_chunk(states, XA_chunk, XB_chunk, XC_chunk,
 
 
 def m2_decode_one_token(states, XA_chunk, XB_chunk, XC_chunk, coeff_chunk):
-    ###
-    ## Legible logic
-    ###
-    # X1 = XB_chunk
-    # Z1 = X1 @ W1_init  # [B,nh,K=1,f] @ [B,nh,f,f] -> [B,nh,K=1,f]
-    # grad_l_wrt_Z1 = Z1 - XA_chunk
-    # grad_W1 = XB_chunk.transpose(-2, -1) @ grad_l_wrt_Z1 + params_dic["W1_grad"]  # [B,nh,f,f]
-    # Z1_bar = XC_chunk @ (W1_init - coeff_chunk * grad_W1)  # [B,nh,K=1,f]
-    # XCW_chunk = Z1_bar
-    # W1_last = W1_init - coeff_chunk * grad_W1
-
-    ###
-    ## Compact logic
-    ###
     W1_init = states['W1_states']
     W1_grad = states['W1_grad']
     W2_init = states['W2_states']

@@ -26,6 +26,7 @@ import os.path as osp
 import time
 import json
 import logging
+from distutils.util import strtobool
 
 import torch
 import torch.nn.functional as F
@@ -56,7 +57,7 @@ parser.add_argument("--batch", type=int, default=1)
 parser.add_argument("--attn_impl", type=str, default='flash_attention_2', choices=['eager', 'flash_attention_2'])
 parser.add_argument("--inner_net", type=str, default='mlp_2_dual', choices=['mlp_1_dual', 'mlp_2_dual', 'mlp_1_dual_triton'])
 parser.add_argument("--use_compile", action='store_true')
-parser.add_argument("--use_cg", type=bool, default=True)  # @xinhao: currently only implemented for Mamba and TTT
+parser.add_argument("--no_cg", action='store_true')  # @xinhao: currently only implemented for Mamba and TTT
 parser.add_argument("--profile", action='store_true')
 args = parser.parse_args()
 
@@ -132,7 +133,7 @@ if args.mode == 'decode':
         fn = lambda i: model.generate(
             input_ids=input_ids,
             max_length=max_length,
-            cg=args.use_cg,
+            cg=(not args.no_cg),
             return_dict_in_generate=True,
             output_scores=False,
             enable_timing=False,
@@ -144,7 +145,7 @@ if args.mode == 'decode':
         fn = lambda i: model.generate(
             input_ids=input_ids,
             max_length=max_length,
-            cg=args.use_cg,
+            cg=(not args.no_cg),
             return_dict_in_generate=True,
             output_scores=False,
             enable_timing=False,
@@ -156,7 +157,7 @@ if args.mode == 'decode':
     else:
         if args.use_compile:
             model = torch.compile(model)  # @xinhao: can compile the whole Transformer for decode, though doesn't help
-        if args.use_cg:
+        if not args.no_cg:
             logger.info(f"CUDA Graph Not Implemented for Transformers")
         fn = lambda i: model.generate(
             input_ids=input_ids,

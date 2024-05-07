@@ -65,6 +65,7 @@ class TttCache:
             self.params_dict[f"{name}_grad"][layer_idx].zero_()
 
     def update_non_last_in_chunk(self, py_tree, layer_idx):
+        # TODO: prefilling last chunk < CS will also need to use this
         for name in self.param_names:
             self.params_dict[f"{name}_grad"][layer_idx].copy_(py_tree[f"{name}_grad"])
 
@@ -80,7 +81,7 @@ class TttCache:
             for name in self.param_names:
                 weight = getattr(self.model.model.layers[layer_idx].self_attn, name)
                 tiled_weight = torch.tile(weight, (max_batch_size,) + (1,) * (weight.dim() - 1))  # [B*nh,f,f]
-                self.params_dict[f"{name}_states"][layer_idx].copy_(tiled_weight  + i * 0.1)
+                self.params_dict[f"{name}_states"][layer_idx].copy_(tiled_weight  + i * 0.1)  # @xinhao: debug cg update
                 self.params_dict[f"{name}_grad"][layer_idx].zero_()
 
 
@@ -208,21 +209,35 @@ def decode(
 
     else:
         inference_params = TttCache(max_seqlen=max_length, max_batch_size=batch_size, model=model)
+        inference_params.allocate_inference_cache()
 
 
     def get_logits(input_ids, inference_params):
         decoding = inference_params.seqlen_offset > 0  # after prompt
 
         if not cg or not decoding:
-            # before prompt
-            is_last_in_chunk = (input_ids.shape[1] % inference_params.inner_chunk_size == 0)  # TODO: Prompt must be a multiple of CS
-            logits = model(
-                input_ids,
-                is_prefill=True,
-                is_last_in_chunk=is_last_in_chunk,
-                cache_params=inference_params,
-            ).logits.squeeze(dim=1)
+            if not decoding:
+                ## prefilling never uses cg
+                is_last_in_chunk = True  # TODO: assume prompt is always a multiple of CS
+                is_prefill = True
+                logits = model(
+                    input_ids,
+                    is_prefill=is_prefill,
+                    is_last_in_chunk=is_last_in_chunk,
+                    cache_params=inference_params,
+                ).logits[:, -1, :]  # [BS,prompt_len,vocab] -> [BS,1,vocab] -> [BS,vocab]
+            else:
+                ## decoding, but doesn't use cg (should only be used for profiling)
+                is_last_in_chunk = ((input_ids.shape[1] + 1) % inference_params.inner_chunk_size == 0)
+                is_prefill = False
+                logits = model(
+                    input_ids,
+                    is_prefill=is_prefill,
+                    is_last_in_chunk=is_last_in_chunk,
+                    cache_params=inference_params,
+                ).logits.squeeze(dim=1)  # [BS,1,vocab] -> [BS,vocab]
         else:
+            ## cg and decoding
             # after prompt: continue generating
             is_prefill = False
             # is_last_in_chunk = ((inference_params.seqlen_offset + 1) % inference_params.inner_chunk_size == 0)
@@ -261,7 +276,7 @@ def decode(
 
     scores, sequences = [], [input_ids]
     if input_ids.shape[1] == 1:
-        inference_params.seqlen_offset = 1  # @xinhao: prompt=1 use decode mode directly as a hack
+        inference_params.seqlen_offset = 1  # TODO: @xinhao: prompt=1 use decode mode directly as a hack
 
     while not should_stop(sequences[-1], inference_params):
 
