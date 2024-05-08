@@ -114,6 +114,9 @@ elif is_ttt:
     ttt_config.inner_net = args.inner_net
     ttt_config.use_compile = args.use_compile
     ttt_config.dtype = dtype
+    # @xinhao: follow mamba-1.4b
+    ttt_config.fused_add_norm = True
+    ttt_config.residual_in_fp32 = True
     if args.model_name.split('-')[-1] == 'profile':
         ttt_config.num_hidden_layers = 1
     model = TttForCausalLM(ttt_config).to(device=device, dtype=dtype)

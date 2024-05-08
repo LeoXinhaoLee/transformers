@@ -25,7 +25,7 @@ from ...utils import ModelOutput, logging
 from .configuration_ttt import TttConfig
 
 from transformers.models.ttt_benchmark_cg.generation import GenerationMixin, TttCache
-from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn
+from mamba_ssm.ops.triton.layernorm import RMSNorm, rms_norm_fn
 
 
 logger = logging.get_logger(__name__)
@@ -654,6 +654,8 @@ class TttDecoderLayer(nn.Module):
         # self.input_layernorm = TttRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # self.post_attention_layernorm = TttRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        self.fused_add_norm = config.fused_add_norm
+        self.residual_in_fp32 = config.residual_in_fp32
         self.input_layernorm = RMSNorm(hidden_size=self.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(hidden_size=self.hidden_size, eps=config.rms_norm_eps)
 
@@ -665,25 +667,41 @@ class TttDecoderLayer(nn.Module):
             self.mlp_forward = self._mlp_forward
 
     def _mlp_forward(self, hidden_states: torch.Tensor):
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        # residual = hidden_states
+        # hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        # hidden_states = residual + hidden_states
         return hidden_states
 
     def forward(
         self,
         hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         cache_params: Optional[TttCache] = None,
         is_prefill: Optional[bool] = None,
         is_last_in_chunk: Optional[bool] = None,
     ):
-        residual = hidden_states
+        # residual = hidden_states
+        # hidden_states = self.input_layernorm(hidden_states)
 
-        hidden_states = self.input_layernorm(hidden_states)
-
+        if not self.fused_add_norm:
+            residual = (hidden_states + residual) if residual is not None else hidden_states
+            hidden_states = self.input_layernorm(residual.to(dtype=self.input_layernorm.weight.dtype))
+            if self.residual_in_fp32:
+                residual = residual.to(torch.float32)
+        else:
+            fused_add_norm_fn = rms_norm_fn
+            hidden_states, residual = fused_add_norm_fn(
+                hidden_states,
+                self.input_layernorm.weight,
+                self.input_layernorm.bias,
+                residual=residual,
+                prenorm=True,
+                residual_in_fp32=self.residual_in_fp32,
+                eps=self.input_layernorm.eps,
+            )
         # TTT
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
@@ -693,12 +711,28 @@ class TttDecoderLayer(nn.Module):
             is_prefill=is_prefill,
             is_last_in_chunk=is_last_in_chunk,
         )
-        hidden_states = residual + hidden_states
+        # hidden_states = residual + hidden_states
 
+        if not self.fused_add_norm:
+            residual = (hidden_states + residual) if residual is not None else hidden_states
+            hidden_states = self.post_attention_layernorm(residual.to(dtype=self.post_attention_layernorm.weight.dtype))
+            if self.residual_in_fp32:
+                residual = residual.to(torch.float32)
+        else:
+            fused_add_norm_fn = rms_norm_fn
+            hidden_states, residual = fused_add_norm_fn(
+                hidden_states,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.bias,
+                residual=residual,
+                prenorm=True,
+                residual_in_fp32=self.residual_in_fp32,
+                eps=self.post_attention_layernorm.eps,
+            )
         # Fully Connected
         hidden_states = self.mlp_forward(hidden_states)
 
-        return hidden_states
+        return hidden_states, residual
 
 
 @dataclass
@@ -797,6 +831,8 @@ class TttModel(TttPreTrainedModel):
         self.inner_net_chunk_size = config.inner_net_chunk_size
         self.config = config
 
+        self.fused_add_norm = config.fused_add_norm
+        self.residual_in_fp32 = config.residual_in_fp32
         self.norm_f = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # Initialize weights and apply final processing
@@ -872,7 +908,7 @@ class TttModel(TttPreTrainedModel):
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
-
+        residual = None
         for decoder_layer in self.layers:
             if self.gradient_checkpointing and self.training:
                 hidden_states = self._gradient_checkpointing_func(
@@ -885,6 +921,7 @@ class TttModel(TttPreTrainedModel):
             else:
                 hidden_states, residual = decoder_layer(
                     hidden_states,
+                    residual=residual,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     cache_params=cache_params,
@@ -902,7 +939,6 @@ class TttModel(TttPreTrainedModel):
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states
             hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
-
         else:
             # Set prenorm=False here since we don't need the residual
             fused_add_norm_fn = rms_norm_fn
