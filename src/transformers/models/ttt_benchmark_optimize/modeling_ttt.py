@@ -510,7 +510,7 @@ class TttM1BMMTritonModule(TttBaseModule):
         output = output.permute(0, 2, 1, 3).reshape(B, CS, -1)
         return output, None
 
-##########################################  
+##########################################
 
 
 class TttDecoderLayer(nn.Module):
