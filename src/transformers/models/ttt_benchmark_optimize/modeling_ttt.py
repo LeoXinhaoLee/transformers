@@ -139,6 +139,11 @@ class TttBaseModule(nn.Module):
             split_size_or_sections=self.head_dim, dim=-1
         )  # [B,N,3,F] -> [B*nh,N,3*f] -> [B*nh,N=1,f] x3
 
+        # @xinhao: for QKVO-MLP Only
+        # XC, XB, XA = torch.split(
+        #     XCBA, split_size_or_sections=D, dim=-1
+        # )  # [B,N,3*F] -> [B,N,F] x3
+
         ilr_gated = F.sigmoid(ilr_gated.permute(0,2,1).reshape(-1,1,1))  # [B,N=1,nh] -> [B,nh,N=1] -> [B*nh,N=1,1]
         coeff = self.token_idx[inner_chunk_step_offset] * ilr_gated   # [B*nh,N=1,1]
         return XC, XB, XA, coeff
@@ -172,9 +177,10 @@ class TttBaseModule(nn.Module):
             cache_params=cache_params,
             is_prefill=is_prefill, is_last_in_chunk=is_last_in_chunk,
         )
-        # XCW_batch = XA + XB + XC; batch_params_dict = None  # @xinhao: for QKVO-MLP Only
-        z_batch = self.project_inner_loop_outputs(XCW_batch)
+        # @xinhao: for QKVO-MLP Only
+        # XCW_batch = XA + XB + XC; batch_params_dict = None
 
+        z_batch = self.project_inner_loop_outputs(XCW_batch)
         if return_params:
             return z_batch, batch_params_dict
         else:
@@ -501,12 +507,160 @@ class TttM1BMMTritonModule(TttBaseModule):
 
         output = torch.empty(size=(B, NH, CS, HF), device=input_device, dtype=torch.float16)  # TODO FIX DTYPE
         grid = (B, NH, 1)
-        _m1_decode_kernel[grid](W1_init, W1_grad,
-                                XA, XB, XC, coeff, output,
-                                NH * HF * HF, HF * HF, HF, 1,  # strides for W
-                                NH * CS * HF, CS * HF, HF, 1,  # strides for ABCO, output
-                                NH * CS, CS, 1, 1,  # strides for coeff
+        _m1_decode_kernel[grid](W1_init, W1_grad, XA, XB, XC, coeff, output,
+
+                                NH * HF * HF,
+                                HF * HF,
+                                HF,
+                                1,  # strides for W
+
+                                NH * CS * HF,
+                                CS * HF,
+                                HF,
+                                1,  # strides for ABCO, output
+
+                                NH * CS,
+                                CS,
+                                1,
+                                1,  # strides for coeff
+
                                 CS, HF)  # TODO: differentiate last_in_chunk and non_last_in_chunk
+
+        output = output.permute(0, 2, 1, 3).reshape(B, CS, -1)
+        return output, None
+
+##########################################
+
+
+####### M2 Triton Decode Module #######
+
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_stages=7, num_warps=8),
+        triton.Config({}, num_stages=6, num_warps=8),
+        triton.Config({}, num_stages=5, num_warps=8),
+        triton.Config({}, num_stages=4, num_warps=8),
+        triton.Config({}, num_stages=3, num_warps=8),
+        triton.Config({}, num_stages=3, num_warps=4),
+        triton.Config({}, num_stages=4, num_warps=4),
+        triton.Config({}, num_stages=6, num_warps=4),
+    ],
+    key=['HF', 'HF_prime'],
+    restore_value=['W1_init', 'W1_grad', 'W2_init', 'W2_grad']
+)
+@triton.jit
+def _m2_decode_kernel(W1_init, W1_grad, W2_init, W2_grad,
+                      XA, XB, XC, coeff,
+                      Out,
+                      stride_w1b, stride_w1h, stride_w1f, stride_w1d,
+                      stride_w2b, stride_w2h, stride_w2f, stride_w2d,
+                      stride_ab, stride_ah, stride_ac, stride_af,
+                      stride_cb, stride_ch, stride_cn, stride_cc,
+                      CS: tl.constexpr, HF: tl.constexpr, HF_prime: tl.constexpr):
+
+    batch = tl.program_id(0)
+    head = tl.program_id(1)
+
+    rc = tl.arange(0, CS)
+    rf = tl.arange(0, HF)
+    rf_prime = tl.arange(0, HF_prime)
+
+    W_dtype = W1_init.type.element_ty
+    O_dtype = Out.type.element_ty
+
+    w1_offset = batch * stride_w1b + head * stride_w1h
+    w2_offset = batch * stride_w2b + head * stride_w2h
+
+    abco_offset = batch * stride_ab + head * stride_ah
+    coeff_offset = batch * stride_cb + head * stride_ch
+
+    W1_init = W1_init + w1_offset + (rf[:, None] * stride_w1f + rf_prime[None, :] * stride_w1d)  # [HF, HF_prime]
+    W1_grad = W1_grad + w1_offset + (rf[:, None] * stride_w1f + rf_prime[None, :] * stride_w1d)
+
+    W2_init = W2_init + w2_offset + (rf_prime[:, None] * stride_w2f + rf[None, :] * stride_w2d)  # [HF_prime, HF]
+    W2_grad = W2_grad + w2_offset + (rf_prime[:, None] * stride_w2f + rf[None, :] * stride_w2d)
+
+    XA = XA + abco_offset + rf[None, :] * stride_af  # [1,HF]
+    XB = XB + abco_offset + rf[None, :] * stride_af
+    XC = XC + abco_offset + rf[None, :] * stride_af
+    coeff = coeff + coeff_offset  # [1,1]
+    Out_chunk = Out + abco_offset + rf * stride_af  # [1,HF]
+
+    XA_chunk = tl.load(XA)
+    XB_chunk = tl.load(XB)
+    XC_chunk = tl.load(XC)
+    coeff_chunk = tl.load(coeff)
+    W1_init_data = tl.load(W1_init)
+    W1_grad_data = tl.load(W1_grad)
+    W2_init_data = tl.load(W2_init)
+    W2_grad_data = tl.load(W2_grad)
+
+    Z1 = tl.sum(tl.trans(XB_chunk) * W1_init_data, 0)[None,:]  # [1,HF_prime]
+    Z2 = tl.sum(tl.trans(Z1) * W2_init_data, 0)[None,:]  # [1,HF]
+
+    grad_l_wrt_Z2 = Z2 - XA_chunk  # [1,HF]
+    grad_l_wrt_Z1 = tl.sum(grad_l_wrt_Z2 * W2_init_data, 1)[None,:]  # [1,HF] * [HF_p, HF] -> [HF_p,] -> [1,HF_p]
+
+    W1_grad_data += tl.trans(XB_chunk) * grad_l_wrt_Z1  # [1,HF].t * [1,HF_p] -> [HF,HF_p]
+    W1_init_data -= coeff_chunk * W1_grad_data
+    Z1_bar = tl.sum(tl.trans(XC_chunk) * W1_init_data, 0)[None,:]
+
+    W2_grad_data += tl.trans(Z1) * grad_l_wrt_Z2  # [1,HF_p].t * [1,HF] -> [HF_p,HF]
+    W2_init_data -= coeff_chunk * W2_grad_data
+    Z2_bar = tl.sum(tl.trans(Z1_bar) * W2_init_data, 0)
+
+    tl.store(Out_chunk, Z2_bar.to(Out.type.element_ty))
+    tl.store(W1_init, W1_init_data.to(W_dtype))
+    tl.store(W1_grad, W1_grad_data.to(W_dtype))
+    tl.store(W2_init, W2_init_data.to(W_dtype))
+    tl.store(W2_grad, W2_grad_data.to(W_dtype))
+
+
+class TttM2BMMTritonModule(TttBaseModule):
+
+    def __init__(self, config: TttConfig, layer_idx: Optional[int] = None):
+        super().__init__(config, layer_idx)
+        self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim, 4 * self.head_dim)))
+        self.W2 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, 4 * self.head_dim, self.head_dim)))
+
+    def process_inner_loop(self, inputs, inner_chunk_size, last_chunk_params_dic,
+                           is_prefill=False,
+                           is_last_in_chunk=False,
+                           cache_params=None):
+
+        # XA = torch.randn(BS, NH, N, HF, device='cuda', dtype=input_dtype)  # reference shape
+
+        # @xinhao: decoding from a prompt of length 1 will always have `inner_chunk_size=remainder=1`
+        B_mul_NH, CS, HF = inputs['XA'].shape  # [B*nh,N=1,f]
+        HF_prime = self.W1.shape[-1]
+        B = B_mul_NH // self.num_heads
+        NH = self.num_heads
+        input_dtype = inputs['XA'].dtype
+        input_device = inputs['XA'].device
+
+        inputs = tree_map(lambda x: x.reshape(B, NH, CS, -1), inputs) # [B*nh,N=1,f], [B*nh,N=1,1] -> [BS,nh,N=1,f/1]
+        XA, XB, XC, coeff = inputs['XA'], inputs['XB'], inputs['XC'], inputs['coeff']
+
+        W1_init = cache_params.params_dict["W1_states"][self.layer_idx].reshape(B, NH, HF, 4 * HF)
+        W1_grad = cache_params.params_dict["W1_grad"][self.layer_idx].reshape(B, NH, HF, 4 * HF)
+        W2_init = cache_params.params_dict["W2_states"][self.layer_idx].reshape(B, NH, 4 * HF, HF)
+        W2_grad = cache_params.params_dict["W2_grad"][self.layer_idx].reshape(B, NH, 4 * HF, HF)
+
+        output = torch.empty(size=(B, NH, CS, HF), device=input_device, dtype=torch.float16)  # TODO FIX DTYPE
+        grid = (B, NH, 1)
+        _m2_decode_kernel[grid](W1_init, W1_grad, W2_init, W2_grad,
+                                XA, XB, XC, coeff,
+                                output,
+                                NH * HF * HF_prime, HF * HF_prime, HF_prime, 1,  # strides for W1: [B,NH,HF,HF_prime]
+
+                                NH * HF_prime * HF, HF_prime * HF, HF, 1,  # strides for W2
+
+                                NH * CS * HF, CS * HF, HF, 1,  # strides for ABCO, output
+
+                                NH * CS * 1, CS * 1, 1, 1,  # strides for coeff
+
+                                CS=CS, HF=HF, HF_prime=HF_prime)
+
         output = output.permute(0, 2, 1, 3).reshape(B, CS, -1)
         return output, None
 
@@ -525,6 +679,8 @@ class TttDecoderLayer(nn.Module):
             self.self_attn = TttM1BMMTritonModule(config=config, layer_idx=layer_idx)
         elif config.inner_net == 'mlp_2_dual':
             self.self_attn = TttM2BMMModule(config=config, layer_idx=layer_idx)
+        elif config.inner_net == 'mlp_2_dual_triton':
+            self.self_attn = TttM2BMMTritonModule(config=config, layer_idx=layer_idx)
         else:
             raise NotImplementedError(f"Inner {config.inner_net} Not Implemented!")
 

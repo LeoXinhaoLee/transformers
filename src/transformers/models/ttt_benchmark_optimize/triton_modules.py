@@ -47,6 +47,11 @@ def _m1_kernel(W1, XA, XB, XC, coeff_last, coeff, Out,
     XC = XC + abco_offset
     Out = Out + abco_offset
     W1_data = tl.load(W1 + w_offset + rf[:, None] * stride_wf + rf[None, :] * stride_wd)
+    # if batch == 0 and head == 0:
+    #     # temp = W1_data.shape
+    #     # temp = XB_chunk.shape
+    #     temp = tl.tensor(W1_data.shape, type=tl.float32)
+    #     tl.device_print("w1: ", temp)
     coeff = coeff + coeff_offset
     coeff_last = coeff_last + coeff_last_offset
     for i in range(N_CHUNK):
@@ -66,6 +71,11 @@ def _m1_kernel(W1, XA, XB, XC, coeff_last, coeff, Out,
         Z1_bar = tl.dot(XC_chunk, W1_data) - tl.dot((coeff_chunk[:, None] * Attn1), Z1)
         W1_data -= tl.dot(tl.trans(coeff_chunk_last * XB_chunk).to(Z1.dtype), Z1).to(W1.type.element_ty)
         Out_chunk = Out + local_abco_offset + (rc[:, None] * stride_ac + rf[None, :] * stride_af)
+
+        # if batch == 0 and head == 0:
+        #     temp = tl.tensor(W1_data.shape, type=tl.float32)
+        #     tl.device_print("gg: ", temp)
+
         tl.store(Out_chunk, Z1_bar.to(Out.type.element_ty))
 
 
@@ -191,8 +201,24 @@ def _m1_decode_kernel(W1_init, W1_grad, XA, XB, XC, coeff, Out,
     W1_init_data = tl.load(W1_init)
     W1_grad_data = tl.load(W1_grad)
 
-    Z1 = tl.sum(tl.trans(XB_chunk) * W1_init_data, 0) - XA_chunk
-    W1_grad_data += tl.sum(XB_chunk * Z1, 0)
+    # if batch == 0 and head == 0:
+    #     XA_chunk_shape = tl.tensor(XA_chunk.shape, type=tl.float32)
+    #     tl.device_print("x: ", XA_chunk_shape)
+
+    Z1 = tl.sum(tl.trans(XB_chunk) * W1_init_data, 0) - XA_chunk # [1,HF]
+    # if batch == 0 and head == 0:
+    #     # XB_chunk_shape = tl.tensor(XB_chunk.shape, type=tl.float32)
+    #     # tl.device_print("x: ", XB_chunk_shape)
+    #     # Z1_shape = tl.tensor(Z1.shape, type=tl.float32)
+    #     # tl.device_print("x: ", Z1_shape)
+    #     # temp = tl.sum(XB_chunk * Z1, 0)
+    #     # temp = tl.tensor(temp.shape, type=tl.float32)
+    #     # temp = tl.tensor(W1_grad_data.shape, type=tl.float32)
+    #     # temp = tl.tensor(tl.dot(tl.trans(XB_chunk), Z1).shape, type=tl.float32)
+    #     temp = tl.tensor((tl.trans(XB_chunk) * Z1).shape, type=tl.float32)
+    #     tl.device_print("x: ", temp)
+
+    W1_grad_data += tl.trans(XB_chunk) * Z1  # tl.dot(tl.trans(XB_chunk), Z1)
     W1_init_data -= coeff_chunk * W1_grad_data
     Z1_bar = tl.sum(tl.trans(XC_chunk) * W1_init_data, 0)
 
@@ -368,4 +394,30 @@ if __name__ == "__main__":
         print('========== Timing ==========')
         benchmark_decode.run(show_plots=False, print_data=True)
     else:
-        raise NotImplementedError
+        # # raise NotImplementedError
+        BS, NH, CS, HF = 16, 32, 1, 64
+        # BS, NH, CS, HF = 1, 1, 1, 4
+        input_dtype = torch.float16
+        W1 = torch.randn(BS, NH, HF, HF, device='cuda', dtype=input_dtype) * 0.02
+        W1_grad = torch.randn_like(W1) * 0.02
+        W1_original = W1.clone()
+        W1_grad_original = W1_grad.clone()
+        XA = torch.randn(BS, NH, CS, HF, device='cuda', dtype=input_dtype) * 0.02
+        XB = torch.randn(BS, NH, CS, HF, device='cuda', dtype=input_dtype) * 0.02
+        XC = torch.randn(BS, NH, CS, HF, device='cuda', dtype=input_dtype) * 0.02
+        coeff = torch.randn(BS, NH, CS, 1, device='cuda', dtype=input_dtype) * 0.02
+
+        W1_triton, W1_grad_triton, XCW_batch_triton = ttt_m1_triton_decode(XA, XB, XC, coeff, W1_original,
+                                                                           W1_grad_original)
+
+        # L = 16
+        # BS, NH, NC, CS, HF = 16, 32, L // 16, 16, 64
+        # input_dtype = torch.float16
+        # W1 = torch.randn(NH, HF, HF, device='cuda', dtype=input_dtype) * 0.02
+        # W1_original = W1.clone()
+        # XA = torch.randn(BS, NH, NC, CS, HF, device='cuda', dtype=input_dtype) * 0.02
+        # XB = torch.randn(BS, NH, NC, CS, HF, device='cuda', dtype=input_dtype) * 0.02
+        # XC = torch.randn(BS, NH, NC, CS, HF, device='cuda', dtype=input_dtype) * 0.02
+        # coeff = torch.randn(BS, NH, NC, CS, 1, device='cuda', dtype=input_dtype) * 0.02
+        #
+        # W1_triton, XCW_batch_triton = ttt_m1_triton_forward(XA, XB, XC, coeff, W1_original)
