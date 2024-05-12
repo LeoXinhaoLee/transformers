@@ -7,6 +7,7 @@ import triton
 import triton.language as tl
 import os
 
+EXPAND = 1
 
 def clean_tensor(tensor):
     tensor[torch.isnan(tensor) | (tensor == float('inf')) | (tensor == float('-inf'))] = 0
@@ -259,6 +260,124 @@ def ttt_m1_triton_decode(XA, XB, XC, coeff, W1_init, W1_grad):
         # x_vals=[128, 256],
         line_arg='provider',  # argument name whose value corresponds to a different line in the plot
         line_vals=[
+            'M2 torch-native CG',
+            'M1 torch-native CG',
+            'M2 triton CG',
+            'M1 triton CG',
+        ],  # possible values for `line_arg``
+        line_names=[
+            'M2 torch-native CG',
+            'M1 torch-native CG',
+            'M2 triton CG',
+            'M1 triton CG',
+        ],  # label name for the lines
+        styles=[('blue', '--'), ('green', '--'), ('blue', '-'), ('green', '-')],  # line styles
+        ylabel="ms",  # label name for the y-axis
+        plot_name="decode time",  # name for the plot. Used also as a file name for saving the plot.
+        args={'BS': 64, 'NH': 32, 'CS': 1, 'HF': 64, 'HF_prime': int(EXPAND * 64)},  # values for function arguments not in `x_names` and `y_name`
+    )
+)
+def benchmark_decode_cg(N, BS, NH, CS, HF, HF_prime, provider):
+    assert CS == 1
+
+    quantiles = [0.5, 0.2, 0.8]
+    n_warmups = 2
+
+    input_dtype = torch.float16
+
+    XA = torch.randn(N, BS, NH, CS, HF, device='cuda', dtype=input_dtype) * 0.02
+    XB = torch.randn(N, BS, NH, CS, HF, device='cuda', dtype=input_dtype) * 0.02
+    XC = torch.randn(N, BS, NH, CS, HF, device='cuda', dtype=input_dtype) * 0.02
+    coeff = torch.randn(N, BS, NH, CS, 1, device='cuda', dtype=input_dtype) * 0.02
+
+    XA_holder = torch.zeros_like(XA[0])
+    XB_holder = torch.zeros_like(XB[0])
+    XC_holder = torch.zeros_like(XC[0])
+    coeff_holder = torch.zeros_like(coeff[0])
+
+    if 'M2' in provider:
+        if 'triton' in provider:
+            decode_fn = ttt_m2_triton_decode
+        else:
+            decode_fn = ttt_m2_decode
+
+        W1 = torch.randn(BS, NH, HF, HF_prime, device='cuda', dtype=input_dtype) * 0.02
+        W1_grad = torch.randn_like(W1) * 0.02
+
+        W2 = torch.randn(BS, NH, HF_prime, HF, device='cuda', dtype=input_dtype) * 0.02
+        W2_grad = torch.randn_like(W2) * 0.02
+
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(n_warmups):
+                W1_tmp, W1_grad_tmp, \
+                W2_tmp, W2_grad_tmp, Z_tmp = decode_fn(XA_holder, XB_holder, XC_holder, coeff_holder,
+                                                       W1, W1_grad, W2, W2_grad)
+            s.synchronize()
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+
+        torch.cuda.current_stream().wait_stream(s)
+
+        graph = torch.cuda.CUDAGraph()
+        mempool = torch.cuda.graphs.graph_pool_handle()
+        with torch.cuda.graph(graph, pool=mempool):
+            W1_tmp, W1_grad_tmp, \
+            W2_tmp, W2_grad_tmp, Z_tmp = decode_fn(XA_holder, XB_holder, XC_holder, coeff_holder,
+                                                   W1, W1_grad, W2, W2_grad)
+
+    else:
+        if 'triton' in provider:
+            decode_fn = ttt_m1_triton_decode
+        else:
+            decode_fn = ttt_m1_decode
+
+        W1 = torch.randn(BS, NH, HF, HF, device='cuda', dtype=input_dtype) * 0.02
+        W1_grad = torch.randn_like(W1) * 0.02
+
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(n_warmups):
+                W1_tmp, W1_grad_tmp, Z_tmp = decode_fn(XA_holder, XB_holder, XC_holder, coeff_holder,
+                                                       W1, W1_grad)
+            s.synchronize()
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+
+        torch.cuda.current_stream().wait_stream(s)
+
+        graph = torch.cuda.CUDAGraph()
+        mempool = torch.cuda.graphs.graph_pool_handle()
+        with torch.cuda.graph(graph, pool=mempool):
+            W1_tmp, W1_grad_tmp, Z_tmp = decode_fn(XA_holder, XB_holder, XC_holder, coeff_holder,
+                                                   W1, W1_grad)
+
+    def run(new_XA, new_XB, new_XC, new_coeff):
+        XA_holder.copy_(new_XA)
+        XB_holder.copy_(new_XB)
+        XC_holder.copy_(new_XC)
+        coeff_holder.copy_(new_coeff)
+        graph.replay()
+        return Z_tmp.clone()
+
+    def loop():
+        for i in range(N):
+            Z_tmp = run(XA[i], XB[i], XC[i], coeff[i])
+
+    ms, min_ms, max_ms = triton.testing.do_bench(lambda: loop(), quantiles=quantiles)
+
+    return ms, min_ms, max_ms
+
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=['N'],  # argument names to use as an x-axis for the plot
+        x_vals=[2 ** i for i in range(0, 12)],  # different possible values for `x_name`
+        # x_vals=[128, 256],
+        line_arg='provider',  # argument name whose value corresponds to a different line in the plot
+        line_vals=[
             'M2 torch-native',
             'M1 torch-native',
             'M2 triton',
@@ -273,7 +392,7 @@ def ttt_m1_triton_decode(XA, XB, XC, coeff, W1_init, W1_grad):
         styles=[('blue', '--'), ('green', '--'), ('blue', '-'), ('green', '-')],  # line styles
         ylabel="ms",  # label name for the y-axis
         plot_name="decode time",  # name for the plot. Used also as a file name for saving the plot.
-        args={'BS': 64, 'NH': 32, 'CS': 1, 'HF': 64, 'HF_prime': 4 * 64},  # values for function arguments not in `x_names` and `y_name`
+        args={'BS': 64, 'NH': 32, 'CS': 1, 'HF': 64, 'HF_prime': int(EXPAND * 64)},  # values for function arguments not in `x_names` and `y_name`
     )
 )
 def benchmark_decode(N, BS, NH, CS, HF, HF_prime, provider):
@@ -306,6 +425,17 @@ def benchmark_decode(N, BS, NH, CS, HF, HF_prime, provider):
             for i in range(N):
                 W1, W1_grad, _ = decode(XA[i], XB[i], XC[i], coeff[i], W1, W1_grad)
 
+    # if provider == 'M2 torch-native':
+    #     ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(lambda: loop(ttt_m2_decode, W1, W1_grad, W2, W2_grad))
+    # elif provider == 'M1 torch-native':
+    #     ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(lambda: loop(ttt_m1_decode, W1, W1_grad))
+    # elif provider == 'M2 triton':
+    #     ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(lambda: loop(ttt_m2_triton_decode, W1, W1_grad, W2, W2_grad))
+    # elif provider == 'M1 triton':
+    #     ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(lambda: loop(ttt_m1_triton_decode, W1, W1_grad))
+    # else:
+    #     raise NotImplementedError
+
     if provider == 'M2 torch-native':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: loop(ttt_m2_decode, W1, W1_grad, W2, W2_grad),
                                                      quantiles=quantiles)
@@ -324,68 +454,10 @@ def benchmark_decode(N, BS, NH, CS, HF, HF_prime, provider):
     return ms, min_ms, max_ms
 
 
+
 if __name__ == "__main__":
     # os.environ['TRITON_PRINT_AUTOTUNING'] = '1'
 
-    input_dtype = torch.float16
-
-    ############### M2 Matching outputs abs diff ###############
-
-    # BS, NH, CS, HF, HF_prime = 64, 32, 1, 64, 4 * 64
-    # W1 = torch.randn(BS, NH, HF, HF_prime, device='cuda', dtype=input_dtype) * 0.02
-    # W1_grad = torch.randn_like(W1) * 0.02
-    # W1_original = W1.clone()
-    # W1_grad_original = W1_grad.clone()
-    #
-    # W2 = torch.randn(BS, NH, HF_prime, HF, device='cuda', dtype=input_dtype) * 0.02
-    # W2_grad = torch.randn_like(W2) * 0.02
-    # W2_original = W2.clone()
-    # W2_grad_original = W2_grad.clone()
-    #
-    # XA = torch.randn(BS, NH, CS, HF, device='cuda', dtype=input_dtype) * 0.02
-    # XB = torch.randn(BS, NH, CS, HF, device='cuda', dtype=input_dtype) * 0.02
-    # XC = torch.randn(BS, NH, CS, HF, device='cuda', dtype=input_dtype) * 0.02
-    # coeff = torch.randn(BS, NH, CS, 1, device='cuda', dtype=input_dtype) * 0.02
-    #
-    # W1, W1_grad, \
-    # W2, W2_grad, \
-    # XCW_batch = ttt_m2_decode(XA, XB, XC, coeff, W1, W1_grad, W2, W2_grad)
-    #
-    # W1_triton, W1_grad_triton, \
-    # W2_triton, W2_grad_triton, \
-    # XCW_batch_triton = ttt_m2_triton_decode(XA, XB, XC, coeff,
-    #                                         W1_original, W1_grad_original, W2_original, W2_grad_original)
-    #
-    # print('========== M2 Matching outputs abs diff ==========')
-    # print('W1 diff: ' + str(torch.abs(W1 - W1_triton).max()))
-    # print('W1_grad diff: ' + str(torch.abs(W1_grad - W1_grad_triton).max()))
-    # print('W2 diff: ' + str(torch.abs(W2 - W2_triton).max()))
-    # print('W2_grad diff: ' + str(torch.abs(W2_grad - W2_grad_triton).max()))
-    # print('Output diff: ' + str(torch.abs(XCW_batch - XCW_batch_triton).max()))
-
-    ############### M1 Matching outputs abs diff ###############
-
-    # BS, NH, CS, HF = 64, 32, 1, 64
-    # W1 = torch.randn(BS, NH, HF, HF, device='cuda', dtype=input_dtype) * 0.02
-    # W1_grad = torch.randn_like(W1) * 0.02
-    # W1_original = W1.clone()
-    # W1_grad_original = W1_grad.clone()
-    #
-    # XA = torch.randn(BS, NH, CS, HF, device='cuda', dtype=input_dtype) * 0.02
-    # XB = torch.randn(BS, NH, CS, HF, device='cuda', dtype=input_dtype) * 0.02
-    # XC = torch.randn(BS, NH, CS, HF, device='cuda', dtype=input_dtype) * 0.02
-    # coeff = torch.randn(BS, NH, CS, 1, device='cuda', dtype=input_dtype) * 0.02
-    #
-    # W1, W1_grad, \
-    # XCW_batch = ttt_m1_decode(XA, XB, XC, coeff, W1, W1_grad)
-    #
-    # W1_triton, W1_grad_triton, \
-    # XCW_batch_triton = ttt_m1_triton_decode(XA, XB, XC, coeff, W1_original, W1_grad_original)
-    #
-    # print('========== M1 Matching outputs abs diff ==========')
-    # print('W1 diff: ' + str(torch.abs(W1 - W1_triton).max()))
-    # print('W1_grad diff: ' + str(torch.abs(W1_grad - W1_grad_triton).max()))
-    # print('Output diff: ' + str(torch.abs(XCW_batch - XCW_batch_triton).max()))
-
     print('========== Timing ==========')
-    benchmark_decode.run(show_plots=False, print_data=True)
+    # benchmark_decode.run(show_plots=False, print_data=True)
+    benchmark_decode_cg.run(show_plots=False, print_data=True)

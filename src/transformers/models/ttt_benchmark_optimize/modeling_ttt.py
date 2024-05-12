@@ -435,6 +435,20 @@ class TttM2BMMModule(TttBaseModule):
 
 
 ####### M1 Triton Decode Module #######
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_stages=7, num_warps=8),
+        triton.Config({}, num_stages=6, num_warps=8),
+        triton.Config({}, num_stages=5, num_warps=8),
+        triton.Config({}, num_stages=4, num_warps=8),
+        triton.Config({}, num_stages=3, num_warps=8),
+        triton.Config({}, num_stages=3, num_warps=4),
+        triton.Config({}, num_stages=4, num_warps=4),
+        triton.Config({}, num_stages=6, num_warps=4),
+    ],
+    key=['HF'],
+    restore_value=['W1_init', 'W1_grad']
+)
 @triton.jit
 def _m1_decode_kernel(W1_init, W1_grad, XA, XB, XC, coeff, Out,
                       stride_wb, stride_wh, stride_wf, stride_wd,
@@ -471,7 +485,8 @@ def _m1_decode_kernel(W1_init, W1_grad, XA, XB, XC, coeff, Out,
     W1_grad_data = tl.load(W1_grad)
 
     Z1 = tl.sum(tl.trans(XB_chunk) * W1_init_data, 0) - XA_chunk
-    W1_grad_data += tl.sum(XB_chunk * Z1, 0)
+    # W1_grad_data += tl.sum(XB_chunk * Z1, 0)  # @xinhao: bug, but doesn't affect speed too much
+    W1_grad_data += tl.trans(XB_chunk) * Z1
     W1_init_data -= coeff_chunk * W1_grad_data
     Z1_bar = tl.sum(tl.trans(XC_chunk) * W1_init_data, 0)
 
