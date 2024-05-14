@@ -2,11 +2,12 @@ import sys
 import pdb
 
 import torch
-import einops
 import triton
 import triton.language as tl
 import os
 import nvtx
+
+from transformers.models.ttt_benchmark_optimize.nvtx_do_bench import do_bench
 
 EXPAND = 4
 
@@ -75,6 +76,14 @@ def ttt_m1_decode(XA, XB, XC, coeff, W1_init, W1_grad):
 ###
 @triton.autotune(
     configs=[
+        # triton.Config({}, num_stages=7, num_warps=8),
+        # triton.Config({}, num_stages=6, num_warps=8),
+        # triton.Config({}, num_stages=5, num_warps=8),
+        # triton.Config({}, num_stages=4, num_warps=8),
+        # triton.Config({}, num_stages=3, num_warps=8),
+        # triton.Config({}, num_stages=3, num_warps=4),
+        # triton.Config({}, num_stages=4, num_warps=4),
+        # triton.Config({}, num_stages=6, num_warps=4),
         triton.Config({}, num_stages=1, num_warps=8),
     ],
     key=['HF', 'HF_prime'],  # the two above configs will be evaluated anytime the value of key changes
@@ -182,20 +191,6 @@ def ttt_m2_triton_decode(XA, XB, XC, coeff, W1_init, W1_grad, W2_init, W2_grad):
 ###
 ## M1
 ###
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_stages=7, num_warps=8),
-        triton.Config({}, num_stages=6, num_warps=8),
-        triton.Config({}, num_stages=5, num_warps=8),
-        triton.Config({}, num_stages=4, num_warps=8),
-        triton.Config({}, num_stages=3, num_warps=8),
-        triton.Config({}, num_stages=3, num_warps=4),
-        triton.Config({}, num_stages=4, num_warps=4),
-        triton.Config({}, num_stages=6, num_warps=4),
-    ],
-    key=['HF'],
-    restore_value=['W1_init', 'W1_grad'],
-)
 @triton.jit
 def _m1_decode_kernel(W1_init, W1_grad,
                       XA, XB, XC, coeff, Out,
@@ -203,8 +198,7 @@ def _m1_decode_kernel(W1_init, W1_grad,
                       stride_ab, stride_ah, stride_ac, stride_af,
                       stride_cb, stride_ch, stride_cn, stride_cc,
                       CS: tl.constexpr, HF: tl.constexpr,
-                      # num_stages=1, num_warps=8
-                      ):
+                      num_stages=1, num_warps=8):
     batch = tl.program_id(0)
     head = tl.program_id(1)
 
@@ -262,12 +256,156 @@ def ttt_m1_triton_decode(XA, XB, XC, coeff, W1_init, W1_grad):
 if __name__ == "__main__":
 
     input_dtype = torch.float16
+    # BS = 64;
+    # NH = 32;
+    # CS = 1;
+    # HF = 64;
+    # EXPAND = 4;
+    # HF_prime = int(EXPAND * 64)
+    #
+    # XA = torch.randn(BS, NH, CS, HF, device='cuda', dtype=input_dtype) * 0.02
+    # XB = torch.randn(BS, NH, CS, HF, device='cuda', dtype=input_dtype) * 0.02
+    # XC = torch.randn(BS, NH, CS, HF, device='cuda', dtype=input_dtype) * 0.02
+    # coeff = torch.randn(BS, NH, CS, 1, device='cuda', dtype=input_dtype) * 0.02
+    #
+    # if 'M1' in sys.argv[1]:
+    #
+    #     W1 = torch.randn(BS, NH, HF, HF, device='cuda', dtype=input_dtype) * 0.02
+    #     W1_grad = torch.randn_like(W1) * 0.02
+    #
+    #     if sys.argv[1] == 'M1-pytorch':
+    #         W1, W1_grad, Z = ttt_m1_decode(XA, XB, XC, coeff, W1, W1_grad)
+    #
+    #     elif sys.argv[1] == 'M1-triton':
+    #         W1, W1_grad, Z = ttt_m1_triton_decode(XA, XB, XC, coeff, W1, W1_grad)
+    #
+    #     elif sys.argv[1] == 'M1-triton-cg':
+    #         XA_holder = torch.zeros_like(XA)
+    #         XB_holder = torch.zeros_like(XB)
+    #         XC_holder = torch.zeros_like(XC)
+    #         coeff_holder = torch.zeros_like(coeff)
+    #
+    #         n_warmups = 2
+    #         s = torch.cuda.Stream()
+    #         s.wait_stream(torch.cuda.current_stream())
+    #         with torch.cuda.stream(s):
+    #             for _ in range(n_warmups):
+    #                 W1_tmp, W1_grad_tmp, Z_tmp = ttt_m1_triton_decode(XA_holder, XB_holder, XC_holder, coeff_holder,
+    #                                                                   W1, W1_grad)
+    #             s.synchronize()
+    #             if torch.distributed.is_initialized():
+    #                 torch.distributed.barrier()
+    #
+    #         torch.cuda.current_stream().wait_stream(s)
+    #
+    #         graph = torch.cuda.CUDAGraph()
+    #         mempool = torch.cuda.graphs.graph_pool_handle()
+    #         with torch.cuda.graph(graph, pool=mempool):
+    #             W1_tmp, W1_grad_tmp, Z_tmp = ttt_m1_triton_decode(XA_holder, XB_holder, XC_holder, coeff_holder,
+    #                                                               W1, W1_grad)
+    #
+    #         def m1_run(new_XA, new_XB, new_XC, new_coeff):
+    #             XA_holder.copy_(new_XA)
+    #             XB_holder.copy_(new_XB)
+    #             XC_holder.copy_(new_XC)
+    #             coeff_holder.copy_(new_coeff)
+    #             graph.replay()
+    #             return Z_tmp.clone()
+    #
+    #         Z = m1_run(XA, XB, XC, coeff)
+    #
+    #     else:
+    #         raise NotImplementedError
+    #
+    # elif 'M2' in sys.argv[1]:
+    #
+    #     W1 = torch.randn(BS, NH, HF, HF_prime, device='cuda', dtype=input_dtype) * 0.02
+    #     W1_grad = torch.randn_like(W1) * 0.02
+    #
+    #     W2 = torch.randn(BS, NH, HF_prime, HF, device='cuda', dtype=input_dtype) * 0.02
+    #     W2_grad = torch.randn_like(W2) * 0.02
+    #
+    #     if sys.argv[1] == 'M2-pytorch':
+    #         W1, W1_grad, W2, W2_grad, Z = ttt_m2_decode(XA, XB, XC, coeff, W1, W1_grad, W2, W2_grad)
+    #
+    #     elif sys.argv[1] == 'M2-triton':
+    #         W1, W1_grad, W2, W2_grad, Z = ttt_m2_triton_decode(XA, XB, XC, coeff, W1, W1_grad, W2, W2_grad)
+    #
+    #     elif sys.argv[1] == 'M2-triton-cg':
+    #         XA_holder = torch.zeros_like(XA)
+    #         XB_holder = torch.zeros_like(XB)
+    #         XC_holder = torch.zeros_like(XC)
+    #         coeff_holder = torch.zeros_like(coeff)
+    #
+    #         n_warmups = 2
+    #         s = torch.cuda.Stream()
+    #         s.wait_stream(torch.cuda.current_stream())
+    #         with torch.cuda.stream(s):
+    #             for _ in range(n_warmups):
+    #                 W1_tmp, W1_grad_tmp, \
+    #                 W2_tmp, W2_grad_tmp, Z_tmp = ttt_m2_triton_decode(XA_holder, XB_holder, XC_holder, coeff_holder,
+    #                                                                   W1, W1_grad, W2, W2_grad)
+    #             s.synchronize()
+    #             if torch.distributed.is_initialized():
+    #                 torch.distributed.barrier()
+    #
+    #         torch.cuda.current_stream().wait_stream(s)
+    #
+    #         graph = torch.cuda.CUDAGraph()
+    #         mempool = torch.cuda.graphs.graph_pool_handle()
+    #         with torch.cuda.graph(graph, pool=mempool):
+    #             W1_tmp, W1_grad_tmp, \
+    #             W2_tmp, W2_grad_tmp, Z_tmp = ttt_m2_triton_decode(XA_holder, XB_holder, XC_holder, coeff_holder,
+    #                                                               W1, W1_grad, W2, W2_grad)
+    #         def m2_run(new_XA, new_XB, new_XC, new_coeff):
+    #             XA_holder.copy_(new_XA)
+    #             XB_holder.copy_(new_XB)
+    #             XC_holder.copy_(new_XC)
+    #             coeff_holder.copy_(new_coeff)
+    #             graph.replay()
+    #             return Z_tmp.clone()
+    #
+    #         Z = m2_run(XA, XB, XC, coeff)
+    #
+    #     else:
+    #         raise NotImplementedError
+    #
+    # else:
+    #     raise NotImplementedError
+    #
+    # if sys.argv[1] == 'M1-pytorch':
+    #     ms =  do_bench(lambda: ttt_m1_decode(XA, XB, XC, coeff, W1, W1_grad))
+    #
+    # elif sys.argv[1] == 'M1-triton':
+    #     ms =  do_bench(lambda: ttt_m1_triton_decode(XA, XB, XC, coeff, W1, W1_grad))
+    #
+    # elif sys.argv[1] == 'M1-triton-cg':
+    #     ms =  do_bench(lambda: m1_run(XA, XB, XC, coeff))
+    #
+    # elif sys.argv[1] == 'M2-pytorch':
+    #     ms =  do_bench(lambda: ttt_m2_decode(XA, XB, XC, coeff, W1, W1_grad, W2, W2_grad))
+    #
+    # elif sys.argv[1] == 'M2-triton':
+    #     ms =  do_bench(lambda: ttt_m2_triton_decode(XA, XB, XC, coeff, W1, W1_grad, W2, W2_grad))
+    #
+    # elif sys.argv[1] == 'M2-triton-cg':
+    #     ms =  do_bench(lambda: m2_run(XA, XB, XC, coeff))
+    #
+    # else:
+    #     raise NotImplementedError
+
+    N = 1
     BS = 64;
     NH = 32;
     CS = 1;
     HF = 64;
     EXPAND = 4;
     HF_prime = int(EXPAND * 64)
+
+    XA_for = torch.randn(N, BS, NH, CS, HF, device='cuda', dtype=input_dtype) * 0.02
+    XB_for = torch.randn(N, BS, NH, CS, HF, device='cuda', dtype=input_dtype) * 0.02
+    XC_for = torch.randn(N, BS, NH, CS, HF, device='cuda', dtype=input_dtype) * 0.02
+    coeff_for = torch.randn(N, BS, NH, CS, 1, device='cuda', dtype=input_dtype) * 0.02
 
     XA = torch.randn(BS, NH, CS, HF, device='cuda', dtype=input_dtype) * 0.02
     XB = torch.randn(BS, NH, CS, HF, device='cuda', dtype=input_dtype) * 0.02
@@ -310,6 +448,7 @@ if __name__ == "__main__":
                 W1_tmp, W1_grad_tmp, Z_tmp = ttt_m1_triton_decode(XA_holder, XB_holder, XC_holder, coeff_holder,
                                                                   W1, W1_grad)
 
+
             def m1_run(new_XA, new_XB, new_XC, new_coeff):
                 XA_holder.copy_(new_XA)
                 XB_holder.copy_(new_XB)
@@ -317,6 +456,7 @@ if __name__ == "__main__":
                 coeff_holder.copy_(new_coeff)
                 graph.replay()
                 return Z_tmp.clone()
+
 
             Z = m1_run(XA, XB, XC, coeff)
 
@@ -335,7 +475,8 @@ if __name__ == "__main__":
             W1, W1_grad, W2, W2_grad, Z = ttt_m2_decode(XA, XB, XC, coeff, W1, W1_grad, W2, W2_grad)
 
         elif sys.argv[1] == 'M2-triton':
-            W1, W1_grad, W2, W2_grad, Z = ttt_m2_triton_decode(XA, XB, XC, coeff, W1, W1_grad, W2, W2_grad)
+            # W1, W1_grad, W2, W2_grad, Z = ttt_m2_triton_decode(XA, XB, XC, coeff, W1, W1_grad, W2, W2_grad)
+            pass
 
         elif sys.argv[1] == 'M2-triton-cg':
             XA_holder = torch.zeros_like(XA)
@@ -363,6 +504,8 @@ if __name__ == "__main__":
                 W1_tmp, W1_grad_tmp, \
                 W2_tmp, W2_grad_tmp, Z_tmp = ttt_m2_triton_decode(XA_holder, XB_holder, XC_holder, coeff_holder,
                                                                   W1, W1_grad, W2, W2_grad)
+
+
             def m2_run(new_XA, new_XB, new_XC, new_coeff):
                 XA_holder.copy_(new_XA)
                 XB_holder.copy_(new_XB)
@@ -370,6 +513,7 @@ if __name__ == "__main__":
                 coeff_holder.copy_(new_coeff)
                 graph.replay()
                 return Z_tmp.clone()
+
 
             Z = m2_run(XA, XB, XC, coeff)
 
@@ -379,50 +523,33 @@ if __name__ == "__main__":
     else:
         raise NotImplementedError
 
-    # warmup
-    for _ in range(10):
-        if sys.argv[1] == 'M1-pytorch':
-            W1, W1_grad, Z = ttt_m1_decode(XA, XB, XC, coeff, W1, W1_grad)
+    def loop(f, *args):
+        for i in range(N):
+            W1, W1_grad, W2, W2_grad, _ = f(XA_for[i], XB_for[i], XC_for[i], coeff_for[i], *args)
+        return
 
-        elif sys.argv[1] == 'M1-triton':
-            W1, W1_grad, Z = ttt_m1_triton_decode(XA, XB, XC, coeff, W1, W1_grad)
+    if sys.argv[1] == 'M1-pytorch':
+        ms = do_bench(lambda: loop(ttt_m1_decode, W1, W1_grad), quantiles=None)
 
-        elif sys.argv[1] == 'M1-triton-cg':
-            Z = m1_run(XA, XB, XC, coeff)
+    elif sys.argv[1] == 'M1-triton':
+        ms = do_bench(lambda: loop(ttt_m1_triton_decode, W1, W1_grad), quantiles=None)
 
-        elif sys.argv[1] == 'M2-pytorch':
-            W1, W1_grad, W2, W2_grad, Z = ttt_m2_decode(XA, XB, XC, coeff, W1, W1_grad, W2, W2_grad)
+    elif sys.argv[1] == 'M1-triton-cg':
+        ms = do_bench(lambda: loop(m1_run), quantiles=None)
 
-        elif sys.argv[1] == 'M2-triton':
-            W1, W1_grad, W2, W2_grad, Z = ttt_m2_triton_decode(XA, XB, XC, coeff, W1, W1_grad, W2, W2_grad)
+    elif sys.argv[1] == 'M2-pytorch':
+        ms = do_bench(lambda: loop(ttt_m2_decode, W1, W1_grad, W2, W2_grad), quantiles=None)
 
-        elif sys.argv[1] == 'M2-triton-cg':
-            Z = m2_run(XA, XB, XC, coeff)
+    elif sys.argv[1] == 'M2-triton':
+        # ms = do_bench(lambda: loop(ttt_m2_triton_decode, W1, W1_grad, W2, W2_grad), quantiles=None)
+        print(f'W1: {W1.shape}, W2: {W2.shape}, XA: {XA_for.shape}')
+        ms = triton.testing.do_bench(lambda: loop(ttt_m2_triton_decode, W1, W1_grad, W2, W2_grad), quantiles=None)
 
-        else:
-            raise NotImplementedError
 
-    torch.cuda.synchronize()
-    #### Profile ####
-    with MyContextManager('Decode', 'lime', '') as c:
-        for _ in range(4):
-            if sys.argv[1] == 'M1-pytorch':
-                W1, W1_grad, Z = ttt_m1_decode(XA, XB, XC, coeff, W1, W1_grad)
+    elif sys.argv[1] == 'M2-triton-cg':
+        ms = do_bench(lambda: loop(m2_run), quantiles=None)
 
-            elif sys.argv[1] == 'M1-triton':
-                W1, W1_grad, Z = ttt_m1_triton_decode(XA, XB, XC, coeff, W1, W1_grad)
+    else:
+        raise NotImplementedError
 
-            elif sys.argv[1] == 'M1-triton-cg':
-                Z = m1_run(XA, XB, XC, coeff)
-
-            elif sys.argv[1] == 'M2-pytorch':
-                W1, W1_grad, W2, W2_grad, Z = ttt_m2_decode(XA, XB, XC, coeff, W1, W1_grad, W2, W2_grad)
-
-            elif sys.argv[1] == 'M2-triton':
-                W1, W1_grad, W2, W2_grad, Z = ttt_m2_triton_decode(XA, XB, XC, coeff, W1, W1_grad, W2, W2_grad)
-
-            elif sys.argv[1] == 'M2-triton-cg':
-                Z = m2_run(XA, XB, XC, coeff)
-
-            else:
-                raise NotImplementedError
+    print(ms)

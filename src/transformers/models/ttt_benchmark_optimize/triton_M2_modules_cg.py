@@ -257,19 +257,19 @@ def ttt_m1_triton_decode(XA, XB, XC, coeff, W1_init, W1_grad):
     triton.testing.Benchmark(
         x_names=['N'],  # argument names to use as an x-axis for the plot
         x_vals=[2 ** i for i in range(0, 12)],  # different possible values for `x_name`
-        # x_vals=[128, 256],
+        # x_vals=[1,2,4],
         line_arg='provider',  # argument name whose value corresponds to a different line in the plot
         line_vals=[
-            'M2 torch-native CG',
-            'M1 torch-native CG',
-            'M2 triton CG',
+            # 'M2 torch-native CG',
+            # 'M1 torch-native CG',
+            # 'M2 triton CG',
             'M1 triton CG',
         ],  # possible values for `line_arg``
         line_names=[
-            'M2 torch-native CG',
+            # 'M2 torch-native CG',
             # 'M1 torch-native CG',
-            'M2 triton CG',
-            # 'M1 triton CG',
+            # 'M2 triton CG',
+            'M1 triton CG',
         ],  # label name for the lines
         styles=[('blue', '--'), ('green', '--'), ('blue', '-'), ('green', '-')],  # line styles
         ylabel="ms",  # label name for the y-axis
@@ -375,19 +375,19 @@ def benchmark_decode_cg(N, BS, NH, CS, HF, HF_prime, provider):
     triton.testing.Benchmark(
         x_names=['N'],  # argument names to use as an x-axis for the plot
         # x_vals=[2 ** i for i in range(0, 12)],  # different possible values for `x_name`
-        x_vals=[128, 256],
+        x_vals=[1, 4],
         line_arg='provider',  # argument name whose value corresponds to a different line in the plot
         line_vals=[
-            'M2 torch-native',
-            'M1 torch-native',
+            # 'M2 torch-native',
+            # 'M1 torch-native',
             'M2 triton',
-            'M1 triton',
+            # 'M1 triton',
         ],  # possible values for `line_arg``
         line_names=[
-            'M2 torch-native',
-            'M1 torch-native',
+            # 'M2 torch-native',
+            # 'M1 torch-native',
             'M2 triton',
-            'M1 triton',
+            # 'M1 triton',
         ],  # label name for the lines
         styles=[('blue', '--'), ('green', '--'), ('blue', '-'), ('green', '-')],  # line styles
         ylabel="ms",  # label name for the y-axis
@@ -398,7 +398,8 @@ def benchmark_decode_cg(N, BS, NH, CS, HF, HF_prime, provider):
 def benchmark_decode(N, BS, NH, CS, HF, HF_prime, provider):
     assert CS == 1
 
-    quantiles = [0.5, 0.2, 0.8]
+    # quantiles = [0.5, 0.2, 0.8]
+    quantiles = None
 
     input_dtype = torch.float16
 
@@ -425,33 +426,30 @@ def benchmark_decode(N, BS, NH, CS, HF, HF_prime, provider):
             for i in range(N):
                 W1, W1_grad, _ = decode(XA[i], XB[i], XC[i], coeff[i], W1, W1_grad)
 
-    # if provider == 'M2 torch-native':
-    #     ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(lambda: loop(ttt_m2_decode, W1, W1_grad, W2, W2_grad))
-    # elif provider == 'M1 torch-native':
-    #     ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(lambda: loop(ttt_m1_decode, W1, W1_grad))
-    # elif provider == 'M2 triton':
-    #     ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(lambda: loop(ttt_m2_triton_decode, W1, W1_grad, W2, W2_grad))
-    # elif provider == 'M1 triton':
-    #     ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(lambda: loop(ttt_m1_triton_decode, W1, W1_grad))
-    # else:
-    #     raise NotImplementedError
-
     if provider == 'M2 torch-native':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: loop(ttt_m2_decode, W1, W1_grad, W2, W2_grad),
-                                                     quantiles=quantiles)
+        # ms, min_ms, max_ms = triton.testing.do_bench(lambda: loop(ttt_m2_decode, W1, W1_grad, W2, W2_grad),
+        #                                              quantiles=quantiles)
+        ms = triton.testing.do_bench(lambda: loop(ttt_m2_decode, W1, W1_grad, W2, W2_grad), quantiles=quantiles)
     elif provider == 'M1 torch-native':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: loop(ttt_m1_decode, W1, W1_grad),
-                                                     quantiles=quantiles)
+        # ms, min_ms, max_ms = triton.testing.do_bench(lambda: loop(ttt_m1_decode, W1, W1_grad),
+        #                                              quantiles=quantiles)
+        ms = triton.testing.do_bench(lambda: loop(ttt_m1_decode, W1, W1_grad), quantiles=quantiles)
     elif provider == 'M2 triton':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: loop(ttt_m2_triton_decode, W1, W1_grad, W2, W2_grad),
-                                                     quantiles=quantiles)
+        # ms, min_ms, max_ms = triton.testing.do_bench(lambda: loop(ttt_m2_triton_decode, W1, W1_grad, W2, W2_grad),
+        #                                              quantiles=quantiles)
+        ms = triton.testing.do_bench(lambda: loop(ttt_m2_triton_decode, W1, W1_grad, W2, W2_grad), quantiles=quantiles)
     elif provider == 'M1 triton':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: loop(ttt_m1_triton_decode, W1, W1_grad),
-                                                     quantiles=quantiles)
+        # ms, min_ms, max_ms = triton.testing.do_bench(lambda: loop(ttt_m1_triton_decode, W1, W1_grad),
+        #                                              quantiles=quantiles)
+        ms = triton.testing.do_bench(lambda: loop(ttt_m1_triton_decode, W1, W1_grad), quantiles=quantiles)
     else:
         raise NotImplementedError
 
-    return ms, min_ms, max_ms
+    # return ms, min_ms, max_ms
+
+    print(f'W1: {W1.shape}, W2: {W2.shape}, XA: {XA.shape}')
+    print(str(N) + '>> ' + provider + ': ' + str(ms) + 'ms')
+    return ms
 
 
 @triton.testing.perf_report(
@@ -460,21 +458,21 @@ def benchmark_decode(N, BS, NH, CS, HF, HF_prime, provider):
         x_vals=[2 ** i for i in range(5, 8)],  # different possible values for `x_name`
         line_arg='provider',  # argument name whose value corresponds to a different line in the plot
         line_vals=[
-            'M2 triton',
-            # 'M1 triton',
-            'M2 triton CG',
-            # 'M1 triton CG',
+            # 'M2 triton',
+            'M1 triton',
+            # 'M2 triton CG',
+            'M1 triton CG',
         ],  # possible values for `line_arg``
         line_names=[
-            'M2 triton',
-            # 'M1 triton',
-            'M2 triton CG',
-            # 'M1 triton CG',
+            # 'M2 triton',
+            'M1 triton',
+            # 'M2 triton CG',
+            'M1 triton CG',
         ],  # label name for the lines
         styles=[('blue', '--'), ('green', '--'), ('blue', '-'), ('green', '-')],  # line styles
         ylabel="ms",  # label name for the y-axis
         plot_name="decode time",  # name for the plot. Used also as a file name for saving the plot.
-        args={'BS': 64, 'NH': 32, 'CS': 1, 'HF': 64, 'HF_prime': int(EXPAND * 64)},  # values for function arguments not in `x_names` and `y_name`
+        args={'BS': 64, 'NH': 32, 'CS': 1, 'HF': 64 * 2, 'HF_prime': int(EXPAND * 64)},  # values for function arguments not in `x_names` and `y_name`
     )
 )
 def benchmark_decode_cg_or_not(N, BS, NH, CS, HF, HF_prime, provider):
@@ -550,6 +548,53 @@ def benchmark_decode_cg_or_not(N, BS, NH, CS, HF, HF_prime, provider):
 
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: loop(), quantiles=quantiles)
 
+    elif provider == 'M1 triton':
+        W1 = torch.randn(BS, NH, HF, HF, device='cuda', dtype=input_dtype) * 0.02
+        W1_grad = torch.randn_like(W1) * 0.02
+
+        def loop(decode, W1, W1_grad):
+            for i in range(N):
+                W1, W1_grad, _ = decode(XA[i], XB[i], XC[i], coeff[i], W1, W1_grad)
+
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: loop(ttt_m1_triton_decode, W1, W1_grad),
+                                                     quantiles=quantiles)
+
+    elif provider == 'M1 triton CG':
+        W1 = torch.randn(BS, NH, HF, HF, device='cuda', dtype=input_dtype) * 0.02
+        W1_grad = torch.randn_like(W1) * 0.02
+
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(n_warmups):
+                W1_tmp, W1_grad_tmp, Z_tmp = ttt_m1_triton_decode(XA_holder, XB_holder, XC_holder, coeff_holder,
+                                                                  W1, W1_grad)
+            s.synchronize()
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+
+        torch.cuda.current_stream().wait_stream(s)
+
+        graph = torch.cuda.CUDAGraph()
+        mempool = torch.cuda.graphs.graph_pool_handle()
+        with torch.cuda.graph(graph, pool=mempool):
+            W1_tmp, W1_grad_tmp, Z_tmp = ttt_m1_triton_decode(XA_holder, XB_holder, XC_holder, coeff_holder,
+                                                              W1, W1_grad)
+
+        def run(new_XA, new_XB, new_XC, new_coeff):
+            XA_holder.copy_(new_XA)
+            XB_holder.copy_(new_XB)
+            XC_holder.copy_(new_XC)
+            coeff_holder.copy_(new_coeff)
+            graph.replay()
+            return Z_tmp.clone()
+
+        def loop():
+            for i in range(N):
+                Z_tmp = run(XA[i], XB[i], XC[i], coeff[i])
+
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: loop(), quantiles=quantiles)
+
 
     return ms, min_ms, max_ms
 
@@ -558,6 +603,6 @@ if __name__ == "__main__":
     # os.environ['TRITON_PRINT_AUTOTUNING'] = '1'
 
     print('========== Timing ==========')
-    benchmark_decode.run(show_plots=False, print_data=True)
+    # benchmark_decode.run(show_plots=False, print_data=True)
     # benchmark_decode_cg.run(show_plots=False, print_data=True)
-    # benchmark_decode_cg_or_not.run(show_plots=False, print_data=True)
+    benchmark_decode_cg_or_not.run(show_plots=False, print_data=True)

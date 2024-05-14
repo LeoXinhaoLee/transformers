@@ -38,7 +38,8 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, Pretra
 from transformers import LlamaForCausalLM, LlamaConfig
 from transformers import MambaForCausalLM  # HF Mamaba (slow)
 
-from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel  # Mamba Package (fast)
+# from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel  # Mamba Package (fast)
+from transformers.models.mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel  # copy from mamba repo, modify generation to avoid OOM
 # from transformers.models.ttt.modeling_ttt import TttConfig, TttForCausalLM
 # from transformers.models.ttt.configuration_ttt import TTT_STANDARD_CONFIGS
 # from transformers.models.ttt_benchmark.modeling_ttt import TttConfig, TttForCausalLM
@@ -199,8 +200,6 @@ if args.mode == 'decode':
     print(tokenizer.batch_decode(out.sequences[0].tolist()[:5]))
     print('=================')
 del out
-torch.cuda.empty_cache()
-gc.collect()
 
 if args.profile:
 
@@ -226,10 +225,7 @@ else:
     torch.cuda.synchronize()
     start = time.time()
     for i in range(repeats):
-        out = fn(i)
-        if args.mode == 'decode':
-            print(tokenizer.batch_decode(out.sequences[0].tolist()[:5]))
-            print('=================')
+        fn(i)
     torch.cuda.synchronize()
     avg_time = (time.time() - start) / repeats
 

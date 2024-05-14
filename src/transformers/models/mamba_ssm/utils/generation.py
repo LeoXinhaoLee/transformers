@@ -4,7 +4,6 @@ import pdb
 import time
 from collections import namedtuple
 from dataclasses import dataclass, field
-from collections import defaultdict
 from functools import partial
 from typing import Callable, Optional, Sequence, Union
 
@@ -34,55 +33,6 @@ class InferenceParams:
         self.seqlen_offset = 0
         if self.lengths_per_sample is not None:
             self.lengths_per_sample.zero_()
-
-
-class TttCache:
-    def __init__(self, max_seqlen, max_batch_size, model):
-        self.model = model
-        self.max_seqlen = max_seqlen
-        self.max_batch_size = max_batch_size
-        self.seqlen_offset = 0
-        self.dtype = model.config.dtype
-        self.inner_net = model.config.inner_net
-        self.inner_chunk_size = model.config.inner_net_chunk_size
-        self.params_dict = defaultdict(dict)
-        if 'mlp_1' in self.inner_net:
-            self.param_names = ["W1",]
-        else:
-            self.param_names = ["W1", "W2"]
-
-    def allocate_inference_cache(self):
-        for layer_idx in range(self.model.config.num_hidden_layers):
-            for name in self.param_names:
-                weight = getattr(self.model.model.layers[layer_idx].self_attn, name)
-                tiled_weight = torch.tile(weight, (self.max_batch_size,) + (1,) * (weight.dim() - 1))  # [B*nh,f,f]
-                self.params_dict[f"{name}_states"][layer_idx] = tiled_weight
-                self.params_dict[f"{name}_grad"][layer_idx] = torch.zeros_like(tiled_weight)
-
-    def update_last_in_chunk(self, py_tree, layer_idx):
-        for name in self.param_names:
-            self.params_dict[f"{name}_states"][layer_idx].copy_(py_tree[f"{name}_states"])
-            self.params_dict[f"{name}_grad"][layer_idx].zero_()
-
-    def update_non_last_in_chunk(self, py_tree, layer_idx):
-        # TODO: prefilling last chunk < CS will also need to use this
-        for name in self.param_names:
-            self.params_dict[f"{name}_grad"][layer_idx].copy_(py_tree[f"{name}_grad"])
-
-    def to_dic(self, layer_idx):
-        return {name: self.params_dict[name][layer_idx] for name in self.params_dict}
-
-    def reset(self, max_seqlen, max_batch_size, model, i=0):
-        self.max_seqlen = max_seqlen
-        self.max_batch_size = max_batch_size
-        self.seqlen_offset = 0
-        self.model = model
-        for layer_idx in range(self.model.config.num_hidden_layers):
-            for name in self.param_names:
-                weight = getattr(self.model.model.layers[layer_idx].self_attn, name)
-                tiled_weight = torch.tile(weight, (max_batch_size,) + (1,) * (weight.dim() - 1))  # [B*nh,f,f]
-                self.params_dict[f"{name}_states"][layer_idx].copy_(tiled_weight  + i * 0.1)  # @xinhao: debug cg update
-                self.params_dict[f"{name}_grad"][layer_idx].zero_()
 
 
 # https://github.com/NVIDIA/Megatron-LM/blob/0bb597b42c53355a567aba2a1357cc34b9d99ddd/megatron/text_generation/sampling.py
@@ -154,7 +104,6 @@ def decode(
     tensor_parallel=1,
     cg=False,
     enable_timing=False,
-    i = 0,
 ):
     """Decoding, either greedy or with top-k or top-p sampling.
     If top-k = 0, don't limit the number of candidates (pure sampling).
@@ -177,7 +126,6 @@ def decode(
         if not hasattr(model, "_decoding_cache"):
             model._decoding_cache = None
 
-        ## Capture is_last_in_chunk = False
         model._decoding_cache = update_graph_cache(
             model,
             model._decoding_cache,
@@ -185,66 +133,42 @@ def decode(
             seqlen_og,
             max_length,
             tensor_parallel=tensor_parallel,
-            is_prefill=False,
-            is_last_in_chunk=False,
         )
 
         inference_params = model._decoding_cache.inference_params
 
-        inference_params.reset(max_length, batch_size, model, i)  # TODO: must reset keep the shape of inference_params?
-
-        ## Capture is_last_in_chunk = True
-        # model._decoding_cache = update_graph_cache(
-        #     model,
-        #     model._decoding_cache,
-        #     batch_size,
-        #     seqlen_og,
-        #     max_length,
-        #     tensor_parallel=tensor_parallel,
-        #     is_prefill=False,
-        #     is_last_in_chunk=True,
-        # )
-        # inference_params = model._decoding_cache.inference_params
-        # inference_params.reset(max_length, batch_size, model)  # TODO: must reset keep the shape of inference_params?
+        inference_params.reset(max_length, batch_size)
 
     else:
-        inference_params = TttCache(max_seqlen=max_length, max_batch_size=batch_size, model=model)
-        inference_params.allocate_inference_cache()
+        inference_params = InferenceParams(max_seqlen=max_length, max_batch_size=batch_size)
 
 
     def get_logits(input_ids, inference_params):
         decoding = inference_params.seqlen_offset > 0  # after prompt
+        if decoding:
+            position_ids = torch.full(
+                (batch_size, 1),
+                inference_params.seqlen_offset,
+                dtype=torch.long,
+                device=input_ids.device,
+            )
+        else:
+            position_ids = None
 
         if not cg or not decoding:
-            if not decoding:
-                ## prefilling never uses cg
-                is_last_in_chunk = True  # TODO: assume prompt is always a multiple of CS
-                is_prefill = True
-                logits = model(
-                    input_ids,
-                    is_prefill=is_prefill,
-                    is_last_in_chunk=is_last_in_chunk,
-                    cache_params=inference_params,
-                ).logits[:, -1, :]  # [BS,prompt_len,vocab] -> [BS,1,vocab] -> [BS,vocab]
-            else:
-                ## decoding, but doesn't use cg (should only be used for profiling)
-                is_last_in_chunk = ((input_ids.shape[1] + 1) % inference_params.inner_chunk_size == 0)
-                is_prefill = False
-                logits = model(
-                    input_ids,
-                    is_prefill=is_prefill,
-                    is_last_in_chunk=is_last_in_chunk,
-                    cache_params=inference_params,
-                ).logits.squeeze(dim=1)  # [BS,1,vocab] -> [BS,vocab]
+            # before prompt
+            logits = model(
+                input_ids,
+                position_ids=position_ids,  # None
+                inference_params=inference_params,
+                num_last_tokens=1,
+            ).logits.squeeze(dim=1)
+
         else:
-            ## cg and decoding
             # after prompt: continue generating
-            is_prefill = False
-            # is_last_in_chunk = ((inference_params.seqlen_offset + 1) % inference_params.inner_chunk_size == 0)
-            is_last_in_chunk = False
             logits = model._decoding_cache.run(
-                input_ids, is_prefill, is_last_in_chunk
-            ).squeeze(dim=1)  # [BS,decode_len,vocab_size]
+                input_ids, position_ids, inference_params.seqlen_offset
+            ).squeeze(dim=1)
 
         return logits[..., :vocab_size] if vocab_size is not None else logits
 
@@ -275,8 +199,8 @@ def decode(
         start.record()
 
     scores, sequences = [], [input_ids]
-    if input_ids.shape[1] == 1:
-        inference_params.seqlen_offset = 1  # TODO: @xinhao: prompt=1 use decode mode directly as a hack
+    # if input_ids.shape[1] == 1:
+    #     inference_params.seqlen_offset = 1  # TODO: @xinhao: prompt=1 use decode mode directly as a hack
 
     while not should_stop(sequences[-1], inference_params):
 
@@ -295,6 +219,7 @@ def decode(
         inference_params.seqlen_offset += sequences[-1].shape[1]
         new_token = logits.argmax(dim=-1).unsqueeze(-1)  # [BS,1]
         sequences.append(new_token)
+
 
     if enable_timing:
         end.record()
@@ -321,7 +246,7 @@ class GenerationMixin:
         temperature=1.0,
         return_dict_in_generate=False,
         output_scores=False,
-        **kwargs,  # include cg
+        **kwargs,
     ):
         output = decode(
             input_ids, self, max_length, top_k=top_k, top_p=top_p, temperature=temperature, **kwargs
@@ -329,6 +254,22 @@ class GenerationMixin:
         if not output_scores:
             output.scores = None
         return output if return_dict_in_generate else output.sequences
+
+
+def allocate_inference_cache(
+    max_batch_size,
+    max_seqlen,
+    nheads,
+    headdim,
+    layers: Union[int, Sequence],
+    device,
+    dtype=torch.float16,
+):
+    assert dtype in [torch.float16, torch.bfloat16, torch.float32]
+    kv_cache_shape = (max_batch_size, max_seqlen, 2, nheads, headdim)
+    if isinstance(layers, int):
+        layers = range(layers)
+    return {i: torch.empty(kv_cache_shape, device=device, dtype=dtype) for i in layers}
 
 
 @dataclass
@@ -339,7 +280,7 @@ class DecodingCGCache:
     dtype = None
     callables: dict = field(default_factory=dict)
     mempool = None
-    inference_params: Optional[InferenceParams | TttCache] = None
+    inference_params: Optional[InferenceParams] = None
     run: Optional[Callable] = None
 
 
@@ -354,44 +295,61 @@ def update_graph_cache(
     tensor_parallel=1,
     dtype=None,
     n_warmups=2,
-    is_prefill=False,
-    is_last_in_chunk=False,
 ):
     if cache is None:
         cache = DecodingCGCache()
 
     param_example = next(iter(model.parameters()))
     device = param_example.device
-
     if dtype is None:
         dtype = param_example.dtype
-
     if (
         (device, dtype) != (cache.device, cache.dtype)
         or batch_size > cache.max_batch_size
         or max_seqlen > cache.max_seqlen
-    ):  # Invalidate the cache (@xinhao: always activated the first time enter updte_graph_cache)
+    ):  # Invalidate the cache
         cache.callables = {}
         cache.mempool = None
         cache.inference_params = None
         gc.collect()
         cache.device, cache.dtype = device, dtype
         cache.max_batch_size, cache.max_seqlen = batch_size, max_seqlen
-        cache.inference_params = TttCache(
+
+        if hasattr(model, "allocate_inference_cache"):
+            inf_cache = model.allocate_inference_cache(batch_size, max_seqlen, dtype)
+        else:
+            headdim = getattr(
+                model.config,
+                "head_dim",
+                model.config.hidden_size // model.config.num_attention_heads,
+            )
+            inf_cache = allocate_inference_cache(
+                batch_size,
+                max_seqlen,
+                model.config.num_attention_heads // tensor_parallel,
+                headdim,
+                model.config.num_hidden_layers,
+                device,
+                dtype,
+            )
+
+        lengths_per_sample = torch.full((batch_size,), seqlen_og, dtype=torch.int32, device=device)
+
+        cache.inference_params = InferenceParams(
             max_seqlen=max_seqlen,
             max_batch_size=batch_size,
-            model=model,
+            seqlen_offset=seqlen_og,
+            key_value_memory_dict=inf_cache,
+            lengths_per_sample=lengths_per_sample,
         )
-        cache.inference_params.allocate_inference_cache()
         cache.mempool = torch.cuda.graphs.graph_pool_handle()
 
-    ###
     for decoding_seqlen in decoding_seqlens:
 
-        if (batch_size, decoding_seqlen, is_prefill, is_last_in_chunk) not in cache.callables:
+        if (batch_size, decoding_seqlen) not in cache.callables:
 
             # key: (batch_size, decoding_seqlen)=(bs, 1), val: a function returned by capture_graph
-            cache.callables[batch_size, decoding_seqlen, is_prefill, is_last_in_chunk] = capture_graph(
+            cache.callables[batch_size, decoding_seqlen] = capture_graph(
                 model,
                 cache.inference_params,
                 batch_size,
@@ -399,16 +357,20 @@ def update_graph_cache(
                 decoding_seqlen=decoding_seqlen,
                 mempool=cache.mempool,
                 n_warmups=n_warmups,
-                is_prefill=is_prefill,
-                is_last_in_chunk=is_last_in_chunk,
             )
 
-    def dispatch(input_ids, is_prefill, is_last_in_chunk):
+
+    def dispatch(input_ids, position_ids, seqlen):
+
         batch_size, decoding_seqlen = input_ids.shape[:2]
-        return cache.callables[batch_size, decoding_seqlen, is_prefill, is_last_in_chunk](input_ids)
+
+        return cache.callables[batch_size, decoding_seqlen](input_ids, position_ids, seqlen)
+
 
     cache.run = dispatch
+
     cache.inference_params.seqlen_offset = 0  # Reset so it's not confusing
+
     return cache
 
 
@@ -417,9 +379,7 @@ def capture_graph(
         inference_params,
         batch_size, max_seqlen, decoding_seqlen=1,
         mempool=None,
-        n_warmups=2,
-        is_prefill=False,
-        is_last_in_chunk=False
+        n_warmups=2
 ):
     device = next(iter(model.parameters())).device
     input_ids = torch.full((batch_size, decoding_seqlen), 0, dtype=torch.long, device=device)
@@ -427,7 +387,7 @@ def capture_graph(
 
     seqlen_offset_og = inference_params.seqlen_offset
     inference_params.seqlen_offset = max_seqlen - decoding_seqlen
-    # inference_params.lengths_per_sample[:] = inference_params.seqlen_offset
+    inference_params.lengths_per_sample[:] = inference_params.seqlen_offset
 
     # Warmup before capture
     s = torch.cuda.Stream()
@@ -436,9 +396,9 @@ def capture_graph(
         for _ in range(n_warmups):
             logits = model(
                 input_ids,
-                cache_params=inference_params,
-                is_prefill=is_prefill,
-                is_last_in_chunk=is_last_in_chunk,
+                position_ids=position_ids,
+                inference_params=inference_params,
+                num_last_tokens=decoding_seqlen,
             ).logits
         s.synchronize()
         # This might be needed for correctness if we run with NCCL_GRAPH_MIXING_SUPPORT=0,
@@ -454,14 +414,19 @@ def capture_graph(
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, pool=mempool):
         logits = model(
-            input_ids,
-            cache_params=inference_params,
-            is_prefill=is_prefill,
-            is_last_in_chunk=is_last_in_chunk,
+            input_ids,                          # [batch_size, decoding_seqlen] full of 0
+            position_ids=position_ids,          # [batch_size, decoding_seqlen] full of 0
+            inference_params=inference_params,  # .seqlen_offset = max_seqlen - decoding_seqlen:
+                                                # (pretend already generted max_l - to_decode_l)
+                                                # .lengths_per_sample: [BS,] full of seqlen_offset
+            num_last_tokens=decoding_seqlen,    # only return the logits for the last n tokens
         ).logits
 
-    def run(new_input_ids):
+
+    def run(new_input_ids, new_position_ids, seqlen):
+        inference_params.lengths_per_sample[:] = seqlen
         input_ids.copy_(new_input_ids)
+        position_ids.copy_(new_position_ids)
         graph.replay()
         return logits.clone()
 
