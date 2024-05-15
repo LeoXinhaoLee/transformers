@@ -1,21 +1,24 @@
 '''Benchmarking Prefilling and Decoding
 E.g.,
-# Decoding
-python benchmark_prefill_decode.py --logdir ./exp/decode_ttt_125m \
-                                   --mode decode \
-                                   --model-name ttt-125m \
-                                   --inner_net mlp_2_dual \
-                                   --batch 64 \
-                                   --promptlen 1 \
-                                   --genlen 512
 # Prefilling
 python benchmark_prefill_decode.py --logdir ./exp/prefill_ttt_125m \
                                    --mode prefill \
-                                   --model-name ttt-125m \
-                                   --inner_net mlp_2_dual \
+                                   --model-name ttt-1b \
+                                   --inner_net mlp_1_dual_triton \
                                    --batch 64 \
                                    --promptlen 512 \
-                                   --genlen 0
+                                   --genlen 0 \
+                                   --use_compile
+
+# Decoding
+python benchmark_prefill_decode.py --logdir ./exp/decode_ttt_125m \
+                                   --mode decode \
+                                   --model-name ttt-1b \
+                                   --inner_net mlp_2_dual_triton \
+                                   --batch 64 \
+                                   --promptlen 1 \
+                                   --genlen 512 \
+                                   --use_compile
 '''
 import gc
 import pdb
@@ -36,18 +39,12 @@ from einops import rearrange
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, PretrainedConfig
 from transformers import LlamaForCausalLM, LlamaConfig
-from transformers import MambaForCausalLM  # HF Mamaba (slow)
 
-# from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel  # Mamba Package (fast)
 from transformers.models.mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel  # copy from mamba repo, modify generation to avoid OOM
-# from transformers.models.ttt.modeling_ttt import TttConfig, TttForCausalLM
-# from transformers.models.ttt.configuration_ttt import TTT_STANDARD_CONFIGS
-# from transformers.models.ttt_benchmark.modeling_ttt import TttConfig, TttForCausalLM
-# from transformers.models.ttt_benchmark.configuration_ttt import TTT_STANDARD_CONFIGS
-# from transformers.models.ttt_benchmark_cg.modeling_ttt import TttConfig, TttForCausalLM
-# from transformers.models.ttt_benchmark_cg.configuration_ttt import TTT_STANDARD_CONFIGS
-from transformers.models.ttt_benchmark_optimize.modeling_ttt import TttConfig, TttForCausalLM
-from transformers.models.ttt_benchmark_optimize.configuration_ttt import TTT_STANDARD_CONFIGS
+from transformers.models.ttt.configuration_ttt import TTT_STANDARD_CONFIGS, TttConfig  # 125m and 1b config
+
+# from transformers.models.ttt_benchmark_prefill_decode.modeling_ttt import TttForCausalLM  # TODO: prefill and decode, but not optimized
+from transformers.models.ttt_benchmark_decode_optimize.modeling_ttt import TttForCausalLM  # TODO: Only support decode, but is optimized
 
 parser = argparse.ArgumentParser(description="Generation benchmarking")
 parser.add_argument("--logdir", type=str, default="./exp/clean")
@@ -60,8 +57,8 @@ parser.add_argument("--batch", type=int, default=1)
 parser.add_argument("--attn_impl", type=str, default='flash_attention_2', choices=['eager', 'flash_attention_2'])
 parser.add_argument("--inner_net", type=str, default='mlp_2_dual', choices=['mlp_1_dual', 'mlp_2_dual', 'mlp_1_dual_triton', 'mlp_2_dual_triton'])
 parser.add_argument("--use_compile", action='store_true')
-parser.add_argument("--no_cg", action='store_true')  # @xinhao: currently only implemented for Mamba and TTT
-parser.add_argument("--profile", action='store_true')
+parser.add_argument("--no_cg", action='store_true')    # @xinhao: currently only implemented for Mamba and TTT
+parser.add_argument("--profile", action='store_true')  # @xinhao: pytorch profiler, different from nsys in micro-benchmark
 args = parser.parse_args()
 
 def print_args(args):
@@ -94,7 +91,7 @@ torch.random.manual_seed(0)  # @xinhao: make sure model init is fixed
 
 repeats = 3
 device = "cuda"
-dtype = torch.float16
+dtype = torch.float16  # @xinhao: follow mamba benchmark
 logger.info("dtype: " + str(dtype))
 
 logger.info(f"Loading model {args.model_name}")

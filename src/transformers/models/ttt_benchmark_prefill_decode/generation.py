@@ -280,15 +280,21 @@ def decode(
 
     while not should_stop(sequences[-1], inference_params):
 
-        scores.append(
-            get_logits(sequences[-1], inference_params)
-        )
+        # scores.append(
+        #     get_logits(sequences[-1], inference_params)
+        # )
+        #
+        # inference_params.seqlen_offset += sequences[-1].shape[1]
+        #
+        # sequences.append(
+        #     sample_tokens(scores[-1], inference_params)
+        # )
 
+        # @xinhao: avoid appending logits, which will OOM as generation length gets longer
+        logits = get_logits(sequences[-1], inference_params)  # [BS, V]
         inference_params.seqlen_offset += sequences[-1].shape[1]
-
-        sequences.append(
-            sample_tokens(scores[-1], inference_params)
-        )
+        new_token = logits.argmax(dim=-1).unsqueeze(-1)  # [BS,1]
+        sequences.append(new_token)
 
     if enable_timing:
         end.record()

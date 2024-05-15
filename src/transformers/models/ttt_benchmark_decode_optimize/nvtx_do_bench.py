@@ -80,7 +80,8 @@ def do_bench_cudagraph(fn, rep=20, grad_to_none=None):
     return torch.mean(torch.tensor(ret)).item()
 
 
-def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, fast_flush=True, return_mode="mean"):
+def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, fast_flush=True, return_mode="mean",
+             profile=False):
     assert return_mode in ["min", "max", "mean", "median"]
     import torch
     """
@@ -143,14 +144,16 @@ def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, fast_flu
         cache.zero_()
 
         # record time of `fn`
-        # start_id = nvtx.start_range('Decode', color='lime')
+        if profile:
+            start_id = nvtx.start_range('Decode', color='lime')
 
         start_event[i].record()
         fn()
         end_event[i].record()
 
-        # torch.cuda.synchronize()
-        # nvtx.end_range(start_id)
+        if profile:
+            # torch.cuda.synchronize()
+            nvtx.end_range(start_id)
 
     # Record clocks
     torch.cuda.synchronize()

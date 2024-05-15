@@ -24,7 +24,7 @@ from ...pytorch_utils import ALL_LAYERNORM_LAYERS
 from ...utils import ModelOutput, logging
 from .configuration_ttt import TttConfig
 
-from transformers.models.ttt_benchmark_optimize.generation import GenerationMixin, TttCache
+from transformers.models.ttt_benchmark_decode_optimize.generation import GenerationMixin, TttCache
 from mamba_ssm.ops.triton.layernorm import RMSNorm, rms_norm_fn
 
 
