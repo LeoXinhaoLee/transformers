@@ -9,6 +9,7 @@ pytorch 2.2 + triton 2.2 (needed by Mamba and components borrowed from it)
 
 <h2>Commands for reproducing results</h2>
 Note that Mamba and TTT have constant decode throughput given any generation length, so only need to test 2K for example.
+
 ```
 #!/bin/bash
 
@@ -56,12 +57,11 @@ do
                                       --inner_net mlp_2_dual_triton \
                                       --use_compile
  done
-
 ```
 
 To generate pytorch profiler .json file, follow this example:
-```
 
+```
 python benchmark_prefill_decode.py --logdir ./exp/05_15_M2_decode_profile \
                                    --model-name ttt-profile \
                                    --mode decode \
@@ -71,8 +71,8 @@ python benchmark_prefill_decode.py --logdir ./exp/05_15_M2_decode_profile \
                                    --inner_net mlp_2_dual \
                                    --no_cg \
                                    --profile
-
 ```
+
 Then go to https://ui.perfetto.dev/ to open .json trace.
 
 
@@ -81,13 +81,16 @@ Then go to https://ui.perfetto.dev/ to open .json trace.
 <h2>Commands</h2>
 
 To benchmark clock-time:
+
 ```
 python src/models/ttt_benchmark_decode_optimize/micro_benchmark.py
 ```
+
 Note that to select which kernel function to benchmark, you can comment out the unneeded ones in `line_vals` in 
 `@triton.testing.perf_report`.
 
 To generate Nvidia Nsight System record:
+
 ```
 nsys profile -f true -o OUTPUT_PATH python src/models/ttt_benchmark_decode_optimize/micro_benchmark.py --profile
 ```
