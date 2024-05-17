@@ -16,13 +16,10 @@ import torch
 import triton
 import triton.language as tl
 # from triton.testing import do_bench
-from transformers.models.ttt_benchmark_decode_optimize.nvtx_do_bench import do_bench  # @xinhao: support nvtx tag
+from transformers.models.ttt_full_decode_optimize.nvtx_do_bench import do_bench  # @xinhao: support nvtx tag
 
-from transformers.models.ttt_benchmark_decode_optimize.micro_decode_modules import ttt_m1_decode, ttt_m2_decode, \
+from transformers.models.ttt_full_decode_optimize.micro_decode_modules import ttt_m1_decode, ttt_m2_decode, \
     ttt_m1_triton_decode, ttt_m2_triton_decode
-
-from transformers.models.ttt_benchmark_decode_optimize.micro_decode_modules_beta import ttt_m1_triton_sharded_decode
-
 
 EXPAND = 4
 
