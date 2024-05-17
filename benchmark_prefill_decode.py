@@ -29,13 +29,9 @@ import os.path as osp
 import time
 import json
 import logging
-from distutils.util import strtobool
 
 import torch
-import torch.nn.functional as F
 from torch.profiler import profile, record_function, ProfilerActivity
-
-from einops import rearrange
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, PretrainedConfig
 from transformers import LlamaForCausalLM, LlamaConfig

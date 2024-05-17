@@ -12,6 +12,8 @@ import sys
 import os
 
 import argparse
+
+import einops
 import torch
 import triton
 import triton.language as tl
@@ -30,40 +32,39 @@ parser = argparse.ArgumentParser(description="Micro benchmarking")
 parser.add_argument("--profile", action='store_true')  # @xinhao: launching by `nsys profile` will affect time
 args = parser.parse_args()                             # @xinhao: but if not, even if specify --profile, time won't be affected
 
-
-def clean_tensor(tensor):
-    tensor[torch.isnan(tensor) | (tensor == float('inf')) | (tensor == float('-inf'))] = 0
-    return tensor
-
 ################### Benchmark M2 v.s M1, Pytorch v.s Triton v.s Triton CG ###########################
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=['N'],
         # x_vals=[2 ** i for i in range(0, 12)],  # different possible values for `x_name`
-        x_vals=[64, 128],
+        x_vals=[128, 256],
         line_arg='provider',
         line_vals=[
             # 'M1 torch-native',
-            # 'M1 triton',
-            # 'M1 triton CG',
+            'M1 triton',
+            'M1 triton CG',
+            'M1 triton sharded',
+            'M1 triton sharded CG',
             # 'M2 torch-native',
-            'M2 triton',
+            # 'M2 triton',
             # 'M2 triton CG',
         ],
         line_names=[
             # 'M1 torch-native',
-            # 'M1 triton',
-            # 'M1 triton CG',
+            'M1 triton',
+            'M1 triton CG',
+            'M1 triton sharded',
+            'M1 triton sharded CG',
             # 'M2 torch-native',
-            'M2 triton',
+            # 'M2 triton',
             # 'M2 triton CG',
         ],
         styles=[('blue', '-'), ('blue', '--'), ('blue', ':'),
                 ('green', '-'), ('green', '--'), ('green', ':')],
         ylabel="ms",
         plot_name="decode N token time",
-        args={'BS': 64, 'NH': 32, 'CS': 1, 'HF': 64, 'HF_prime': int(EXPAND * 64)},
+        args={'BS': 4, 'NH': 32, 'CS': 1, 'HF': 64, 'HF_prime': int(EXPAND * 64)},
     )
 )
 def benchmark_decode(N, BS, NH, CS, HF, HF_prime, provider):
@@ -79,6 +80,14 @@ def benchmark_decode(N, BS, NH, CS, HF, HF_prime, provider):
     XC = torch.randn(N, BS, NH, CS, HF, device='cuda', dtype=input_dtype) * 0.02
     coeff = torch.randn(N, BS, NH, CS, 1, device='cuda', dtype=input_dtype) * 0.02
 
+    if 'sharded' in provider:
+        M = 2
+        # XA = XA.reshape(N, BS, NH, CS, M, HF // M).permute(0, 1, 2, 4, 3, 5)  # [N, BS, NH, M, CS, HF//M]
+        XA = XA.reshape(N, BS * NH, CS, M, HF // M).permute(0, 1, 3, 2, 4)  # [N, BS*NH, M, CS, HF//M]
+        XB = einops.rearrange(XB, "n b h cs f -> n (b h) cs f")
+        XC = einops.rearrange(XC, "n b h cs f -> n (b h) cs f")
+        coeff = einops.rearrange(coeff, "n b h cs f -> n (b h) cs f")
+
     XA_holder = torch.zeros_like(XA[0])
     XB_holder = torch.zeros_like(XB[0])
     XC_holder = torch.zeros_like(XC[0])
@@ -86,6 +95,9 @@ def benchmark_decode(N, BS, NH, CS, HF, HF_prime, provider):
 
     if 'M1' in provider:
         W1 = torch.randn(BS, NH, HF, HF, device='cuda', dtype=input_dtype) * 0.02
+        if 'sharded' in provider:
+            # W1 = W1.reshape(BS, NH, HF, M, HF // M).permute(0, 1, 3, 2, 4)
+            W1 = W1.reshape(BS * NH, HF, M, HF // M).permute(0, 2, 1, 3)  # [BS*NH, M, HF, HF_div_M]
         W1_grad = torch.randn_like(W1) * 0.02
     elif 'M2' in provider:
         W1 = torch.randn(BS, NH, HF, HF_prime, device='cuda', dtype=input_dtype) * 0.02
@@ -96,13 +108,19 @@ def benchmark_decode(N, BS, NH, CS, HF, HF_prime, provider):
     else:
         raise NotImplementedError
 
-    if provider == 'M1 torch-native' or provider == 'M1 triton':
+    if provider == 'M1 torch-native' or provider == 'M1 triton' or provider == 'M1 triton sharded':
         def loop(decode, W1, W1_grad):
             for i in range(N):
-                W1, W1_grad, _ = decode(XA[i], XB[i], XC[i], coeff[i], W1, W1_grad)
+                # W1, W1_grad, _ = decode(XA[i], XB[i], XC[i], coeff[i], W1, W1_grad)
+                decode(XA[i], XB[i], XC[i], coeff[i], W1, W1_grad)
 
-    elif provider == 'M1 triton CG':
-        decode = ttt_m1_triton_decode
+    elif provider == 'M1 triton CG' or provider == 'M1 triton sharded CG':
+
+        if provider == 'M1 triton CG':
+            decode = ttt_m1_triton_decode
+        else:
+            decode = ttt_m1_triton_sharded_decode
+
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
