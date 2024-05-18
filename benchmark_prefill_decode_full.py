@@ -1,25 +1,3 @@
-'''Benchmarking Prefilling and Decoding
-E.g.,
-# Prefilling
-python benchmark_prefill_decode.py --logdir ./exp/prefill_ttt_125m \
-                                   --mode prefill \
-                                   --model-name ttt-1b \
-                                   --inner_net mlp_1_dual_triton \
-                                   --batch 64 \
-                                   --promptlen 512 \
-                                   --genlen 0 \
-                                   --use_compile
-
-# Decoding
-python benchmark_prefill_decode.py --logdir ./exp/decode_ttt_125m \
-                                   --mode decode \
-                                   --model-name ttt-1b \
-                                   --inner_net mlp_2_dual_triton \
-                                   --batch 64 \
-                                   --promptlen 1 \
-                                   --genlen 512 \
-                                   --use_compile
-'''
 import gc
 import pdb
 
@@ -38,21 +16,20 @@ from transformers import LlamaForCausalLM, LlamaConfig
 
 from transformers.models.mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel  # copy from mamba repo, modify generation to avoid OOM
 from transformers.models.ttt.configuration_ttt import TTT_STANDARD_CONFIGS, TttConfig  # 125m and 1b config
-
+from transformers.models.ttt.modeling_ttt import TttForCausalLM  # doesn't support cg
 # from transformers.models.ttt_benchmark_prefill_decode.modeling_ttt import TttForCausalLM  # TODO: prefill and decode, but not optimized
 # from transformers.models.ttt_benchmark_decode_optimize.modeling_ttt import TttForCausalLM  # TODO: Only support decode, but is optimized
-from transformers.models.ttt_full_decode_optimize.modeling_ttt import TttForCausalLM  # TODO: Only support decode, but is optimized
 
 parser = argparse.ArgumentParser(description="Generation benchmarking")
 parser.add_argument("--logdir", type=str, default="./exp/clean")
-parser.add_argument("--model-name", type=str, default="ttt-1b")
+parser.add_argument("--model-name", type=str, default="state-spaces/mamba-1.4b")
 # state-spaces/mamba-130m | meta-llama/Llama-2-7b | state-spaces/mamba-1.4b | ttt-125m | ttt-1b | ttt-profile
 parser.add_argument("--mode", type=str, default="prefill", choices=["prefill", "decode"])
 parser.add_argument("--promptlen", type=int, default=1)
 parser.add_argument("--genlen", type=int, default=128)
 parser.add_argument("--batch", type=int, default=1)
 parser.add_argument("--attn_impl", type=str, default='flash_attention_2', choices=['eager', 'flash_attention_2'])
-parser.add_argument("--inner_net", type=str, default='mlp_2_dual', choices=['mlp_1_dual', 'mlp_2_dual', 'mlp_1_dual_triton', 'mlp_2_dual_triton'])
+parser.add_argument("--inner_net", type=str, default='m1', choices=['m1', 'm2', 'm1_triton', 'm2_triton'])
 parser.add_argument("--use_compile", action='store_true')
 parser.add_argument("--no_cg", action='store_true')    # @xinhao: currently only implemented for Mamba and TTT
 parser.add_argument("--profile", action='store_true')  # @xinhao: pytorch profiler, different from nsys in micro-benchmark
@@ -105,16 +82,32 @@ elif is_ttt:
     elif ttt_size not in TTT_STANDARD_CONFIGS.keys():
         raise NotImplementedError(f"TTT Config {args.model_name} Not Implemented!")
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
+
+    # ttt_config = TttConfig(**TTT_STANDARD_CONFIGS[ttt_size])
+    # ttt_config.inner_net = args.inner_net
+    # ttt_config.use_compile = args.use_compile
+    # ttt_config.dtype = dtype
+    # # @xinhao: follow mamba-1.4b
+    # ttt_config.fused_add_norm = True
+    # ttt_config.residual_in_fp32 = True
+    # if args.model_name.split('-')[-1] == 'profile':
+    #     ttt_config.num_hidden_layers = 1
+    # model = TttForCausalLM(ttt_config).to(device=device, dtype=dtype)
+
     ttt_config = TttConfig(**TTT_STANDARD_CONFIGS[ttt_size])
-    ttt_config.inner_net = args.inner_net
-    ttt_config.use_compile = args.use_compile
     ttt_config.dtype = dtype
-    # @xinhao: follow mamba-1.4b
-    ttt_config.fused_add_norm = True
-    ttt_config.residual_in_fp32 = True
-    if args.model_name.split('-')[-1] == 'profile':
-        ttt_config.num_hidden_layers = 1
+    ttt_config.inner_net_type = args.inner_net
+    ttt_config.inner_net_lr = 0.01
+    ttt_config.inner_net_chunk_size = 16
+    ttt_config.use_vjp = True,
+    ttt_config.use_post_ln = True
+    ttt_config.inner_net_on_residual = True
+    ttt_config.conv_before_ttt = True
+    ttt_config.conv_kernel = 4
+    ttt_config.use_learnable_token_idx = False
+    ttt_config.inner_net_gate_activation = "sigmoid"
     model = TttForCausalLM(ttt_config).to(device=device, dtype=dtype)
+
 else:
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")  # meta-llama/Llama-2-7b
     config = LlamaConfig.from_json_file('./llama_config/config.json')  # 1B llama config
@@ -142,18 +135,29 @@ if args.mode == 'decode':
             top_p=0,
         )
     elif is_ttt:
+        # fn = lambda i: model.generate(
+        #     input_ids=input_ids,
+        #     max_length=max_length,
+        #     cg=(not args.no_cg),
+        #     return_dict_in_generate=True,
+        #     output_scores=False,
+        #     enable_timing=False,
+        #     temperature=1.0,
+        #     top_k=1,  # @xinhao: mamba src code: shortcut for greedy
+        #     top_p=0,
+        #     i=i  # @xinhao: for debug output
+        # )
+
         fn = lambda i: model.generate(
             input_ids=input_ids,
+            attention_mask=attn_mask,
             max_length=max_length,
-            cg=(not args.no_cg),
+            min_length=max_length,
             return_dict_in_generate=True,
-            output_scores=False,
-            enable_timing=False,
-            temperature=1.0,
-            top_k=1,  # @xinhao: mamba src code: shortcut for greedy
-            top_p=0,
-            i=i  # @xinhao: for debug output
+            pad_token_id=tokenizer.eos_token_id,
+            do_sample=False,
         )
+
     else:
         if args.use_compile:
             model = torch.compile(model)  # @xinhao: can compile the whole Transformer for decode, though doesn't help

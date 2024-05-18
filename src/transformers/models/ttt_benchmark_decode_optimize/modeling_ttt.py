@@ -491,7 +491,7 @@ def _m1_decode_kernel(W1_init, W1_grad, XA, XB, XC, coeff, Out,
     Z1_bar = tl.sum(tl.trans(XC_chunk) * W1_init_data, 0)
 
     tl.store(Out_chunk, Z1_bar.to(Out.type.element_ty))
-    tl.store(W1_init, W1_init_data.to(W_dtype))
+    tl.store(W1_init, W1_init_data.to(W_dtype))  # TODO: don't need in most cases (non-last-in-chunk)
     tl.store(W1_grad, W1_grad_data.to(W_dtype))
 
 class TttM1BMMTritonModule(TttBaseModule):

@@ -576,11 +576,17 @@ class TttBaseModule(nn.Module):
     def get_qkv_projections(self, hidden_states, cache_params: Optional[TttCache] = None):
         if self.share_qk:
             xq, XA = self.q_proj(hidden_states), self.v_proj(hidden_states)
-            seq_len = xq.shape[1]
-            xq = xq.transpose(1, 2)
+
+            seq_len = xq.shape[1]  # [B,N,F]
+
+            xq = xq.transpose(1, 2)  # [B,F,N]
+
             if causal_conv1d_fn is None:
+
                 if cache_params is not None:
+
                     if cache_params.seqlen_offset > 0:
+                        # decode
                         conv_q_state = cache_params.conv_states_dic['ttt_conv_q'][self.layer_idx]
                         conv_q_state = torch.roll(conv_q_state, shifts=-1, dims=-1)
                         conv_q_state[:, :, -1] = xq[:, :, 0]
@@ -596,22 +602,28 @@ class TttBaseModule(nn.Module):
                         XB = torch.sum(conv_k_state * self.conv_k.weight[:, 0, :], dim=-1)
                         XB += self.conv_k.bias
                         XB = XB.unsqueeze(-1)
+
                     else:
+                        # prefill
                         conv_q_state = nn.functional.pad(
                             xq,
                             (self.config.conv_kernel - xq.shape[-1], 0)
                         )
                         cache_params.conv_states_dic['ttt_conv_q'][self.layer_idx].copy_(conv_q_state)
                         XC = self.conv_q(xq)[..., :seq_len]
+
                         conv_k_state = nn.functional.pad(
                             xq,
                             (self.config.conv_kernel - xq.shape[-1], 0)
                         )
                         cache_params.conv_states_dic['ttt_conv_k'][self.layer_idx].copy_(conv_k_state)
                         XB = self.conv_k(xq)[..., :seq_len]
+
                 else:
+                    # cache_params is None
                     XC = self.conv_q(xq)[..., :seq_len]
                     XB = self.conv_k(xq)[..., :seq_len]
+
             else:
                 conv_q_weights = self.conv_q.weight.view(self.conv_q.weight.size(0), self.conv_q.weight.size(2))
                 conv_k_weights = self.conv_k.weight.view(self.conv_k.weight.size(0), self.conv_k.weight.size(2))

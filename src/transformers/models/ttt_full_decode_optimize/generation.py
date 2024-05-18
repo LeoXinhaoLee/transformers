@@ -38,6 +38,7 @@ class InferenceParams:
 
 class TttCache:
     def __init__(self, max_seqlen, max_batch_size, model):
+        self.config = model.config
         self.model = model
         self.max_seqlen = max_seqlen
         self.max_batch_size = max_batch_size
@@ -47,9 +48,9 @@ class TttCache:
         self.inner_chunk_size = model.config.inner_net_chunk_size
         self.params_dict = defaultdict(dict)
         if 'mlp_1' in self.inner_net:
-            self.param_names = ["W1",]
+            self.param_names = ["W1", "b1"]
         else:
-            self.param_names = ["W1", "W2"]
+            self.param_names = ["W1", "b1", "W2", "b2"]
 
     def allocate_inference_cache(self):
         for layer_idx in range(self.model.config.num_hidden_layers):
@@ -58,6 +59,10 @@ class TttCache:
                 tiled_weight = torch.tile(weight, (self.max_batch_size,) + (1,) * (weight.dim() - 1))  # [B*nh,f,f]
                 self.params_dict[f"{name}_states"][layer_idx] = tiled_weight
                 self.params_dict[f"{name}_grad"][layer_idx] = torch.zeros_like(tiled_weight)
+            self.params_dict[f"conv_states"][layer_idx] = torch.zeros(
+                size=(self.max_batch_size, self.config.hidden_size, self.config.conv_kernel),
+                dtype=self.dtype, device=weight.device
+            )
 
     def update_last_in_chunk(self, py_tree, layer_idx):
         for name in self.param_names:
@@ -83,6 +88,7 @@ class TttCache:
                 tiled_weight = torch.tile(weight, (max_batch_size,) + (1,) * (weight.dim() - 1))  # [B*nh,f,f]
                 self.params_dict[f"{name}_states"][layer_idx].copy_(tiled_weight  + i * 0.1)  # @xinhao: debug cg update
                 self.params_dict[f"{name}_grad"][layer_idx].zero_()
+            self.params_dict[f"conv_states"][layer_idx].zero_()
 
 
 # https://github.com/NVIDIA/Megatron-LM/blob/0bb597b42c53355a567aba2a1357cc34b9d99ddd/megatron/text_generation/sampling.py
