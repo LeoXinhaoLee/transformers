@@ -27,7 +27,7 @@ from .configuration_ttt import TttConfig
 from transformers.models.ttt_full_decode_optimize.generation import GenerationMixin, TttCache
 from mamba_ssm.ops.triton.layernorm import RMSNorm, rms_norm_fn
 
-from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+# from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 # causal_conv1d_update, causal_conv1d_fn = None, None
 
 
@@ -187,28 +187,28 @@ class TttBaseModule(nn.Module):
         self.qkv_proj = nn.Linear(self.hidden_size, 3 * self.hidden_size + self.num_heads, bias=False)  # share QK so can add Gate
         self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
 
-        self.conv_q = nn.Conv1d(
-            self.hidden_size,
-            self.hidden_size,
-            bias=True,
-            kernel_size=self.conv_kernel,
-            groups=self.hidden_size,
-            padding=self.conv_kernel - 1,
-        )
-        self.conv_k = nn.Conv1d(
-            self.hidden_size,
-            self.hidden_size,
-            bias=True,
-            kernel_size=self.conv_kernel,
-            groups=self.hidden_size,
-            padding=self.conv_kernel - 1,
-        )
+        # self.conv_q = nn.Conv1d(
+        #     self.hidden_size,
+        #     self.hidden_size,
+        #     bias=True,
+        #     kernel_size=self.conv_kernel,
+        #     groups=self.hidden_size,
+        #     padding=self.conv_kernel - 1,
+        # )
+        # self.conv_k = nn.Conv1d(
+        #     self.hidden_size,
+        #     self.hidden_size,
+        #     bias=True,
+        #     kernel_size=self.conv_kernel,
+        #     groups=self.hidden_size,
+        #     padding=self.conv_kernel - 1,
+        # )
 
-        self.decoder_ln_fn = partial(F.layer_norm, normalized_shape=[self.head_dim], eps=1e-6)
-        ln_weight_data = nn.LayerNorm(self.head_dim).weight.data
-        self.ln_weight = nn.Parameter(torch.tile(ln_weight_data.reshape(1, 1, 1, -1), (1, self.num_heads, 1, 1)))  # [1,h,1,f]
-        ln_bias_data = nn.LayerNorm(self.head_dim).bias.data
-        self.ln_bias = nn.Parameter(torch.tile(ln_bias_data.reshape(1, 1, 1, -1), (1, self.num_heads, 1, 1)))  # [1,h,1,f]
+        # self.decoder_ln_fn = partial(F.layer_norm, normalized_shape=[self.head_dim], eps=1e-6)
+        # ln_weight_data = nn.LayerNorm(self.head_dim).weight.data
+        # self.ln_weight = nn.Parameter(torch.tile(ln_weight_data.reshape(1, 1, 1, -1), (1, self.num_heads, 1, 1)))  # [1,h,1,f]
+        # ln_bias_data = nn.LayerNorm(self.head_dim).bias.data
+        # self.ln_bias = nn.Parameter(torch.tile(ln_bias_data.reshape(1, 1, 1, -1), (1, self.num_heads, 1, 1)))  # [1,h,1,f]
         
         if config.use_compile:
             self.get_inner_loop_inputs = torch.compile(self._get_inner_loop_inputs)
@@ -347,11 +347,6 @@ class TttBaseModule(nn.Module):
         XC = XC.reshape(B, L, self.num_heads, self.head_dim).permute(0,2,1,3).reshape(-1, L, self.head_dim)  # [B*nh,N,f]
         XB = XB.reshape(B, L, self.num_heads, self.head_dim).permute(0,2,1,3).reshape(-1, L, self.head_dim)
 
-        # @xinhao: for QKVO-MLP Only
-        # XC, XB, XA = torch.split(
-        #     XCBA, split_size_or_sections=D, dim=-1
-        # )  # [B,N,3*F] -> [B,N,F] x3
-
         ilr_gated = F.sigmoid(ilr_gated.permute(0,2,1).reshape(-1,1,1))  # [B,N=1,nh] -> [B,nh,N=1] -> [B*nh,N=1,1]
         coeff = self.token_idx[inner_chunk_step_offset] * ilr_gated   # [B*nh,N=1,1]
         return XC, XB, XA, coeff, XGate
@@ -368,20 +363,20 @@ class TttBaseModule(nn.Module):
         is_prefill: Optional[bool] = None,
         is_last_in_chunk: Optional[bool] = None,
     ):
-        if cache_params is None:
-            XC, XB, XA, coeff, XGate = self.get_inner_loop_inputs(
-                hidden_states, position_ids=position_ids,
-                cache_params=cache_params, inner_chunk_size=inner_chunk_size, is_prefill=is_prefill
-            )
-        else:
-            # @xinhao: decoding time should not compile `get_inner_loop_inputs`. Otherwise will recompile every step.
-            XC, XB, XA, coeff, XGate = self._get_inner_loop_inputs(
-                hidden_states, position_ids=position_ids,
-                cache_params=cache_params, inner_chunk_size=inner_chunk_size, is_prefill=is_prefill
-            )
-        B_mul_NH, N, HF = XA.shape
-        B = B_mul_NH // self.num_heads
-        inputs = {'XC': XC, 'XB': XB, 'XA': XA, 'coeff': coeff}
+        # if cache_params is None:
+        #     XC, XB, XA, coeff, XGate = self.get_inner_loop_inputs(
+        #         hidden_states, position_ids=position_ids,
+        #         cache_params=cache_params, inner_chunk_size=inner_chunk_size, is_prefill=is_prefill
+        #     )
+        # else:
+        #     # @xinhao: decoding time should not compile `get_inner_loop_inputs`. Otherwise will recompile every step.
+        #     XC, XB, XA, coeff, XGate = self._get_inner_loop_inputs(
+        #         hidden_states, position_ids=position_ids,
+        #         cache_params=cache_params, inner_chunk_size=inner_chunk_size, is_prefill=is_prefill
+        #     )
+        # B_mul_NH, N, HF = XA.shape
+        # B = B_mul_NH // self.num_heads
+        # inputs = {'XC': XC, 'XB': XB, 'XA': XA, 'coeff': coeff}
         # XCW_batch, batch_params_dict = self.process_inner_loop(
         #     inputs,
         #     inner_chunk_size=inner_chunk_size,
@@ -389,16 +384,24 @@ class TttBaseModule(nn.Module):
         #     cache_params=cache_params,
         #     is_prefill=is_prefill, is_last_in_chunk=is_last_in_chunk,
         # )
-        # @xinhao: for QKVO-MLP Only
-        XCW_batch = XA + XB + XC; batch_params_dict = None
 
-        XCW_batch = F.gelu(XGate, approximate='tanh') * XCW_batch  # [B*nh,N,f]
-        XCW_batch = XCW_batch.reshape(B, self.num_heads, N, self.head_dim).permute(0, 2, 1, 3).reshape(B, N,- 1)
-        z_batch = self.project_inner_loop_outputs(XCW_batch)  # [B,N,F]
-        if return_params:
-            return z_batch, batch_params_dict
-        else:
-            return z_batch
+        # @xinhao: for QKVO-MLP Only
+        # B, N = hidden_states.shape[:2]
+        # XC = XB = XA = XGate = hidden_states.reshape(B, N, self.num_heads, self.head_dim).permute(0,2,1,3).reshape(-1, N, self.head_dim)
+        # XCW_batch = XA + XB + XC; batch_params_dict = None
+        #
+        # # XCW_batch = F.gelu(XGate, approximate='tanh') * XCW_batch  # [B*nh,N,f]
+        # XCW_batch = XGate * XCW_batch  # [B*nh,N,f]
+        #
+        # XCW_batch = XCW_batch.reshape(B, self.num_heads, N, self.head_dim).permute(0, 2, 1, 3).reshape(B, N,- 1)
+        # z_batch = self.project_inner_loop_outputs(XCW_batch)  # [B,N,F]
+        # if return_params:
+        #     return z_batch, batch_params_dict
+        # else:
+        #     return z_batch
+
+        return hidden_states
+
 
     def project_inner_loop_outputs(self, XCW_batch):
         """
@@ -1020,14 +1023,14 @@ class TttDecoderLayer(nn.Module):
                 eps=self.input_layernorm.eps,
             )
         # TTT
-        hidden_states = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            cache_params=cache_params,
-            is_prefill=is_prefill,
-            is_last_in_chunk=is_last_in_chunk,
-        )
+        # hidden_states = self.self_attn(
+        #     hidden_states=hidden_states,
+        #     attention_mask=attention_mask,
+        #     position_ids=position_ids,
+        #     cache_params=cache_params,
+        #     is_prefill=is_prefill,
+        #     is_last_in_chunk=is_last_in_chunk,
+        # )
         # hidden_states = residual + hidden_states
 
         if not self.fused_add_norm:

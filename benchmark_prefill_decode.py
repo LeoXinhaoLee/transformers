@@ -40,8 +40,8 @@ from transformers.models.mamba_ssm.models.mixer_seq_simple import MambaLMHeadMod
 from transformers.models.ttt.configuration_ttt import TTT_STANDARD_CONFIGS, TttConfig  # 125m and 1b config
 
 # from transformers.models.ttt_benchmark_prefill_decode.modeling_ttt import TttForCausalLM  # TODO: prefill and decode, but not optimized
-# from transformers.models.ttt_benchmark_decode_optimize.modeling_ttt import TttForCausalLM  # TODO: Only support decode, but is optimized
-from transformers.models.ttt_full_decode_optimize.modeling_ttt import TttForCausalLM  # TODO: Only support decode, but is optimized
+from transformers.models.ttt_benchmark_decode_optimize.modeling_ttt import TttForCausalLM  # TODO: Only support decode, but is optimized
+# from transformers.models.ttt_full_decode_optimize.modeling_ttt import TttForCausalLM  # TODO: Only support decode, but is optimized
 
 parser = argparse.ArgumentParser(description="Generation benchmarking")
 parser.add_argument("--logdir", type=str, default="./exp/clean")
@@ -213,6 +213,23 @@ if args.profile:
     logger.info(f"SUCCESS: RECORDED TRACE TO {args.logdir}/{args.mode}_trace.json")
     logger.info(f"SUCCESS: RECORDED FLAME DATA TO {args.logdir}/{args.mode}_[cuda,cpu]_flamedata.txt")
     logger.info("==================================")
+
+    # prof = torch.profiler.profile(
+    #     activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+    #     on_trace_ready=torch.profiler.tensorboard_trace_handler(args.logdir),
+    #     record_shapes=True, profile_memory=True, use_cuda=True,
+    #     with_flops=True, with_stack=True, with_modules=True
+    # )
+    #
+    # prof.start()
+    # fn(0)
+    # prof.stop()
+    #
+    # logger.info(f"Mode: {args.mode}")
+    # logger.info(f"Prompt length: {in_len}, generation length: {out_len - in_len}")
+    # logger.info(f"SUCCESS: RECORDED TRACE TO {args.logdir}")
+    # logger.info("==================================")
+
 
 else:
 
