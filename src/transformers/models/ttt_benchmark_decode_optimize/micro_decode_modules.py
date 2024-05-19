@@ -389,7 +389,8 @@ def ttt_m2_triton_block_decode(XA, XB, XC, coeff, W1_init, W1_grad, W2_init, W2_
 
 
 if __name__ == "__main__":
-    os.environ['TRITON_PRINT_AUTOTUNING'] = '1'
+    # os.environ['TRITON_PRINT_AUTOTUNING'] = '1'
+    input_dtype = torch.float16
 
     ############### M2 Matching outputs abs diff ###############
 
@@ -427,25 +428,69 @@ if __name__ == "__main__":
 
     ############### M1 Matching outputs abs diff ###############
 
-    # BS, NH, CS, HF = 64, 32, 1, 64
-    # W1 = torch.randn(BS, NH, HF, HF, device='cuda', dtype=input_dtype) * 0.02
-    # W1_grad = torch.randn_like(W1) * 0.02
-    # W1_original = W1.clone()
-    # W1_grad_original = W1_grad.clone()
-    #
-    # XA = torch.randn(BS, NH, CS, HF, device='cuda', dtype=input_dtype) * 0.02
-    # XB = torch.randn(BS, NH, CS, HF, device='cuda', dtype=input_dtype) * 0.02
-    # XC = torch.randn(BS, NH, CS, HF, device='cuda', dtype=input_dtype) * 0.02
-    # coeff = torch.randn(BS, NH, CS, 1, device='cuda', dtype=input_dtype) * 0.02
-    #
-    # W1, W1_grad, \
-    # XCW_batch = ttt_m1_decode(XA, XB, XC, coeff, W1, W1_grad)
-    #
-    # W1_triton, W1_grad_triton, \
-    # XCW_batch_triton = ttt_m1_triton_decode(XA, XB, XC, coeff, W1_original, W1_grad_original)
-    #
-    # print('========== M1 Matching outputs abs diff ==========')
-    # print('W1 diff: ' + str(torch.abs(W1 - W1_triton).max()))
-    # print('W1_grad diff: ' + str(torch.abs(W1_grad - W1_grad_triton).max()))
-    # print('Output diff: ' + str(torch.abs(XCW_batch - XCW_batch_triton).max()))
+    BS, NH, CS, HF = 64, 32, 1, 64
+    W1_pt = torch.randn(BS, NH, HF, HF, device='cuda', dtype=input_dtype) * 0.02
+    W1_grad_pt = torch.randn_like(W1_pt) * 0.02
+    W1_triton = W1_pt.clone()
+    W1_grad_triton = W1_grad_pt.clone()
+    W1_triton_cg = W1_pt.clone()
+    W1_grad_triton_cg = W1_grad_pt.clone()
 
+    XA = torch.randn(BS, NH, CS, HF, device='cuda', dtype=input_dtype) * 0.02
+    XB = torch.randn(BS, NH, CS, HF, device='cuda', dtype=input_dtype) * 0.02
+    XC = torch.randn(BS, NH, CS, HF, device='cuda', dtype=input_dtype) * 0.02
+    coeff = torch.randn(BS, NH, CS, 1, device='cuda', dtype=input_dtype) * 0.02
+
+    XA_holder = torch.zeros_like(XA)
+    XB_holder = torch.zeros_like(XB)
+    XC_holder = torch.zeros_like(XC)
+    coeff_holder = torch.zeros_like(coeff)
+    W1_holder = torch.zeros_like(W1_pt)
+    W1_grad_holder = torch.zeros_like(W1_grad_pt)
+
+    W1_pt, W1_grad_pt, \
+    XCW_batch_pt = ttt_m1_decode(XA, XB, XC, coeff, W1_pt, W1_grad_pt)
+
+    W1_triton, W1_grad_triton, \
+    XCW_batch_triton = ttt_m1_triton_decode(XA, XB, XC, coeff, W1_triton, W1_grad_triton)
+
+    n_warmups = 4
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(n_warmups):
+            W1_tmp, W1_grad_tmp, Z_tmp = ttt_m1_triton_decode(XA_holder, XB_holder, XC_holder, coeff_holder,
+                                                              W1_holder, W1_grad_holder)
+        s.synchronize()
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
+    torch.cuda.current_stream().wait_stream(s)
+
+    graph = torch.cuda.CUDAGraph()
+    mempool = torch.cuda.graphs.graph_pool_handle()
+    with torch.cuda.graph(graph, pool=mempool):
+        W1_tmp, W1_grad_tmp, Z_tmp = ttt_m1_triton_decode(XA_holder, XB_holder, XC_holder, coeff_holder,
+                                                          W1_holder, W1_grad_holder)
+
+    def run(new_XA, new_XB, new_XC, new_coeff, new_W1, new_W1_grad):
+        XA_holder.copy_(new_XA)
+        XB_holder.copy_(new_XB)
+        XC_holder.copy_(new_XC)
+        coeff_holder.copy_(new_coeff)
+        W1_holder.copy_(new_W1)
+        W1_grad_holder.copy_(new_W1_grad)
+        graph.replay()
+        return W1_tmp.clone(), W1_grad_tmp.clone(), Z_tmp.clone()
+
+    W1_triton_cg, W1_grad_triton_cg, XCW_batch_triton_cg = run(XA, XB, XC, coeff, W1_triton_cg, W1_grad_triton_cg)
+
+    print('========== M1 Matching Pytorch v.s Triton ============')
+    print('W1 diff: ' + str(torch.abs(W1_pt - W1_triton).max()))
+    print('W1_grad diff: ' + str(torch.abs(W1_grad_pt - W1_grad_triton).max()))
+    print('Output diff: ' + str(torch.abs(XCW_batch_pt - XCW_batch_triton).max()))
+
+    print('========== M1 Matching Pytorch v.s Triton CG ============')
+    print('W1 diff: ' + str(torch.abs(W1_pt - W1_triton_cg).max()))
+    print('W1_grad diff: ' + str(torch.abs(W1_grad_pt - W1_grad_triton_cg).max()))
+    print('Output diff: ' + str(torch.abs(XCW_batch_pt - XCW_batch_triton_cg).max()))
