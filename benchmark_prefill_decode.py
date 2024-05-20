@@ -1,23 +1,24 @@
 '''Benchmarking Prefilling and Decoding
 E.g.,
-# Prefilling
-python benchmark_prefill_decode.py --logdir ./exp/prefill_ttt_125m \
+# Prefilling (https://docs.google.com/spreadsheets/d/1rhl2RNSzORNz5rZLFQV_LTeEsVhbeKDYCdziRjUOIsw/edit#gid=581380725)
+
+# Throughput ~= 45000
+python benchmark_prefill_decode.py --logdir ./exp/prefill_ttt_1b \
+                                   --mode prefill \
+                                   --model-name ttt-1b \
+                                   --inner_net mlp_1_dual \
+                                   --batch 64 \
+                                   --promptlen 512 \
+                                   --genlen 0
+
+# Throughput ~= 64000
+python benchmark_prefill_decode.py --logdir ./exp/prefill_ttt_1b \
                                    --mode prefill \
                                    --model-name ttt-1b \
                                    --inner_net mlp_1_dual_triton \
                                    --batch 64 \
                                    --promptlen 512 \
                                    --genlen 0 \
-                                   --use_compile
-
-# Decoding
-python benchmark_prefill_decode.py --logdir ./exp/decode_ttt_125m \
-                                   --mode decode \
-                                   --model-name ttt-1b \
-                                   --inner_net mlp_2_dual_triton \
-                                   --batch 64 \
-                                   --promptlen 1 \
-                                   --genlen 512 \
                                    --use_compile
 '''
 import gc
@@ -39,8 +40,8 @@ from transformers import LlamaForCausalLM, LlamaConfig
 from transformers.models.mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel  # copy from mamba repo, modify generation to avoid OOM
 from transformers.models.ttt.configuration_ttt import TTT_STANDARD_CONFIGS, TttConfig  # 125m and 1b config
 
-# from transformers.models.ttt_benchmark_prefill_decode.modeling_ttt import TttForCausalLM  # TODO: prefill and decode, but not optimized
-from transformers.models.ttt_benchmark_decode_optimize.modeling_ttt import TttForCausalLM  # TODO: Only support decode, but is optimized
+from transformers.models.ttt_benchmark_prefill_decode.modeling_ttt import TttForCausalLM  # TODO: prefill and decode, but not optimized
+# from transformers.models.ttt_benchmark_decode_optimize.modeling_ttt import TttForCausalLM  # TODO: Only support decode, but is optimized
 
 parser = argparse.ArgumentParser(description="Generation benchmarking")
 parser.add_argument("--logdir", type=str, default="./exp/clean")
