@@ -83,7 +83,7 @@ Then go to https://ui.perfetto.dev/ to open .json trace.
 To benchmark clock-time:
 
 ```
-python src/models/ttt_benchmark_decode_optimize/micro_benchmark.py
+python src/transformers/models/ttt_benchmark_decode_optimize/micro_benchmark.py
 ```
 
 Note that to select which kernel function to benchmark, you can comment out the unneeded ones in `line_vals` in 
@@ -92,5 +92,5 @@ Note that to select which kernel function to benchmark, you can comment out the 
 To generate Nvidia Nsight System record:
 
 ```
-nsys profile -f true -o OUTPUT_PATH python src/models/ttt_benchmark_decode_optimize/micro_benchmark.py --profile
+nsys profile -f true -o OUTPUT_PATH python src/transformers/models/ttt_benchmark_decode_optimize/micro_benchmark.py --profile
 ```
