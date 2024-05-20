@@ -413,6 +413,7 @@ if __name__ == "__main__":
                 torch.distributed.barrier()
         torch.cuda.current_stream().wait_stream(s)
 
+        Z_tmp_before = Z_tmp.clone()
         graph_cuda = torch.cuda.CUDAGraph()
         mempool_cuda = torch.cuda.graphs.graph_pool_handle()
         with torch.cuda.graph(graph_cuda, pool=mempool_cuda):
@@ -420,10 +421,11 @@ if __name__ == "__main__":
                                    cuda_input_dict['XC'], cuda_input_dict['coeff'],
                                    cuda_state_dict['W1'], cuda_state_dict['W1_grad'],
                                    cuda_state_dict['W2'], cuda_state_dict['W2_grad'])
-
+        # print(torch.abs(Z_tmp - Z_tmp_before).max())
         # print(torch.abs(original_state_dict['W1'] - cuda_state_dict['W1']).max())
         # print(torch.abs(original_state_dict['W1_grad'] - cuda_state_dict['W1_grad']).max())
 
+        Z_tmp_before = Z_tmp.clone()
         def run():
             graph_cuda.replay()
             return Z_tmp.clone()
@@ -432,8 +434,8 @@ if __name__ == "__main__":
             cuda_state_dict[k].copy_(original_state_dict[k])
         for k in cuda_input_dict.keys():
             cuda_input_dict[k].copy_(original_input_dict[k].squeeze(2))
-
         XCW_batch_cuda = run()
+        # print(torch.abs(Z_tmp - Z_tmp_before).max())
         # print(torch.abs(original_state_dict['W1'] - cuda_state_dict['W1']).max())
         # print(torch.abs(original_state_dict['W1_grad'] - cuda_state_dict['W1_grad']).max())
         XCW_batch_cuda = XCW_batch_cuda.unsqueeze(2)

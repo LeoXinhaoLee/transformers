@@ -49,7 +49,7 @@ args = parser.parse_args()                             # @xinhao: but if not, ev
                 ('green', '-'), ('green', '--')],
         ylabel="ms",
         plot_name="decode N token time",
-        args={'BS': 64, 'NH': 32, 'CS': 1, 'HF': 64, 'HF_prime': int(EXPAND * 64)},
+        args={'BS': 1024, 'NH': 32, 'CS': 1, 'HF': 64, 'HF_prime': int(EXPAND * 64)},
     )
 )
 def benchmark_decode(N, BS, NH, CS, HF, HF_prime, provider):
