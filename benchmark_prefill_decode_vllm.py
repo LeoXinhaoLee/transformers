@@ -55,8 +55,9 @@ logger.info("dtype: " + str(dtype))
 in_len = args.promptlen
 out_len = args.promptlen + args.genlen
 
-sampling_params = SamplingParams(top_p=1.0, ignore_eos=True, max_tokens=args.genlen, min_tokens=args.genlen)
-llm = LLM(model='LeoLearntoCode/llama-1.3b', skip_tokenizer_init=True)
+# sampling_params = SamplingParams(top_p=1.0, ignore_eos=True, max_tokens=args.genlen, min_tokens=args.genlen)
+sampling_params = SamplingParams(top_p=1.0, ignore_eos=True, max_tokens=out_len, min_tokens=out_len)
+llm = LLM(model=args.model_name, skip_tokenizer_init=True)
 prompts = [torch.randint(low=10, high=100, size=(args.promptlen,)).tolist() for _ in range(args.batch)]
 
 outputs = llm.generate(prompt_token_ids=prompts, sampling_params=sampling_params)

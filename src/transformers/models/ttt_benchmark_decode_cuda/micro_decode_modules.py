@@ -1,4 +1,5 @@
 import copy
+import pdb
 
 import torch
 import einops
@@ -298,7 +299,7 @@ if __name__ == "__main__":
     torch.manual_seed(42)
     input_dtype = torch.float16
 
-    test_cg = True
+    test_cg = False
     end_chunk = False
 
     ############### M2 Matching outputs abs diff ###############
@@ -312,7 +313,7 @@ if __name__ == "__main__":
         triton_decode_fn = triton_m2_decode_non_end_chunk
         cuda_decode_fn = m2_decode_cpp.decode  # non-last-in-chunk: only update W_grad
 
-    BS, NH, CS, HF, HF_prime = 64, 32, 1, 64, 4 * 64
+    BS, NH, CS, HF, HF_prime = 512, 32, 1, 64, 4 * 64
 
     original_state_dict = {
         'W1': torch.randn(BS, NH, HF, HF_prime, device='cuda', dtype=input_dtype) * 0.02,
@@ -347,6 +348,12 @@ if __name__ == "__main__":
         ## CUDA
         cuda_state_dict = copy.deepcopy(original_state_dict)
         cuda_input_dict = copy.deepcopy(original_input_dict)
+        # @xinhao: transpose W1, W2
+        for k in cuda_state_dict.keys():
+            # flag = 'W1' in k
+            flag = True
+            if flag:
+                cuda_state_dict[k] = cuda_state_dict[k].transpose(-1, -2).contiguous()
         for k in cuda_input_dict.keys():
             cuda_input_dict[k] = cuda_input_dict[k].squeeze(2)
         XCW_batch_cuda = cuda_decode_fn(cuda_input_dict['XA'], cuda_input_dict['XB'],
@@ -396,6 +403,12 @@ if __name__ == "__main__":
         ### CUDA CG
         cuda_state_dict = copy.deepcopy(original_state_dict)
         cuda_input_dict = copy.deepcopy(original_input_dict)
+        # @xinhao: transpose W1, W2
+        for k in cuda_state_dict.keys():
+            # flag = 'W1' in k
+            flag = True
+            if flag:
+                cuda_state_dict[k] = cuda_state_dict[k].transpose(-1, -2).contiguous()
         for k in cuda_input_dict.keys():
             cuda_input_dict[k] = cuda_input_dict[k].squeeze(2)
 
@@ -446,6 +459,12 @@ if __name__ == "__main__":
     print(f'Use CG: {test_cg}')
 
     print('=== PyTorch v.s CUDA ===')
+    # @xinhao: transpose back
+    for k in cuda_state_dict.keys():
+        # flag = 'W1' in k
+        flag = True
+        if flag:
+            cuda_state_dict[k] = cuda_state_dict[k].transpose(-1, -2).contiguous()
     for k in original_state_dict.keys():
         diff = pt_state_dict[k] - cuda_state_dict[k]
         print(f'{k} diff: max={diff.max()}')

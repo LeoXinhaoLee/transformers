@@ -41,7 +41,8 @@ from transformers.models.ttt.configuration_ttt import TTT_STANDARD_CONFIGS, TttC
 
 # from transformers.models.ttt_benchmark_prefill_decode.modeling_ttt import TttForCausalLM  # TODO: prefill and decode, but not optimized
 # from transformers.models.ttt_benchmark_decode_optimize.modeling_ttt import TttForCausalLM  # TODO: Only support decode, but is optimized
-from transformers.models.ttt_full_decode_optimize.modeling_ttt import TttForCausalLM  # TODO: Only support decode, but is optimized
+# from transformers.models.ttt_full_decode_optimize.modeling_ttt import TttForCausalLM  # TODO: Only support decode, but is optimized
+from transformers.models.ttt_full_prefill_decode_optimize.modeling_ttt import TttForCausalLM
 
 parser = argparse.ArgumentParser(description="Generation benchmarking")
 parser.add_argument("--logdir", type=str, default="./exp/clean")
