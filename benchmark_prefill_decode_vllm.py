@@ -47,7 +47,7 @@ logger.info(config_str)
 
 torch.random.manual_seed(0)  # @xinhao: make sure model init is fixed
 
-repeats = 3
+repeats = 1
 device = "cuda"
 dtype = torch.float16  # @xinhao: follow mamba benchmark
 logger.info("dtype: " + str(dtype))
@@ -60,9 +60,9 @@ sampling_params = SamplingParams(top_p=1.0, ignore_eos=True, max_tokens=out_len,
 llm = LLM(model=args.model_name, skip_tokenizer_init=True)
 prompts = [torch.randint(low=10, high=100, size=(args.promptlen,)).tolist() for _ in range(args.batch)]
 
-outputs = llm.generate(prompt_token_ids=prompts, sampling_params=sampling_params)
-del outputs
-logger.info(f"Succeeded.")
+# outputs = llm.generate(prompt_token_ids=prompts, sampling_params=sampling_params)
+# del outputs
+# logger.info(f"Succeeded.")
 
 torch.cuda.synchronize()
 start = time.time()

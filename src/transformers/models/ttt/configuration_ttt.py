@@ -43,6 +43,24 @@ TTT_STANDARD_CONFIGS = {
         "rms_norm_eps": 1e-6,
         "tie_word_embeddings": True,
     },
+    "350m": {
+        "hidden_size": 1024,
+        "intermediate_size": 2730,
+        "num_hidden_layers": 24,
+        "num_attention_heads": 16,
+        "rms_norm_eps": 1e-6,
+        "tie_word_embeddings": True,
+    },
+    "760m": {
+        "hidden_size": 1536,
+        "intermediate_size": 4096,
+        "num_hidden_layers": 24,
+        "num_attention_heads": 16,
+        "rms_norm_eps": 1e-6,
+        "tie_word_embeddings": True,
+    },
+
+
 }
 
 

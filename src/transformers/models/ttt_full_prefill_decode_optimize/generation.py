@@ -16,6 +16,26 @@ from torch.profiler import ProfilerActivity, profile, record_function
 from transformers.generation import GreedySearchDecoderOnlyOutput, SampleDecoderOnlyOutput
 
 
+@dataclass
+class InferenceParams:
+    """Inference parameters that are passed to the main model in order
+    to efficienly calculate and store the context during inference."""
+
+    max_seqlen: int
+    max_batch_size: int
+    seqlen_offset: int = 0
+    batch_size_offset: int = 0
+    key_value_memory_dict: dict = field(default_factory=dict)
+    lengths_per_sample: Optional[Tensor] = None
+
+    def reset(self, max_seqlen, max_batch_size):
+        self.max_seqlen = max_seqlen
+        self.max_batch_size = max_batch_size
+        self.seqlen_offset = 0
+        if self.lengths_per_sample is not None:
+            self.lengths_per_sample.zero_()
+
+
 class TttCache:
     def __init__(self, max_seqlen, max_batch_size, model):
         self.config = model.config
@@ -43,19 +63,6 @@ class TttCache:
                 size=(self.max_batch_size, self.config.hidden_size, self.config.conv_kernel),
                 dtype=self.dtype, device=weight.device
             )
-
-    def update_last_in_chunk(self, py_tree, layer_idx):
-        for name in self.param_names:
-            self.params_dict[f"{name}_states"][layer_idx].copy_(py_tree[f"{name}_states"])
-            self.params_dict[f"{name}_grad"][layer_idx].zero_()
-
-    def update_non_last_in_chunk(self, py_tree, layer_idx):
-        # TODO: prefilling last chunk < CS will also need to use this
-        for name in self.param_names:
-            self.params_dict[f"{name}_grad"][layer_idx].copy_(py_tree[f"{name}_grad"])
-
-    def to_dic(self, layer_idx):
-        return {name: self.params_dict[name][layer_idx] for name in self.params_dict}
 
     def reset(self, max_seqlen, max_batch_size, model, i=0):
         self.max_seqlen = max_seqlen
@@ -180,18 +187,18 @@ def decode(
         inference_params.reset(max_length, batch_size, model, i)  # TODO: must reset keep the shape of inference_params?
 
         ## Capture is_last_in_chunk = True
-        model._decoding_cache = update_graph_cache(
-            model,
-            model._decoding_cache,
-            batch_size,
-            seqlen_og,
-            max_length,
-            tensor_parallel=tensor_parallel,
-            is_prefill=False,
-            is_last_in_chunk=True,
-        )
-        inference_params = model._decoding_cache.inference_params
-        inference_params.reset(max_length, batch_size, model)  # TODO: must reset keep the shape of inference_params?
+        # model._decoding_cache = update_graph_cache(
+        #     model,
+        #     model._decoding_cache,
+        #     batch_size,
+        #     seqlen_og,
+        #     max_length,
+        #     tensor_parallel=tensor_parallel,
+        #     is_prefill=False,
+        #     is_last_in_chunk=True,
+        # )
+        # inference_params = model._decoding_cache.inference_params
+        # inference_params.reset(max_length, batch_size, model)  # TODO: must reset keep the shape of inference_params?
 
     else:
         inference_params = TttCache(max_seqlen=max_length, max_batch_size=batch_size, model=model)
@@ -214,7 +221,8 @@ def decode(
                 ).logits[:, -1, :]  # [BS,prompt_len,vocab] -> [BS,1,vocab] -> [BS,vocab]
             else:
                 ## decoding, but doesn't use cg (should only be used for profiling)
-                is_last_in_chunk = ((input_ids.shape[1] + 1) % inference_params.inner_chunk_size == 0)
+                # is_last_in_chunk = ((input_ids.shape[1] + 1) % inference_params.inner_chunk_size == 0)
+                is_last_in_chunk = False
                 is_prefill = False
                 logits = model(
                     input_ids,
@@ -226,8 +234,8 @@ def decode(
             ## cg and decoding
             # after prompt: continue generating
             is_prefill = False
-            is_last_in_chunk = ((inference_params.seqlen_offset + 1) % inference_params.inner_chunk_size == 0)
-            # is_last_in_chunk = False
+            # is_last_in_chunk = ((inference_params.seqlen_offset + 1) % inference_params.inner_chunk_size == 0)
+            is_last_in_chunk = False
             logits = model._decoding_cache.run(
                 input_ids, is_prefill, is_last_in_chunk
             ).squeeze(dim=1)  # [BS,decode_len,vocab_size]
@@ -261,17 +269,15 @@ def decode(
         start.record()
 
     scores, sequences = [], [input_ids]
-    # if input_ids.shape[1] == 1:
-    #     inference_params.seqlen_offset = 1  # TODO: @xinhao: prompt=1 use decode mode directly as a hack
+    if input_ids.shape[1] == 1:
+        inference_params.seqlen_offset = 1  # TODO: @xinhao: prompt=1 use decode mode directly as a hack
 
     while not should_stop(sequences[-1], inference_params):
 
         # scores.append(
         #     get_logits(sequences[-1], inference_params)
         # )
-        #
         # inference_params.seqlen_offset += sequences[-1].shape[1]
-        #
         # sequences.append(
         #     sample_tokens(scores[-1], inference_params)
         # )
