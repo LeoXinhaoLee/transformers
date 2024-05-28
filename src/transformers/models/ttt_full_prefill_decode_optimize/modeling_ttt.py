@@ -190,10 +190,11 @@ class TttBaseModule(nn.Module):
         # self.ln_bias = nn.Parameter(torch.tile(ln_bias_data.reshape(1, 1, 1, -1), (1, self.num_heads, 1, 1)))  # [1,h,1,f]
         self.ln_bias = torch.tile(ln_bias_data.reshape(1, 1, 1, -1), (1, self.num_heads, 1, 1)).to(torch.float16).to('cuda')
 
-        if config.use_compile:
-            self.get_inner_loop_inputs = torch.compile(self._get_inner_loop_inputs)
-        else:
-            self.get_inner_loop_inputs = self._get_inner_loop_inputs
+        # if config.use_compile:
+        #     self.get_inner_loop_inputs = torch.compile(self._get_inner_loop_inputs)
+        # else:
+        #     self.get_inner_loop_inputs = self._get_inner_loop_inputs
+        self.get_inner_loop_inputs = self._get_inner_loop_inputs
 
     def conv_qk(
         self,
@@ -318,8 +319,8 @@ class TttBaseModule(nn.Module):
             split_size_or_sections=self.head_dim, dim=-1
         )  # [B*nh,N=1,f] x2
 
-        XC, XB = self.conv_qk(XCB, cache_params, is_prefill)  # [B,N,F] -> conv1: [B,N,F], conv2: [B,N,F]
-        # XC, XB = self.conv_qk_fused(XCB, cache_params, is_prefill)  # [B,N,F] -> conv1: [B,N,F], conv2: [B,N,F]
+        # XC, XB = self.conv_qk(XCB, cache_params, is_prefill)  # [B,N,F] -> conv1: [B,N,F], conv2: [B,N,F]
+        XC, XB = self.conv_qk_fused(XCB, cache_params, is_prefill)  # [B,N,F] -> conv1: [B,N,F], conv2: [B,N,F]
 
         # @xinhao: test no inner-loop
         # XC = XB = XCB
@@ -620,7 +621,7 @@ def m2_prefill_chunk(states, inputs, i, ln_weight, ln_bias):
     b2_init.copy_(b2_bar[:, -1:])
     return Z2_bar
 
-def m2_decode_one_token_last_in_chunk(states, inputs, ln_weight, ln_bias):
+def m2_decode_end_chunk(states, inputs, ln_weight, ln_bias):
     W1_init = states['W1_states']
     W1_grad = states['W1_grad']
     b1_init = states['b1_states']
@@ -662,7 +663,7 @@ def m2_decode_one_token_last_in_chunk(states, inputs, ln_weight, ln_bias):
 
     return Z2_bar
 
-def m2_decode_one_token_non_last_in_chunk(states, inputs, ln_weight, ln_bias):
+def m2_decode(states, inputs, ln_weight, ln_bias):
     W1_init = states['W1_states']
     W1_grad = states['W1_grad']
     b1_init = states['b1_states']
@@ -709,12 +710,12 @@ class TttM2BMMModule(TttBaseModule):
 
         if self.config.use_compile:
             self.prefill_chunk = torch.compile(m2_prefill_chunk)
-            self.decode_token_last_in_chunk = torch.compile(m2_decode_one_token_last_in_chunk)
-            self.decode_token_non_last_in_chunk = torch.compile(m2_decode_one_token_non_last_in_chunk)
+            self.decode_end_chunk = torch.compile(m2_decode_end_chunk)
+            self.decode = torch.compile(m2_decode)
         else:
             self.prefill_chunk = m2_prefill_chunk
-            self.decode_token_last_in_chunk = m2_decode_one_token_last_in_chunk
-            self.decode_token_non_last_in_chunk = m2_decode_one_token_non_last_in_chunk
+            self.decode_end_chunk = m2_decode_end_chunk
+            self.decode = m2_decode
 
     def process_inner_loop(self, inputs, inner_chunk_size, last_chunk_params_dic,
                            is_prefill=False,
@@ -757,14 +758,14 @@ class TttM2BMMModule(TttBaseModule):
             B_mul_NH, N, HF = inputs['XA'].shape  # [B*nh,N=1,f]
 
             if is_last_in_chunk:
-                XCW_batch = self.decode_token_last_in_chunk(
+                XCW_batch = self.decode_end_chunk(
                     states,  # [B*nh,f,f], cloned from W1, safe for in-place op
                     inputs,  # [B*nh,f]
                     self.ln_weight,  # [nh,1,f]
                     self.ln_bias,  # [nh,1,f]
                 )  # ret: [B*nh,N=1,f]
             else:
-                XCW_batch = self.decode_token_non_last_in_chunk(
+                XCW_batch = self.decode(
                     states,  # [B*nh,f,f], cloned from W1, safe for in-place op
                     inputs,  # [B*nh,f]
                     self.ln_weight,  # [nh,1,f]
@@ -778,176 +779,185 @@ class TttM2BMMModule(TttBaseModule):
 
 ####### M1 Triton Decode Module #######
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({}, num_stages=7, num_warps=8),
-#         triton.Config({}, num_stages=6, num_warps=8),
-#         triton.Config({}, num_stages=5, num_warps=8),
-#         triton.Config({}, num_stages=4, num_warps=8),
-#         triton.Config({}, num_stages=3, num_warps=8),
-#         triton.Config({}, num_stages=3, num_warps=4),
-#         triton.Config({}, num_stages=4, num_warps=4),
-#         triton.Config({}, num_stages=6, num_warps=4),
-#     ],
-#     key=['N_CHUNK'],
-#     restore_value=['W1_init', 'b1_init'],
-# )
-# @triton.jit
-# def _m1_prefill_chunk_triton(
-#         W1_init, b1_init,
-#         XA, XB, XC, coeff, coeff_last, Out,
-#         ln_weight, ln_bias,
-#
-#         stride_w_batch, stride_w_head, stride_w_in, stride_w_out,
-#         stride_b_batch, stride_b_head, stride_b_in, stride_b_out,
-#         stride_ln_head, stride_ln_f,
-#         stride_x_batch, stride_x_head, stride_x_nc, stride_x_cs, stride_x_f,
-#         stride_coeff_batch, stride_coeff_head, stride_coeff_nc, stride_coeff_cs,
-#
-#         CS: tl.constexpr,
-#         HF: tl.constexpr,
-#         N_CHUNK: tl.constexpr
-# ):
-#     batch = tl.program_id(0)
-#     head = tl.program_id(1)
-#     abco_offset = batch * stride_x_batch + head * stride_x_head
-#     coeff_offset = batch * stride_coeff_batch + head * stride_coeff_head
-#     coeff_last_offset = coeff_offset
-#     w_offset = batch * stride_w_batch + head * stride_w_head
-#     b_offset = batch * stride_b_batch + head * stride_b_head
-#     ln_offset = head * stride_ln_head
-#
-#     W_dtype = W1_init.type.element_ty
-#     O_dtype = Out.type.element_ty
-#
-#     rc = tl.arange(0, CS)
-#     rf = tl.arange(0, HF)
-#
-#     XA_blk_ptr = XA + abco_offset
-#     XB_blk_ptr = XB + abco_offset
-#     XC_blk_ptr = XC + abco_offset
-#     Out_blk_ptr = Out + abco_offset
-#
-#     coeff_blk_ptr = coeff + coeff_offset
-#     coeff_last_blk_ptr = coeff_last + coeff_last_offset
-#
-#     W1_data_blk_ptr = W1_init + w_offset + (rf[:, None] * stride_w_in + rf[None, :] * stride_w_out)
-#     b1_data_blk_ptr = b1_init + b_offset + rf[None, :] * stride_b_out  # [1,f]
-#     W1_data = tl.load(W1_data_blk_ptr)  # [f,f]
-#     b1_data = tl.load(b1_data_blk_ptr)  # [1,f]
-#
-#     ln_blk_shape = ln_offset + rf[None, :] * stride_ln_f  # [1,f]
-#     ln_weight_data = tl.load(ln_weight + ln_blk_shape)
-#     ln_bias_data = tl.load(ln_bias + ln_blk_shape)
-#
-#     for i in range(N_CHUNK):
-#         local_abco_offset = i * stride_x_nc + (rc[:, None] * stride_x_cs + rf[None, :] * stride_x_f)
-#         local_coeff_offset = i * stride_coeff_nc
-#         local_coeff_last_offset = local_coeff_offset
-#
-#         XA_chunk = tl.load(XA_blk_ptr + local_abco_offset)
-#         XB_chunk = tl.load(XB_blk_ptr + local_abco_offset)
-#         XC_chunk = tl.load(XC_blk_ptr + local_abco_offset)  # [CS,f]
-#         coeff_chunk = tl.load(coeff_blk_ptr + local_coeff_offset + rc * stride_coeff_cs)[:,None]  # [CS,1]
-#         coeff_chunk_last = tl.load(coeff_last_blk_ptr + local_coeff_last_offset)  # scaler
-#
-#         Z1 = tl.dot(XB_chunk, W1_data) + b1_data  # [CS,f] @ [f,f] -> [CS,f]
-#         reconstruction_target = XA_chunk - XB_chunk  # [CS,f]
-#         mu = tl.sum(Z1, 1) / HF  # [CS,]
-#         mu = mu[:,None]  # [CS,1]
-#         var = tl.sum((Z1 - mu) * (Z1 - mu), 1) / HF  # [CS,]
-#         var = var[:,None]
-#         std = tl.sqrt(var + 1e-6)
-#         x_hat = (Z1 - mu) / std  # [CS,f]
-#         y = ln_weight_data * x_hat + ln_bias_data  # [CS,f]
-#
-#         grad_output = y - reconstruction_target  # [CS,f]
-#         grad_x_hat = ln_weight_data * grad_output  # [CS,f]
-#         grad_l_Z1 = (
-#                 (1.0 / HF)
-#                 * (
-#                         HF * grad_x_hat  # [CS,f]
-#                         - tl.sum(grad_x_hat, 1)[:,None]  # [CS,]
-#                         - x_hat * (tl.sum(grad_x_hat * x_hat, 1))[:,None]  # [CS,f] * [CS,]
-#                 )
-#                 / std
-#         ).to(W_dtype)  # grad_l_Z1: [CS,f]
-#         #
-#         mask = rc[:, None] >= rc[None, :]
-#         Attn1_full = tl.dot(XC_chunk, tl.trans(XB_chunk))
-#         Attn1 = tl.where(mask, Attn1_full, 0).to(W_dtype)  # [CS,CS]
-#
-#         # b1_bar = (b1_data - coeff_chunk * tl.cumsum(grad_l_Z1, 0)).to(W_dtype)   # [CS,f] - [CS,1] * [CS,f]
-#         b1_bar = b1_data - coeff_chunk * grad_l_Z1
-#         Z1_bar = tl.dot(XC_chunk, W1_data) - tl.dot((coeff_chunk * Attn1), grad_l_Z1) + b1_bar  # [CS,f]
-#
-#         W1_data -= tl.dot(tl.trans(coeff_chunk_last * XB_chunk), grad_l_Z1).to(W_dtype)
-#         # TODO: (1) update b1_data; (2) cumsum for b1_bar
-#
-#         # tl.store(Out_blk_ptr + local_abco_offset, Z1_bar.to(O_dtype))  #.to(Output_chunk_ptr.type.element_ty)
-#
-#     tl.store(W1_data_blk_ptr, W1_data)
-#     tl.store(b1_data_blk_ptr, b1_data)
+####### Prefill #######
 
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_stages=7, num_warps=8),
-        triton.Config({}, num_stages=6, num_warps=8),
-        triton.Config({}, num_stages=5, num_warps=8),
-        triton.Config({}, num_stages=4, num_warps=8),
-        triton.Config({}, num_stages=3, num_warps=8),
-        triton.Config({}, num_stages=3, num_warps=4),
-        triton.Config({}, num_stages=4, num_warps=4),
-        triton.Config({}, num_stages=6, num_warps=4),
-    ],
-    key=['N_CHUNK'],
-)
-@triton.jit
-def _m1_prefill_chunk_triton(W1, XA, XB, XC, coeff_last, coeff, Out,
-               stride_ab, stride_ah, stride_an, stride_ac, stride_af,
-               stride_eb, stride_eh, stride_en, stride_ec,
-               stride_pb, stride_ph, stride_pn,
-               stride_wb, stride_wh, stride_wf, stride_wd,
-               CS: tl.constexpr, HF: tl.constexpr,
-               N_CHUNK: tl.constexpr):
-    batch = tl.program_id(0)
-    head = tl.program_id(1)
-    abco_offset = batch * stride_ab + head * stride_ah
-    w_offset = batch * stride_wb + head * stride_wh
-    coeff_offset = batch * stride_eb + head * stride_eh
-    coeff_last_offset = batch * stride_pb + head * stride_ph
+prefill_lnb_flag = False
 
-    rc = tl.arange(0, CS)
-    rf = tl.arange(0, HF)
-    XA = XA + abco_offset
-    XB = XB + abco_offset
-    XC = XC + abco_offset
-    Out = Out + abco_offset
-    W1_data = tl.load(W1 + w_offset + rf[:, None] * stride_wf + rf[None, :] * stride_wd)
-    coeff = coeff + coeff_offset
-    coeff_last = coeff_last + coeff_last_offset
-    for i in range(N_CHUNK):
-        local_abco_offset = i * stride_an
-        local_coeff_offset = i * stride_en
-        local_coeff_last_offset = i * stride_pn
-        XA_chunk = tl.load(XA + local_abco_offset + (rc[:, None] * stride_ac + rf[None, :] * stride_af))
-        XB_chunk = tl.load(XB + local_abco_offset + (rc[:, None] * stride_ac + rf[None, :] * stride_af))
-        XC_chunk = tl.load(XC + local_abco_offset + (rc[:, None] * stride_ac + rf[None, :] * stride_af))
-        coeff_chunk = tl.load(coeff + local_coeff_offset + rc * stride_ec)
-        coeff_chunk_last = tl.load(coeff_last + local_coeff_last_offset)
+if prefill_lnb_flag:
+    @triton.autotune(
+        configs=[
+            triton.Config({}, num_stages=7, num_warps=8),
+            triton.Config({}, num_stages=6, num_warps=8),
+            triton.Config({}, num_stages=5, num_warps=8),
+            triton.Config({}, num_stages=4, num_warps=8),
+            triton.Config({}, num_stages=3, num_warps=8),
+            triton.Config({}, num_stages=3, num_warps=4),
+            triton.Config({}, num_stages=4, num_warps=4),
+            triton.Config({}, num_stages=6, num_warps=4),
+        ],
+        key=['N_CHUNK'],
+        restore_value=['W1_init', 'b1_init'],
+    )
+    @triton.jit
+    def _m1_prefill_kernel(
+            W1_init, b1_init,
+            XA, XB, XC, coeff, coeff_last, Out,
+            ln_weight, ln_bias,
 
-        Z1 = tl.dot(XB_chunk, W1_data) - XA_chunk
-        mask = rc[:, None] >= rc[None, :]
-        Attn1_full = tl.dot(XC_chunk, tl.trans(XB_chunk))
-        Attn1 = tl.where(mask, Attn1_full, 0)
-        Z1_bar = tl.dot(XC_chunk, W1_data) - tl.dot((coeff_chunk[:, None] * Attn1), Z1)
-        W1_data -= tl.dot(tl.trans(coeff_chunk_last * XB_chunk).to(Z1.dtype), Z1).to(W1.type.element_ty)
-        Out_chunk = Out + local_abco_offset + (rc[:, None] * stride_ac + rf[None, :] * stride_af)
-        tl.store(Out_chunk, Z1_bar.to(Out.type.element_ty))
+            stride_w_batch, stride_w_head, stride_w_in, stride_w_out,
+            stride_b_batch, stride_b_head, stride_b_in, stride_b_out,
+            stride_ln_head, stride_ln_f,
+            stride_x_batch, stride_x_head, stride_x_nc, stride_x_cs, stride_x_f,
+            stride_coeff_batch, stride_coeff_head, stride_coeff_nc, stride_coeff_cs,
 
-lnb_flag = True
+            CS: tl.constexpr,
+            HF: tl.constexpr,
+            N_CHUNK: tl.constexpr
+    ):
+        batch = tl.program_id(0)
+        head = tl.program_id(1)
+        abco_offset = batch * stride_x_batch + head * stride_x_head
+        coeff_offset = batch * stride_coeff_batch + head * stride_coeff_head
+        coeff_last_offset = coeff_offset
+        w_offset = batch * stride_w_batch + head * stride_w_head
+        b_offset = batch * stride_b_batch + head * stride_b_head
+        ln_offset = head * stride_ln_head
 
-if lnb_flag:
+        W_dtype = W1_init.type.element_ty
+        O_dtype = Out.type.element_ty
+
+        rc = tl.arange(0, CS)
+        rf = tl.arange(0, HF)
+
+        XA_blk_ptr = XA + abco_offset
+        XB_blk_ptr = XB + abco_offset
+        XC_blk_ptr = XC + abco_offset
+        Out_blk_ptr = Out + abco_offset
+
+        coeff_blk_ptr = coeff + coeff_offset
+        coeff_last_blk_ptr = coeff_last + coeff_last_offset
+
+        W1_data_blk_ptr = W1_init + w_offset + (rf[:, None] * stride_w_in + rf[None, :] * stride_w_out)
+        b1_data_blk_ptr = b1_init + b_offset + rf[None, :] * stride_b_out  # [1,f]
+        W1_data = tl.load(W1_data_blk_ptr)  # [f,f]
+        b1_data = tl.load(b1_data_blk_ptr)  # [1,f]
+
+        ln_blk_shape = ln_offset + rf[None, :] * stride_ln_f  # [1,f]
+        ln_weight_data = tl.load(ln_weight + ln_blk_shape)
+        ln_bias_data = tl.load(ln_bias + ln_blk_shape)
+
+        for i in range(N_CHUNK):
+            local_abco_offset = i * stride_x_nc + (rc[:, None] * stride_x_cs + rf[None, :] * stride_x_f)
+            local_coeff_offset = i * stride_coeff_nc
+            local_coeff_last_offset = local_coeff_offset
+
+            XA_chunk = tl.load(XA_blk_ptr + local_abco_offset)
+            XB_chunk = tl.load(XB_blk_ptr + local_abco_offset)
+            XC_chunk = tl.load(XC_blk_ptr + local_abco_offset)  # [CS,f]
+            coeff_chunk = tl.load(coeff_blk_ptr + local_coeff_offset + rc * stride_coeff_cs)[:,None]  # [CS,1]
+            coeff_chunk_last = tl.load(coeff_last_blk_ptr + local_coeff_last_offset)  # scaler
+
+            Z1 = tl.dot(XB_chunk, W1_data) + b1_data  # [CS,f] @ [f,f] -> [CS,f]
+            reconstruction_target = XA_chunk - XB_chunk  # [CS,f]
+            mu = tl.sum(Z1, 1) / HF  # [CS,]
+            mu = mu[:,None]  # [CS,1]
+            var = tl.sum((Z1 - mu) * (Z1 - mu), 1) / HF  # [CS,]
+            var = var[:,None]
+            std = tl.sqrt(var + 1e-6)
+            x_hat = (Z1 - mu) / std  # [CS,f]
+            y = ln_weight_data * x_hat + ln_bias_data  # [CS,f]
+
+            grad_output = y - reconstruction_target  # [CS,f]
+            grad_x_hat = ln_weight_data * grad_output  # [CS,f]
+            grad_l_Z1 = (
+                    (1.0 / HF)
+                    * (
+                            HF * grad_x_hat  # [CS,f]
+                            - tl.sum(grad_x_hat, 1)[:,None]  # [CS,]
+                            - x_hat * (tl.sum(grad_x_hat * x_hat, 1))[:,None]  # [CS,f] * [CS,]
+                    )
+                    / std
+            ).to(W_dtype)  # grad_l_Z1: [CS,f]
+            #
+            mask = rc[:, None] >= rc[None, :]
+            Attn1_full = tl.dot(XC_chunk, tl.trans(XB_chunk))
+            Attn1 = tl.where(mask, Attn1_full, 0).to(W_dtype)  # [CS,CS]
+
+            # b1_bar = (b1_data - coeff_chunk * tl.cumsum(grad_l_Z1, 0)).to(W_dtype)   # [CS,f] - [CS,1] * [CS,f]
+            b1_bar = b1_data - coeff_chunk * grad_l_Z1
+            Z1_bar = tl.dot(XC_chunk, W1_data) - tl.dot((coeff_chunk * Attn1), grad_l_Z1) + b1_bar  # [CS,f]
+
+            W1_data -= tl.dot(tl.trans(coeff_chunk_last * XB_chunk), grad_l_Z1).to(W_dtype)
+            # TODO: (1) update b1_data; (2) cumsum for b1_bar
+
+            # tl.store(Out_blk_ptr + local_abco_offset, Z1_bar.to(O_dtype))  #.to(Output_chunk_ptr.type.element_ty)
+
+        tl.store(W1_data_blk_ptr, W1_data)
+        tl.store(b1_data_blk_ptr, b1_data)
+
+else:
+    @triton.autotune(
+        configs=[
+            triton.Config({}, num_stages=7, num_warps=8),
+            triton.Config({}, num_stages=6, num_warps=8),
+            triton.Config({}, num_stages=5, num_warps=8),
+            triton.Config({}, num_stages=4, num_warps=8),
+            triton.Config({}, num_stages=3, num_warps=8),
+            triton.Config({}, num_stages=3, num_warps=4),
+            triton.Config({}, num_stages=4, num_warps=4),
+            triton.Config({}, num_stages=6, num_warps=4),
+        ],
+        key=['N_CHUNK'],
+    )
+    @triton.jit
+    def _m1_prefill_kernel(W1, XA, XB, XC, coeff_last, coeff, Out,
+                           stride_ab, stride_ah, stride_an, stride_ac, stride_af,
+                           stride_eb, stride_eh, stride_en, stride_ec,
+                           stride_pb, stride_ph, stride_pn,
+                           stride_wb, stride_wh, stride_wf, stride_wd,
+                           CS: tl.constexpr, HF: tl.constexpr,
+                           N_CHUNK: tl.constexpr):
+        batch = tl.program_id(0)
+        head = tl.program_id(1)
+        abco_offset = batch * stride_ab + head * stride_ah
+        w_offset = batch * stride_wb + head * stride_wh
+        coeff_offset = batch * stride_eb + head * stride_eh
+        coeff_last_offset = batch * stride_pb + head * stride_ph
+
+        rc = tl.arange(0, CS)
+        rf = tl.arange(0, HF)
+        XA = XA + abco_offset
+        XB = XB + abco_offset
+        XC = XC + abco_offset
+        Out = Out + abco_offset
+        W1_ptr = W1 + w_offset + rf[:, None] * stride_wf + rf[None, :] * stride_wd
+        W1_data = tl.load(W1_ptr)
+        coeff = coeff + coeff_offset
+        coeff_last = coeff_last + coeff_last_offset
+        for i in range(N_CHUNK):
+            local_abco_offset = i * stride_an
+            local_coeff_offset = i * stride_en
+            local_coeff_last_offset = i * stride_pn
+            XA_chunk = tl.load(XA + local_abco_offset + (rc[:, None] * stride_ac + rf[None, :] * stride_af))
+            XB_chunk = tl.load(XB + local_abco_offset + (rc[:, None] * stride_ac + rf[None, :] * stride_af))
+            XC_chunk = tl.load(XC + local_abco_offset + (rc[:, None] * stride_ac + rf[None, :] * stride_af))
+            coeff_chunk = tl.load(coeff + local_coeff_offset + rc * stride_ec)
+            coeff_chunk_last = tl.load(coeff_last + local_coeff_last_offset)
+
+            Z1 = tl.dot(XB_chunk, W1_data) - XA_chunk
+            mask = rc[:, None] >= rc[None, :]
+            Attn1_full = tl.dot(XC_chunk, tl.trans(XB_chunk))
+            Attn1 = tl.where(mask, Attn1_full, 0)
+            Z1_bar = tl.dot(XC_chunk, W1_data) - tl.dot((coeff_chunk[:, None] * Attn1), Z1)
+            W1_data -= tl.dot(tl.trans(coeff_chunk_last * XB_chunk).to(Z1.dtype), Z1).to(W1.type.element_ty)
+            Out_chunk = Out + local_abco_offset + (rc[:, None] * stride_ac + rf[None, :] * stride_af)
+            tl.store(Out_chunk, Z1_bar.to(Out.type.element_ty))
+        tl.store(W1_ptr, W1_data.to(W1.type.element_ty))
+
+####### Decode #######
+decode_lnb_flag = False
+
+if decode_lnb_flag:
     # @triton.autotune(
     #     configs=[
     #         triton.Config({}, num_stages=1, num_warps=8),
@@ -1009,51 +1019,51 @@ if lnb_flag:
         W1_grad_data = tl.load(W1_grad)
         b1_init_data = tl.load(b1_init)
         b1_grad_data = tl.load(b1_grad)
-        # ln_weight_data = tl.load(ln_weight)
-        # ln_bias_data = tl.load(ln_bias)
+        ln_weight_data = tl.load(ln_weight)
+        ln_bias_data = tl.load(ln_bias)
 
         Z1 = tl.sum(tl.trans(XB_data) * W1_init_data, 0) + b1_init_data  # [1,HF]: same as PT
         reconstruction_target = XA_data - XB_data  # [1,HF]
 
-        # mu = tl.sum(Z1) / HF  # [1,]
-        # var = tl.sum((Z1 - mu) * (Z1 - mu)) / HF  # [1,]
-        # std = tl.sqrt(var + 1e-6)
-        # x_hat = (Z1 - mu) / std  # [1,f], err from PT: 4e-3
-        # y = ln_weight_data * x_hat + ln_bias_data  # [1,f], err: 4.54
-        #
-        # grad_output = y - reconstruction_target  # [1,f]
-        # grad_x_hat = ln_weight_data * grad_output  # [1,f]
-        # grad_l_Z1 = (
-        #         (1.0 / HF)
-        #         * (
-        #             HF * grad_x_hat  # [1,f]
-        #             - tl.sum(grad_x_hat)  #[1,]
-        #             - x_hat * tl.sum(grad_x_hat * x_hat)  # [1,f] * [1,]
-        #         )
-        #         / std
-        # )  # grad_l_Z1: [1,f]
-        #
-        # W1_grad_data += (tl.trans(XB_data) * grad_l_Z1)  # @xinhao: tl.dot(tl.trans(XB_chunk), Z1) doesn't support [HF,1] @ [1,HF]
-        # b1_grad_data += grad_l_Z1
-        # W1_init_data -= coeff_data * W1_grad_data
-        # b1_init_data -= coeff_data * b1_grad_data
-        # Z1_bar = tl.sum(tl.trans(XC_data) * W1_init_data, 0) + b1_init_data  # Z1_bar
-        #
-        # # Post LN
-        # mu = tl.sum(Z1_bar) / HF  # [1,]
-        # var = tl.sum((Z1_bar - mu) * (Z1_bar - mu)) / HF  # [1,]
-        # std = tl.sqrt(var + 1e-6)
-        # x_hat_bar = (Z1_bar - mu) / std  # [1,f]
-        # Z1_bar = XC_data + (ln_weight_data * x_hat_bar + ln_bias_data)  # XC + LN(Z1_bar): [1,f]
+        mu = tl.sum(Z1) / HF  # [1,]
+        var = tl.sum((Z1 - mu) * (Z1 - mu)) / HF  # [1,]
+        std = tl.sqrt(var + 1e-6)
+        x_hat = (Z1 - mu) / std  # [1,f], err from PT: 4e-3
+        y = ln_weight_data * x_hat + ln_bias_data  # [1,f], err: 4.54
 
-        # tl.store(Out, Z1_bar.to(O_dtype))
+        grad_output = y - reconstruction_target  # [1,f]
+        grad_x_hat = ln_weight_data * grad_output  # [1,f]
+        grad_l_Z1 = (
+                (1.0 / HF)
+                * (
+                    HF * grad_x_hat  # [1,f]
+                    - tl.sum(grad_x_hat)  #[1,]
+                    - x_hat * tl.sum(grad_x_hat * x_hat)  # [1,f] * [1,]
+                )
+                / std
+        )  # grad_l_Z1: [1,f]
+
+        W1_grad_data += (tl.trans(XB_data) * grad_l_Z1)  # @xinhao: tl.dot(tl.trans(XB_chunk), Z1) doesn't support [HF,1] @ [1,HF]
+        b1_grad_data += grad_l_Z1
+        W1_init_data -= coeff_data * W1_grad_data
+        b1_init_data -= coeff_data * b1_grad_data
+        Z1_bar = tl.sum(tl.trans(XC_data) * W1_init_data, 0) + b1_init_data  # Z1_bar
+
+        # Post LN
+        mu = tl.sum(Z1_bar) / HF  # [1,]
+        var = tl.sum((Z1_bar - mu) * (Z1_bar - mu)) / HF  # [1,]
+        std = tl.sqrt(var + 1e-6)
+        x_hat_bar = (Z1_bar - mu) / std  # [1,f]
+        Z1_bar = XC_data + (ln_weight_data * x_hat_bar + ln_bias_data)  # XC + LN(Z1_bar): [1,f]
+
+        tl.store(Out, Z1_bar.to(O_dtype))
         # tl.store(Out, x_hat.to(O_dtype))  # cg err
         # tl.store(Out, Z1.to(O_dtype))
         # tl.store(Out, reconstruction_target.to(O_dtype))
-        tl.store(Out, XC_data.to(O_dtype))
+        # tl.store(Out, XC_data.to(O_dtype))
 
-        # tl.store(W1_grad, W1_grad_data.to(W_dtype))
-        # tl.store(b1_grad, b1_grad_data.to(W_dtype))
+        tl.store(W1_grad, W1_grad_data.to(W_dtype))
+        tl.store(b1_grad, b1_grad_data.to(W_dtype))
 
     @triton.autotune(
         configs=[
@@ -1297,40 +1307,39 @@ class TttM1BMMTritonModule(TttBaseModule):
             output = torch.empty_like(XA)  # [B,nh,NC,CS,f]
 
             grid = (B, NH, 1)
-            # _m1_prefill_chunk_triton[grid](W1_init, b1_init,
-            #                                XA, XB, XC, coeff, coeff_last, output,
-            #                                self.ln_weight, self.ln_bias,
-            #
-            #                                W1_init.stride(0), W1_init.stride(1), W1_init.stride(2), W1_init.stride(3),
-            #                                b1_init.stride(0), b1_init.stride(1), b1_init.stride(2), b1_init.stride(3),
-            #                                self.ln_weight.stride(1), self.ln_weight.stride(2),
-            #
-            #                                XA.stride(0), XA.stride(1), XA.stride(2), XA.stride(3), XA.stride(4),
-            #                                coeff.stride(0), coeff.stride(1),  coeff.stride(2), coeff.stride(3), # strides for coeff
-            #
-            #                                CS, HF, NC)
-            _m1_prefill_chunk_triton[grid](
-                W1_init,  # [B,nh,f,f], cloned from W1, safe for in-place op
-                 XA, XB, XC, coeff_last, coeff, output,
-                 NH * NC * CS * HF, NC * CS * HF, CS * HF, HF, 1,  # strides for A,B,C,O
-                 NH * NC * CS, NC * CS, CS, 1,  # strides for E
-                 NH * NC, NC, 1,  # strides for last coeff
-                 NH * HF * HF, HF * HF, HF, 1,  # strides for W1
-                 CS, HF,
-                 NC
-                 )
-        else:
-            B_mul_NH, N, HF = inputs['XA'].shape  # [B*nh,N=1,f]
-            B = B_mul_NH // self.num_heads
-            NH = self.num_heads
-            CS = N
+            if prefill_lnb_flag:
+                # with LN and bias
+                _m1_prefill_kernel[grid](W1_init, b1_init,
+                                        XA, XB, XC, coeff, coeff_last, output,
+                                        self.ln_weight, self.ln_bias,
 
+                                        W1_init.stride(0), W1_init.stride(1), W1_init.stride(2), W1_init.stride(3),
+                                        b1_init.stride(0), b1_init.stride(1), b1_init.stride(2), b1_init.stride(3),
+                                        self.ln_weight.stride(1), self.ln_weight.stride(2),
+
+                                        XA.stride(0), XA.stride(1), XA.stride(2), XA.stride(3), XA.stride(4),
+                                        coeff.stride(0), coeff.stride(1),  coeff.stride(2), coeff.stride(3), # strides for coeff
+
+                                        CS, HF, NC)
+            else:
+                _m1_prefill_kernel[grid](
+                    W1_init,  # [B,nh,f,f], cloned from W1, safe for in-place op
+                     XA, XB, XC, coeff_last, coeff, output,
+                     NH * NC * CS * HF, NC * CS * HF, CS * HF, HF, 1,  # strides for A,B,C,O
+                     NH * NC * CS, NC * CS, CS, 1,  # strides for E
+                     NH * NC, NC, 1,  # strides for last coeff
+                     NH * HF * HF, HF * HF, HF, 1,  # strides for W1
+                     CS, HF,
+                     NC
+                     )
+        else:
+            CS = N
             inputs = tree_map(lambda x: x.reshape(B, NH, N, -1), inputs)  # [B*nh,N=1,f], [B*nh,N=1,1] -> [BS,nh,N=1,f/1]
             XA, XB, XC, coeff = inputs['XA'], inputs['XB'], inputs['XC'], inputs['coeff']  # [B,nh,N,f/1]
             output = torch.empty_like(XA) # [B,nh,N,f]
-
             grid = (B, NH, 1)
-            if lnb_flag:
+            if decode_lnb_flag:
+                # with LN and bias
                 if is_last_in_chunk:
                     _m1_decode_end_chunk_kernel[grid](W1_init, W1_grad, b1_init, b1_grad,
                                             XA, XB, XC, coeff, output,
@@ -1362,20 +1371,36 @@ class TttM1BMMTritonModule(TttBaseModule):
                                           CS, HF)
 
             else:
-                _m1_decode_kernel[grid](W1_init, W1_grad, XA, XB, XC, coeff, output,
-                                        NH * HF * HF,
-                                        HF * HF,
-                                        HF,
-                                        1,  # strides for W
-                                        NH * CS * HF,
-                                        CS * HF,
-                                        HF,
-                                        1,  # strides for ABCO, output
-                                        NH * CS,
-                                        CS,
-                                        1,
-                                        1,  # strides for coeff
-                                        CS, HF)  # TODO: differentiate last_in_chunk and non_last_in_chunk
+                if is_last_in_chunk:
+                    _m1_decode_end_chunk_kernel[grid](W1_init, W1_grad, XA, XB, XC, coeff, output,
+                                            NH * HF * HF,
+                                            HF * HF,
+                                            HF,
+                                            1,  # strides for W
+                                            NH * CS * HF,
+                                            CS * HF,
+                                            HF,
+                                            1,  # strides for ABCO, output
+                                            NH * CS,
+                                            CS,
+                                            1,
+                                            1,  # strides for coeff
+                                            CS, HF)
+                else:
+                    _m1_decode_kernel[grid](W1_init, W1_grad, XA, XB, XC, coeff, output,
+                                            NH * HF * HF,
+                                            HF * HF,
+                                            HF,
+                                            1,  # strides for W
+                                            NH * CS * HF,
+                                            CS * HF,
+                                            HF,
+                                            1,  # strides for ABCO, output
+                                            NH * CS,
+                                            CS,
+                                            1,
+                                            1,  # strides for coeff
+                                            CS, HF)
 
         output = output.reshape(B_mul_NH, N, HF)
         return output, None
@@ -1384,6 +1409,81 @@ class TttM1BMMTritonModule(TttBaseModule):
 
 
 ####### M2 Triton Decode Module #######
+@triton.autotune(
+        configs=[
+            triton.Config({}, num_stages=7, num_warps=8),
+            triton.Config({}, num_stages=6, num_warps=8),
+            triton.Config({}, num_stages=5, num_warps=8),
+            triton.Config({}, num_stages=4, num_warps=8),
+            triton.Config({}, num_stages=3, num_warps=8),
+            triton.Config({}, num_stages=3, num_warps=4),
+            triton.Config({}, num_stages=4, num_warps=4),
+            triton.Config({}, num_stages=6, num_warps=4),
+        ],
+        key=['N_CHUNK'],
+        restore_value=['W1', 'W2'],
+    )
+@triton.jit
+def _m2_prefill_kernel(W1, W2, XA, XB, XC, coeff_last, coeff, Out,
+                       stride_ab, stride_ah, stride_an, stride_ac, stride_af,
+                       stride_eb, stride_eh, stride_en, stride_ec,
+                       stride_pb, stride_ph, stride_pn,
+                       stride_wb, stride_wh, stride_wf, stride_wd,
+                       stride_wf_prime,
+                       CS: tl.constexpr, HF: tl.constexpr, HF_prime: tl.constexpr,
+                       N_CHUNK: tl.constexpr):
+    batch = tl.program_id(0)
+    head = tl.program_id(1)
+    abco_offset = batch * stride_ab + head * stride_ah
+    w_offset = batch * stride_wb + head * stride_wh
+    coeff_offset = batch * stride_eb + head * stride_eh
+    coeff_last_offset = batch * stride_pb + head * stride_ph
+
+    rc = tl.arange(0, CS)
+    rf = tl.arange(0, HF)
+    rf_prime = tl.arange(0, HF_prime)
+    XA = XA + abco_offset
+    XB = XB + abco_offset
+    XC = XC + abco_offset
+    Out = Out + abco_offset
+    W1_ptr = W1 + w_offset + rf[:, None] * stride_wf + rf_prime[None, :] * stride_wd
+    W1_data = tl.load(W1_ptr)
+    W2_ptr = W2 + w_offset + rf_prime[:, None] * stride_wf_prime + rf[None, :] * stride_wd
+    W2_data = tl.load(W2_ptr)
+    coeff = coeff + coeff_offset
+    coeff_last = coeff_last + coeff_last_offset
+    for i in range(N_CHUNK):
+        local_abco_offset = i * stride_an
+        local_coeff_offset = i * stride_en
+        local_coeff_last_offset = i * stride_pn
+        XA_chunk = tl.load(XA + local_abco_offset + (rc[:, None] * stride_ac + rf[None, :] * stride_af))
+        XB_chunk = tl.load(XB + local_abco_offset + (rc[:, None] * stride_ac + rf[None, :] * stride_af))
+        XC_chunk = tl.load(XC + local_abco_offset + (rc[:, None] * stride_ac + rf[None, :] * stride_af))
+        coeff_chunk = tl.load(coeff + local_coeff_offset + rc * stride_ec)
+        coeff_chunk_last = tl.load(coeff_last + local_coeff_last_offset)
+
+        Z1 = tl.dot(XB_chunk, W1_data, out_dtype=tl.float16)
+        grad_l_wrt_Z2 = tl.dot(Z1, W2_data, out_dtype=tl.float16) - XA_chunk
+        grad_l_wrt_Z1 = tl.dot(grad_l_wrt_Z2, tl.trans(W2_data), out_dtype=tl.float16)
+
+        mask = rc[:, None] >= rc[None, :]
+        Attn1_full = tl.dot(XC_chunk, tl.trans(XB_chunk), out_dtype=tl.float16)
+        Attn1 = tl.where(mask, Attn1_full, 0)
+        Z1_bar = tl.dot(XC_chunk, W1_data, out_dtype=tl.float16) - tl.dot((coeff_chunk[:, None] * Attn1), grad_l_wrt_Z1,
+                                                                          out_dtype=tl.float16)
+
+        Attn2_full = tl.dot(Z1_bar, tl.trans(Z1), out_dtype=tl.float16)
+        Attn2 = tl.where(mask, Attn2_full, 0)
+        Z2_bar = tl.dot(Z1_bar, W2_data, out_dtype=tl.float16) - tl.dot((coeff_chunk[:, None] * Attn2), grad_l_wrt_Z2,
+                                                                        out_dtype=tl.float16)
+
+        W1_data -= tl.dot(tl.trans(coeff_chunk_last * XB_chunk).to(tl.float16), grad_l_wrt_Z1, out_dtype=tl.float16)
+        W2_data -= tl.dot(tl.trans(coeff_chunk_last * Z1).to(tl.float16), grad_l_wrt_Z2, out_dtype=tl.float16)
+
+        Out_chunk = Out + local_abco_offset + (rc[:, None] * stride_ac + rf[None, :] * stride_af)
+        tl.store(Out_chunk, Z2_bar.to(tl.float16))
+    tl.store(W1_ptr, W1_data.to(W1.type.element_ty))
+    tl.store(W2_ptr, W2_data.to(W2.type.element_ty))
 
 @triton.autotune(
     configs=[
@@ -1461,10 +1561,89 @@ def _m2_decode_kernel(W1_init, W1_grad, W2_init, W2_grad,
     Z2_bar = tl.sum(tl.trans(Z1_bar) * W2_init_data, 0)
 
     tl.store(Out_chunk, Z2_bar.to(Out.type.element_ty))
-    tl.store(W1_init, W1_init_data.to(W_dtype))
     tl.store(W1_grad, W1_grad_data.to(W_dtype))
-    tl.store(W2_init, W2_init_data.to(W_dtype))
     tl.store(W2_grad, W2_grad_data.to(W_dtype))
+
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_stages=7, num_warps=8),
+        triton.Config({}, num_stages=6, num_warps=8),
+        triton.Config({}, num_stages=5, num_warps=8),
+        triton.Config({}, num_stages=4, num_warps=8),
+        triton.Config({}, num_stages=3, num_warps=8),
+        triton.Config({}, num_stages=3, num_warps=4),
+        triton.Config({}, num_stages=4, num_warps=4),
+        triton.Config({}, num_stages=6, num_warps=4),
+    ],
+    key=['HF', 'HF_prime'],
+    restore_value=['W1_init', 'W1_grad', 'W2_init', 'W2_grad']
+)
+@triton.jit
+def _m2_decode_end_chunk_kernel(W1_init, W1_grad, W2_init, W2_grad,
+                      XA, XB, XC, coeff,
+                      Out,
+                      stride_w1b, stride_w1h, stride_w1f, stride_w1d,
+                      stride_w2b, stride_w2h, stride_w2f, stride_w2d,
+                      stride_ab, stride_ah, stride_ac, stride_af,
+                      stride_cb, stride_ch, stride_cn, stride_cc,
+                      CS: tl.constexpr, HF: tl.constexpr, HF_prime: tl.constexpr):
+
+    batch = tl.program_id(0)
+    head = tl.program_id(1)
+
+    rc = tl.arange(0, CS)
+    rf = tl.arange(0, HF)
+    rf_prime = tl.arange(0, HF_prime)
+
+    W_dtype = W1_init.type.element_ty
+    O_dtype = Out.type.element_ty
+
+    w1_offset = batch * stride_w1b + head * stride_w1h
+    w2_offset = batch * stride_w2b + head * stride_w2h
+
+    abco_offset = batch * stride_ab + head * stride_ah
+    coeff_offset = batch * stride_cb + head * stride_ch
+
+    W1_init = W1_init + w1_offset + (rf[:, None] * stride_w1f + rf_prime[None, :] * stride_w1d)  # [HF, HF_prime]
+    W1_grad = W1_grad + w1_offset + (rf[:, None] * stride_w1f + rf_prime[None, :] * stride_w1d)
+
+    W2_init = W2_init + w2_offset + (rf_prime[:, None] * stride_w2f + rf[None, :] * stride_w2d)  # [HF_prime, HF]
+    W2_grad = W2_grad + w2_offset + (rf_prime[:, None] * stride_w2f + rf[None, :] * stride_w2d)
+
+    XA = XA + abco_offset + rf[None, :] * stride_af  # [1,HF]
+    XB = XB + abco_offset + rf[None, :] * stride_af
+    XC = XC + abco_offset + rf[None, :] * stride_af
+    coeff = coeff + coeff_offset  # [1,1]
+    Out_chunk = Out + abco_offset + rf * stride_af  # [1,HF]
+
+    XA_chunk = tl.load(XA)
+    XB_chunk = tl.load(XB)
+    XC_chunk = tl.load(XC)
+    coeff_chunk = tl.load(coeff)
+    W1_init_data = tl.load(W1_init)
+    W1_grad_data = tl.load(W1_grad)
+    W2_init_data = tl.load(W2_init)
+    W2_grad_data = tl.load(W2_grad)
+
+    Z1 = tl.sum(tl.trans(XB_chunk) * W1_init_data, 0)[None,:]  # [1,HF_prime]
+    Z2 = tl.sum(tl.trans(Z1) * W2_init_data, 0)[None,:]  # [1,HF]
+
+    grad_l_wrt_Z2 = Z2 - XA_chunk  # [1,HF]
+    grad_l_wrt_Z1 = tl.sum(grad_l_wrt_Z2 * W2_init_data, 1)[None,:]  # [1,HF] * [HF_p, HF] -> [HF_p,] -> [1,HF_p]
+
+    W1_grad_data += tl.trans(XB_chunk) * grad_l_wrt_Z1  # [1,HF].t * [1,HF_p] -> [HF,HF_p]
+    W1_init_data -= coeff_chunk * W1_grad_data
+    Z1_bar = tl.sum(tl.trans(XC_chunk) * W1_init_data, 0)[None,:]
+
+    W2_grad_data += tl.trans(Z1) * grad_l_wrt_Z2  # [1,HF_p].t * [1,HF] -> [HF_p,HF]
+    W2_init_data -= coeff_chunk * W2_grad_data
+    Z2_bar = tl.sum(tl.trans(Z1_bar) * W2_init_data, 0)
+
+    tl.store(Out_chunk, Z2_bar.to(Out.type.element_ty))
+    tl.store(W1_init, W1_init_data.to(W_dtype))
+    tl.store(W2_init, W2_init_data.to(W_dtype))
+    tl.store(W1_grad, tl.zeros_like(W1_grad_data).to(W_dtype))
+    tl.store(W2_grad, tl.zeros_like(W2_grad_data).to(W_dtype))
 
 
 class TttM2BMMTritonModule(TttBaseModule):
@@ -1472,47 +1651,71 @@ class TttM2BMMTritonModule(TttBaseModule):
     def __init__(self, config: TttConfig, layer_idx: Optional[int] = None):
         super().__init__(config, layer_idx)
         self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim, 4 * self.head_dim)))
+        self.b1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, 1, 4 * self.head_dim)))
         self.W2 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, 4 * self.head_dim, self.head_dim)))
+        self.b2 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, 1, self.head_dim)))
 
     def process_inner_loop(self, inputs, inner_chunk_size, last_chunk_params_dic,
                            is_prefill=False,
                            is_last_in_chunk=False,
                            cache_params=None):
 
-        # XA = torch.randn(BS, NH, N, HF, device='cuda', dtype=input_dtype)  # reference shape
-
-        # @xinhao: decoding from a prompt of length 1 will always have `inner_chunk_size=remainder=1`
-        B_mul_NH, CS, HF = inputs['XA'].shape  # [B*nh,N=1,f]
+        B_mul_NH, N, HF = inputs['XA'].shape  # [B*nh,N,f]
         HF_prime = self.W1.shape[-1]
         B = B_mul_NH // self.num_heads
         NH = self.num_heads
-        input_dtype = inputs['XA'].dtype
-        input_device = inputs['XA'].device
-
-        inputs = tree_map(lambda x: x.reshape(B, NH, CS, -1), inputs) # [B*nh,N=1,f], [B*nh,N=1,1] -> [BS,nh,N=1,f/1]
-        XA, XB, XC, coeff = inputs['XA'], inputs['XB'], inputs['XC'], inputs['coeff']
 
         W1_init = cache_params.params_dict["W1_states"][self.layer_idx].reshape(B, NH, HF, 4 * HF)
         W1_grad = cache_params.params_dict["W1_grad"][self.layer_idx].reshape(B, NH, HF, 4 * HF)
         W2_init = cache_params.params_dict["W2_states"][self.layer_idx].reshape(B, NH, 4 * HF, HF)
         W2_grad = cache_params.params_dict["W2_grad"][self.layer_idx].reshape(B, NH, 4 * HF, HF)
 
-        output = torch.empty(size=(B, NH, CS, HF), device=input_device, dtype=torch.float16)  # TODO FIX DTYPE
-        grid = (B, NH, 1)
-        _m2_decode_kernel[grid](W1_init, W1_grad, W2_init, W2_grad,
-                                XA, XB, XC, coeff,
-                                output,
-                                NH * HF * HF_prime, HF * HF_prime, HF_prime, 1,  # strides for W1: [B,NH,HF,HF_prime]
+        if is_prefill:
+            CS = inner_chunk_size
+            NC = N // CS
+            inputs = tree_map(lambda x: x.reshape(B, NH, NC, CS, -1), inputs)  # [B*nh,N,f] -> [B,nh,NC,CS,f/1]
+            XA, XB, XC, coeff = inputs['XA'], inputs['XB'], inputs['XC'], inputs['coeff']  # [B,nh,NC,CS,f/1]
+            coeff_last = coeff[..., -1:, :]  # [B,nh,NC,1,1]
+            output = torch.empty_like(XA)  # [B,nh,NC,CS,f]
+            grid = (B, NH, 1)
+            _m2_prefill_kernel[grid](W2_init,  # [B,nh,f,f], cloned from W1, safe for in-place op
+                                     W2_init,
+                                     XA, XB, XC, coeff_last, coeff, output,
+                                     NH * NC * CS * HF, NC * CS * HF, CS * HF, HF, 1,  # strides for A,B,C,O
+                                     NH * NC * CS, NC * CS, CS, 1,  # strides for E
+                                     NH * NC, NC, 1,  # strides for last coeff
+                                     NH * HF * HF_prime, HF * HF_prime, HF_prime, 1,  # strides for W1
+                                     HF,  # stride for W2
+                                     CS, HF, HF_prime,
+                                     NC
+                                     )
+        else:
+            CS = N
+            inputs = tree_map(lambda x: x.reshape(B, NH, N, -1), inputs)  # [B*nh,N=1,f], [B*nh,N=1,1] -> [BS,nh,N=1,f/1]
+            XA, XB, XC, coeff = inputs['XA'], inputs['XB'], inputs['XC'], inputs['coeff']  # [B,nh,N,f/1]
+            output = torch.empty_like(XA)  # [B,nh,N,f]
+            grid = (B, NH, 1)
+            if is_last_in_chunk:
+                _m2_decode_end_chunk_kernel[grid](W1_init, W1_grad, W2_init, W2_grad,
+                                                  XA, XB, XC, coeff,
+                                                  output,
+                                                  NH * HF * HF_prime, HF * HF_prime, HF_prime, 1,  # strides for W1: [B,NH,HF,HF_prime]
+                                                  NH * HF_prime * HF, HF_prime * HF, HF, 1,  # strides for W2
+                                                  NH * CS * HF, CS * HF, HF, 1,  # strides for ABCO, output
+                                                  NH * CS * 1, CS * 1, 1, 1,  # strides for coeff
+                                                  CS=CS, HF=HF, HF_prime=HF_prime)
+            else:
+                _m2_decode_kernel[grid](W1_init, W1_grad, W2_init, W2_grad,
+                                        XA, XB, XC, coeff,
+                                        output,
+                                        NH * HF * HF_prime, HF * HF_prime, HF_prime, 1,
+                                        # strides for W1: [B,NH,HF,HF_prime]
+                                        NH * HF_prime * HF, HF_prime * HF, HF, 1,  # strides for W2
+                                        NH * CS * HF, CS * HF, HF, 1,  # strides for ABCO, output
+                                        NH * CS * 1, CS * 1, 1, 1,  # strides for coeff
+                                        CS=CS, HF=HF, HF_prime=HF_prime)
 
-                                NH * HF_prime * HF, HF_prime * HF, HF, 1,  # strides for W2
-
-                                NH * CS * HF, CS * HF, HF, 1,  # strides for ABCO, output
-
-                                NH * CS * 1, CS * 1, 1, 1,  # strides for coeff
-
-                                CS=CS, HF=HF, HF_prime=HF_prime)
-
-        output = output.permute(0, 2, 1, 3).reshape(B, CS, -1)
+        output = output.reshape(B_mul_NH, N, HF)
         return output, None
 
 ##########################################
@@ -1820,10 +2023,12 @@ class TttForCausalLM(TttPreTrainedModel):
         self.model = TttModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        if config.use_compile:
-            self.get_output_logits = torch.compile(self._get_output_logits)
-        else:
-            self.get_output_logits = self._get_output_logits
+        # if config.use_compile:
+        #     self.get_output_logits = torch.compile(self._get_output_logits)
+        # else:
+        #     self.get_output_logits = self._get_output_logits
+
+        self.get_output_logits = self._get_output_logits
 
             # Initialize weights and apply final processing
         # self.post_init()
