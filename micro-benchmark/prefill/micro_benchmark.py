@@ -10,7 +10,7 @@ import einops
 import triton
 import triton.language as tl
 from nvtx_do_bench import do_bench  # @xinhao: support nvtx tag
-from micro_decode_modules import pt_m1_prefill, pt_m2_prefill, triton_m1_prefill, triton_m2_prefill
+from micro_modules import pt_m1_prefill, pt_m2_prefill, triton_m1_prefill, triton_m2_prefill
 
 EXPAND = 4
 
