@@ -40,10 +40,10 @@ repeats = 3
 device = "cuda"
 dtype = torch.float16  # @xinhao: follow mamba benchmark
 
-# config = LlamaConfig.from_json_file('./llama_config/config_1b.json')  # 1B llama config
-# config._attn_implementation = args.attn_impl  # @xinhao: llama config use `_attn_implementation` to select attn
-# model = LlamaForCausalLM(config).to(dtype=dtype)
-# model.push_to_hub("LeoLearntoCode/llama-1.3b")
+config = LlamaConfig.from_json_file('./llama_config/config_1b.json')  # 1B llama config
+config._attn_implementation = args.attn_impl  # @xinhao: llama config use `_attn_implementation` to select attn
+model = LlamaForCausalLM(config).to(dtype=dtype)
+model.push_to_hub("LeoLearntoCode/llama-1.3b")
 #
 # config = LlamaConfig.from_json_file('./llama_config/config_125m.json')  # 1B llama config
 # config._attn_implementation = args.attn_impl  # @xinhao: llama config use `_attn_implementation` to select attn
@@ -64,5 +64,5 @@ dtype = torch.float16  # @xinhao: follow mamba benchmark
 # print(f"Number of parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
 # model = AutoModelForCausalLM.from_pretrained('LeoLearntoCode/llama-125m', device_map={"": device}, torch_dtype=dtype)
 # print(f"Number of parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
-model = AutoModelForCausalLM.from_pretrained('LeoLearntoCode/llama-760m', device_map={"": device}, torch_dtype=dtype)
-print(f"Number of parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
+# model = AutoModelForCausalLM.from_pretrained('LeoLearntoCode/llama-760m', device_map={"": device}, torch_dtype=dtype)
+# print(f"Number of parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")

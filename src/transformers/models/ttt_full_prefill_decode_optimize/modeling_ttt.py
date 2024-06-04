@@ -453,23 +453,36 @@ class TttBaseModule(nn.Module):
 
 
 ####### M1 Decode Module #######
+# def m1_prefill_chunk(states, inputs, i, ln_weight, ln_bias):
+#     W1_init = states['W1_states']
+#     b1_init = states['b1_states']
+#     XA_chunk, XB_chunk, XC_chunk, \
+#     coeff_chunk, coeff_chunk_last = inputs['XA'][i], inputs['XB'][i], inputs['XC'][i], \
+#                                     inputs['coeff'][i], inputs['coeff_last'][i]
+#
+#     Z1 = XB_chunk @ W1_init + b1_init  # [B*nh,K,f] @ [B*nh,f,f] -> [B*nh,K,f]
+#     reconstruction_target = XA_chunk - XB_chunk
+#     grad_l_wrt_Z1 = ln_fused_l2_bwd(Z1, reconstruction_target, ln_weight, ln_bias)  # [B*nh,K=1,f]
+#
+#     b1_bar = b1_init - coeff_chunk * torch.cumsum(grad_l_wrt_Z1, dim=1)  # [B*nh,1,f] - [B*nh,K,1] * [B*nh,K,f]
+#     Attn1 = torch.tril(XC_chunk @ XB_chunk.transpose(-1, -2))  # [B*nh,K,K]
+#     Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1 + b1_bar  # [B*nh,K,f] @ [B*nh,f,f] - ([B*nh,K,1] * [B*nh,K,K]) @ [B*nh,K,f]
+#
+#     W1_init.sub_((coeff_chunk_last * XB_chunk).transpose(-1, -2) @ grad_l_wrt_Z1)  # in-place update: [B*nh,f,f] - ([B*nh,1,1] * [B*nh,K,f].t) @ [B*nh,K,f]
+#     b1_init.copy_(b1_bar[:,-1:])
+#     return Z1_bar
+
 def m1_prefill_chunk(states, inputs, i, ln_weight, ln_bias):
     W1_init = states['W1_states']
-    b1_init = states['b1_states']
     XA_chunk, XB_chunk, XC_chunk, \
     coeff_chunk, coeff_chunk_last = inputs['XA'][i], inputs['XB'][i], inputs['XC'][i], \
                                     inputs['coeff'][i], inputs['coeff_last'][i]
-
-    Z1 = XB_chunk @ W1_init + b1_init  # [B*nh,K,f] @ [B*nh,f,f] -> [B*nh,K,f]
+    Z1 = XB_chunk @ W1_init  # [B*nh,K,f] @ [B*nh,f,f] -> [B*nh,K,f]
     reconstruction_target = XA_chunk - XB_chunk
-    grad_l_wrt_Z1 = ln_fused_l2_bwd(Z1, reconstruction_target, ln_weight, ln_bias)  # [B*nh,K=1,f]
-
-    b1_bar = b1_init - coeff_chunk * torch.cumsum(grad_l_wrt_Z1, dim=1)  # [B*nh,1,f] - [B*nh,K,1] * [B*nh,K,f]
+    grad_l_wrt_Z1 = Z1 - reconstruction_target  # [B*nh,K=1,f]
     Attn1 = torch.tril(XC_chunk @ XB_chunk.transpose(-1, -2))  # [B*nh,K,K]
-    Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1 + b1_bar  # [B*nh,K,f] @ [B*nh,f,f] - ([B*nh,K,1] * [B*nh,K,K]) @ [B*nh,K,f]
-
+    Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1  # [B*nh,K,f] @ [B*nh,f,f] - ([B*nh,K,1] * [B*nh,K,K]) @ [B*nh,K,f]
     W1_init.sub_((coeff_chunk_last * XB_chunk).transpose(-1, -2) @ grad_l_wrt_Z1)  # in-place update: [B*nh,f,f] - ([B*nh,1,1] * [B*nh,K,f].t) @ [B*nh,K,f]
-    b1_init.copy_(b1_bar[:,-1:])
     return Z1_bar
 
 def m1_decode_one_token_last_in_chunk(states, inputs, ln_weight, ln_bias):
@@ -590,35 +603,58 @@ class TttM1BMMModule(TttBaseModule):
 
 
 ####### M2 Decode Module #######
+# def m2_prefill_chunk(states, inputs, i, ln_weight, ln_bias):
+#     W1_init = states['W1_states']
+#     b1_init = states['b1_states']
+#     W2_init = states['W2_states']
+#     b2_init = states['b2_states']
+#     XA_chunk, XB_chunk, XC_chunk, \
+#     coeff_chunk, coeff_chunk_last = inputs['XA'][i], inputs['XB'][i], inputs['XC'][i], \
+#                                     inputs['coeff'][i], inputs['coeff_last'][i]
+#
+#     Z1 = XB_chunk @ W1_init + b1_init  # [B*nh,K,f] @ [B*nh,f,f] -> [B*nh,K,f]
+#     X2 = F.gelu(Z1, approximate='tanh')
+#     Z2 = X2 @ W2_init + b2_init
+#     reconstruction_target = XA_chunk - XB_chunk
+#     grad_l_wrt_Z2 = ln_fused_l2_bwd(Z2, reconstruction_target, ln_weight, ln_bias)  # [B*nh,K=1,f]
+#     grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2_init.transpose(-1, -2) * diff_gelu(Z1)
+#
+#     b1_bar = b1_init - coeff_chunk * torch.cumsum(grad_l_wrt_Z1, dim=1)  # [B*nh,1,f] - [B*nh,K,1] * [B*nh,K,f]
+#     Attn1 = torch.tril(XC_chunk @ XB_chunk.transpose(-1, -2))  # [B*nh,K,K]
+#     Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1 + b1_bar  # [B*nh,K,f] @ [B*nh,f,f] - ([B*nh,K,1] * [B*nh,K,K]) @ [B*nh,K,f]
+#     X2_bar = F.gelu(Z1_bar, approximate='tanh')  # X2_bar
+#
+#     b2_bar = b2_init - coeff_chunk * torch.cumsum(grad_l_wrt_Z2, dim=1)  # [B*nh,1,f] - [B*nh,K,1] * [B*nh,K,f]
+#     Attn2 = torch.tril(X2_bar @ X2.transpose(-1, -2))  # [B*nh,K,K]
+#     Z2_bar = X2_bar @ W2_init - (coeff_chunk * Attn2) @ grad_l_wrt_Z2 + b2_bar
+#
+#     W1_init.sub_((coeff_chunk_last * XB_chunk).transpose(-1, -2) @ grad_l_wrt_Z1)  # in-place update: [B*nh,f,f] - ([B*nh,1,1] * [B*nh,K,f].t) @ [B*nh,K,f]
+#     b1_init.copy_(b1_bar[:,-1:])
+#     W2_init.sub_((coeff_chunk_last * X2).transpose(-1, -2) @ grad_l_wrt_Z2)  # in-place update: [B*nh,f,f] - ([B*nh,1,1] * [B*nh,K,f].t) @ [B*nh,K,f]
+#     b2_init.copy_(b2_bar[:, -1:])
+#     return Z2_bar
+
 def m2_prefill_chunk(states, inputs, i, ln_weight, ln_bias):
     W1_init = states['W1_states']
-    b1_init = states['b1_states']
     W2_init = states['W2_states']
-    b2_init = states['b2_states']
     XA_chunk, XB_chunk, XC_chunk, \
     coeff_chunk, coeff_chunk_last = inputs['XA'][i], inputs['XB'][i], inputs['XC'][i], \
                                     inputs['coeff'][i], inputs['coeff_last'][i]
 
-    Z1 = XB_chunk @ W1_init + b1_init  # [B*nh,K,f] @ [B*nh,f,f] -> [B*nh,K,f]
-    X2 = F.gelu(Z1, approximate='tanh')
-    Z2 = X2 @ W2_init + b2_init
+    Z1 = XB_chunk @ W1_init  # [B*nh,K,f] @ [B*nh,f,f] -> [B*nh,K,f]
+    Z2 = Z1 @ W2_init
     reconstruction_target = XA_chunk - XB_chunk
-    grad_l_wrt_Z2 = ln_fused_l2_bwd(Z2, reconstruction_target, ln_weight, ln_bias)  # [B*nh,K=1,f]
-    grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2_init.transpose(-1, -2) * diff_gelu(Z1)
+    grad_l_wrt_Z2 = Z2 - reconstruction_target  # [B*nh,K=1,f]
+    grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2_init.transpose(-1, -2)
 
-    b1_bar = b1_init - coeff_chunk * torch.cumsum(grad_l_wrt_Z1, dim=1)  # [B*nh,1,f] - [B*nh,K,1] * [B*nh,K,f]
     Attn1 = torch.tril(XC_chunk @ XB_chunk.transpose(-1, -2))  # [B*nh,K,K]
-    Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1 + b1_bar  # [B*nh,K,f] @ [B*nh,f,f] - ([B*nh,K,1] * [B*nh,K,K]) @ [B*nh,K,f]
-    X2_bar = F.gelu(Z1_bar, approximate='tanh')  # X2_bar
+    Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1  # [B*nh,K,f] @ [B*nh,f,f] - ([B*nh,K,1] * [B*nh,K,K]) @ [B*nh,K,f]
 
-    b2_bar = b2_init - coeff_chunk * torch.cumsum(grad_l_wrt_Z2, dim=1)  # [B*nh,1,f] - [B*nh,K,1] * [B*nh,K,f]
-    Attn2 = torch.tril(X2_bar @ X2.transpose(-1, -2))  # [B*nh,K,K]
-    Z2_bar = X2_bar @ W2_init - (coeff_chunk * Attn2) @ grad_l_wrt_Z2 + b2_bar
+    Attn2 = torch.tril(Z1_bar @ Z1.transpose(-1, -2))  # [B*nh,K,K]
+    Z2_bar = Z1_bar @ W2_init - (coeff_chunk * Attn2) @ grad_l_wrt_Z2
 
     W1_init.sub_((coeff_chunk_last * XB_chunk).transpose(-1, -2) @ grad_l_wrt_Z1)  # in-place update: [B*nh,f,f] - ([B*nh,1,1] * [B*nh,K,f].t) @ [B*nh,K,f]
-    b1_init.copy_(b1_bar[:,-1:])
-    W2_init.sub_((coeff_chunk_last * X2).transpose(-1, -2) @ grad_l_wrt_Z2)  # in-place update: [B*nh,f,f] - ([B*nh,1,1] * [B*nh,K,f].t) @ [B*nh,K,f]
-    b2_init.copy_(b2_bar[:, -1:])
+    W2_init.sub_((coeff_chunk_last * Z1).transpose(-1, -2) @ grad_l_wrt_Z2)  # in-place update: [B*nh,f,f] - ([B*nh,1,1] * [B*nh,K,f].t) @ [B*nh,K,f]
     return Z2_bar
 
 def m2_decode_end_chunk(states, inputs, ln_weight, ln_bias):
