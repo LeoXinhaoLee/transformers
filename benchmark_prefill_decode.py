@@ -53,7 +53,9 @@ parser.add_argument("--promptlen", type=int, default=1)
 parser.add_argument("--genlen", type=int, default=128)
 parser.add_argument("--batch", type=int, default=1)
 parser.add_argument("--attn_impl", type=str, default='flash_attention_2', choices=['eager', 'flash_attention_2'])
-parser.add_argument("--inner_net", type=str, default='mlp_2_dual', choices=['mlp_1_dual', 'mlp_2_dual', 'mlp_1_dual_triton', 'mlp_2_dual_triton'])
+parser.add_argument("--inner_net", type=str, default='mlp_2_dual', choices=['mlp_1_dual', 'mlp_2_dual',
+                                                                            'mlp_1_dual_triton', 'mlp_2_dual_triton',
+                                                                            'mlp_1_dual_tk', 'mlp_2_dual_tk',])
 parser.add_argument("--use_compile", action='store_true')
 parser.add_argument("--no_cg", action='store_true')    # @xinhao: currently only implemented for Mamba and TTT
 parser.add_argument("--profile", action='store_true')  # @xinhao: pytorch profiler, different from nsys in micro-benchmark
@@ -129,59 +131,46 @@ input_ids = torch.randint(1, 1000, (args.batch, args.promptlen), dtype=torch.lon
 attn_mask = torch.ones_like(input_ids, dtype=torch.long, device=device)
 max_length = input_ids.shape[1] + args.genlen
 
-if args.mode == 'decode':
-    if is_mamba:
-        fn = lambda i: model.generate(
-            input_ids=input_ids,
-            max_length=max_length,
-            cg=(not args.no_cg),
-            return_dict_in_generate=True,
-            output_scores=False,
-            enable_timing=False,
-            temperature=1.0,
-            top_k=1, # @xinhao: mamba src code: shortcut for greedy
-            top_p=0,
-        )
-    elif is_ttt:
-        fn = lambda i: model.generate(
-            input_ids=input_ids,
-            max_length=max_length,
-            cg=(not args.no_cg),
-            return_dict_in_generate=True,
-            output_scores=False,
-            enable_timing=False,
-            temperature=1.0,
-            top_k=1,  # @xinhao: mamba src code: shortcut for greedy
-            top_p=0,
-            i=i  # @xinhao: for debug output
-        )
-    else:
-        if args.use_compile:
-            model = torch.compile(model)  # @xinhao: can compile the whole Transformer for decode, though doesn't help
-        if not args.no_cg:
-            logger.info(f"CUDA Graph Not Implemented for Transformers")
-        fn = lambda i: model.generate(
-            input_ids=input_ids,
-            attention_mask=attn_mask,
-            max_length=max_length,
-            min_length=max_length,
-            return_dict_in_generate=True,
-            pad_token_id=tokenizer.eos_token_id,
-            do_sample=False,
-        )
-elif args.mode == 'prefill':
-    if (not (is_mamba or is_ttt)) and args.use_compile:
-        model = torch.compile(model)  # @xinhao: can only compile the whole Transformer, will help
-    if is_ttt:
-        kwargs = {'input_ids': input_ids, 'is_prefill': True}
-    else:
-        kwargs = {'input_ids': input_ids}
-    @torch.inference_mode()
-    def fn(*args):
-        model(**kwargs)
-        return
+if is_mamba:
+    fn = lambda i: model.generate(
+        input_ids=input_ids,
+        max_length=max_length,
+        cg=(not args.no_cg),
+        return_dict_in_generate=True,
+        output_scores=False,
+        enable_timing=False,
+        temperature=1.0,
+        top_k=1, # @xinhao: mamba src code: shortcut for greedy
+        top_p=0,
+    )
+elif is_ttt:
+    fn = lambda i: model.generate(
+        input_ids=input_ids,
+        max_length=max_length,
+        cg=(not args.no_cg),
+        return_dict_in_generate=True,
+        output_scores=False,
+        enable_timing=False,
+        temperature=1.0,
+        top_k=1,  # @xinhao: mamba src code: shortcut for greedy
+        top_p=0,
+        i=i  # @xinhao: for debug output
+    )
 else:
-    raise NotImplementedError(f"Invalid Mode {args.mode}!")
+    if args.use_compile:
+        model = torch.compile(model)  # @xinhao: can compile the whole Transformer for decode, though doesn't help
+    if not args.no_cg:
+        logger.info(f"CUDA Graph Not Implemented for Transformers")
+    fn = lambda i: model.generate(
+        input_ids=input_ids,
+        attention_mask=attn_mask,
+        max_length=max_length,
+        min_length=max_length,
+        return_dict_in_generate=True,
+        pad_token_id=tokenizer.eos_token_id,
+        do_sample=False,
+    )
+
 
 out = fn(0)  # capture graph if cg=True, will not be timed
 if args.mode == 'decode':

@@ -28,6 +28,15 @@ from transformers.models.ttt_full_prefill_decode_optimize.generation import Gene
 from mamba_ssm.ops.triton.layernorm import RMSNorm, rms_norm_fn
 from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 
+try:
+    import tk_m1_prefill
+except:
+    tk_m1_prefill = None
+
+try:
+    import tk_m2_prefill
+except:
+    tk_m2_prefill = None
 
 logger = logging.get_logger(__name__)
 
@@ -453,6 +462,7 @@ class TttBaseModule(nn.Module):
 
 
 ####### M1 Decode Module #######
+## With LN
 # def m1_prefill_chunk(states, inputs, i, ln_weight, ln_bias):
 #     W1_init = states['W1_states']
 #     b1_init = states['b1_states']
@@ -485,7 +495,7 @@ def m1_prefill_chunk(states, inputs, i, ln_weight, ln_bias):
     W1_init.sub_((coeff_chunk_last * XB_chunk).transpose(-1, -2) @ grad_l_wrt_Z1)  # in-place update: [B*nh,f,f] - ([B*nh,1,1] * [B*nh,K,f].t) @ [B*nh,K,f]
     return Z1_bar
 
-def m1_decode_one_token_last_in_chunk(states, inputs, ln_weight, ln_bias):
+def m1_decode_end_chunk(states, inputs, ln_weight, ln_bias):
     W1_init = states['W1_states']
     b1_init = states['b1_states']
     W1_grad = states['W1_grad']
@@ -509,7 +519,7 @@ def m1_decode_one_token_last_in_chunk(states, inputs, ln_weight, ln_bias):
     b1_grad.zero_()
     return Z1_bar
 
-def m1_decode_one_token_non_last_in_chunk(states, inputs, ln_weight, ln_bias):
+def m1_decode(states, inputs, ln_weight, ln_bias):
     W1_init = states['W1_states']
     b1_init = states['b1_states']
     W1_grad = states['W1_grad']
@@ -539,13 +549,13 @@ class TttM1BMMModule(TttBaseModule):
         self.b1 = nn.Parameter(torch.ones(size=(self.num_heads, 1, self.head_dim)))
 
         if self.config.use_compile:
-            self.prefill_chunk = torch.compile(m1_prefill_chunk)
-            self.decode_token_last_in_chunk = torch.compile(m1_decode_one_token_last_in_chunk)
-            self.decode_token_non_last_in_chunk = torch.compile(m1_decode_one_token_non_last_in_chunk)
+            self.prefill_chunk = torch.compile(m1_prefill_chunk)  # TODO: try PT compile the whole loop?
+            self.decode_end_chunk = torch.compile(m1_decode_end_chunk)
+            self.decode = torch.compile(m1_decode)
         else:
             self.prefill_chunk = m1_prefill_chunk
-            self.decode_token_last_in_chunk = m1_decode_one_token_last_in_chunk
-            self.decode_token_non_last_in_chunk = m1_decode_one_token_non_last_in_chunk
+            self.decode_end_chunk = m1_decode_end_chunk
+            self.decode = m1_decode
 
     def process_inner_loop(self, inputs, inner_chunk_size, last_chunk_params_dic,
                            is_prefill=False,
@@ -583,14 +593,14 @@ class TttM1BMMModule(TttBaseModule):
             B_mul_NH, N, HF = inputs['XA'].shape  # [B*nh,N=1,f]
 
             if is_last_in_chunk:
-                XCW_batch = self.decode_token_last_in_chunk(
+                XCW_batch = self.decode_end_chunk(
                     states,  # [B*nh,f,f], cloned from W1, safe for in-place op
                     inputs,  # [B*nh,f]
                     self.ln_weight,  # [nh,1,f]
                     self.ln_bias, # [nh,1,f]
                 )  # ret: [B*nh,N=1,f]
             else:
-                XCW_batch = self.decode_token_non_last_in_chunk(
+                XCW_batch = self.decode(
                     states,  # [B*nh,f,f], cloned from W1, safe for in-place op
                     inputs,  # [B*nh,f]
                     self.ln_weight,  # [nh,1,f]
@@ -603,6 +613,7 @@ class TttM1BMMModule(TttBaseModule):
 
 
 ####### M2 Decode Module #######
+## With LN
 # def m2_prefill_chunk(states, inputs, i, ln_weight, ln_bias):
 #     W1_init = states['W1_states']
 #     b1_init = states['b1_states']
@@ -994,15 +1005,15 @@ else:
 decode_lnb_flag = False
 
 if decode_lnb_flag:
-    # @triton.autotune(
-    #     configs=[
-    #         triton.Config({}, num_stages=1, num_warps=8),
-    #         triton.Config({}, num_stages=1, num_warps=4),
-    #         triton.Config({}, num_stages=1, num_warps=2),
-    #     ],
-    #     key=['HF'],
-    #     restore_value=['W1_init', 'W1_grad', 'b1_init', 'b1_grad'],
-    # )
+    @triton.autotune(
+        configs=[
+            triton.Config({}, num_stages=1, num_warps=8),
+            triton.Config({}, num_stages=1, num_warps=4),
+            triton.Config({}, num_stages=1, num_warps=2),
+        ],
+        key=['HF'],
+        restore_value=['W1_init', 'W1_grad', 'b1_init', 'b1_grad'],
+    )
     @triton.jit
     def _m1_decode_kernel(
             W1_init, W1_grad, b1_init, b1_grad,
@@ -1359,7 +1370,7 @@ class TttM1BMMTritonModule(TttBaseModule):
                                         CS, HF, NC)
             else:
                 _m1_prefill_kernel[grid](
-                    W1_init,  # [B,nh,f,f], cloned from W1, safe for in-place op
+                     W1_init,  # [B,nh,f,f], cloned from W1, safe for in-place op
                      XA, XB, XC, coeff_last, coeff, output,
                      NH * NC * CS * HF, NC * CS * HF, CS * HF, HF, 1,  # strides for A,B,C,O
                      NH * NC * CS, NC * CS, CS, 1,  # strides for E
@@ -1409,19 +1420,19 @@ class TttM1BMMTritonModule(TttBaseModule):
             else:
                 if is_last_in_chunk:
                     _m1_decode_end_chunk_kernel[grid](W1_init, W1_grad, XA, XB, XC, coeff, output,
-                                            NH * HF * HF,
-                                            HF * HF,
-                                            HF,
-                                            1,  # strides for W
-                                            NH * CS * HF,
-                                            CS * HF,
-                                            HF,
-                                            1,  # strides for ABCO, output
-                                            NH * CS,
-                                            CS,
-                                            1,
-                                            1,  # strides for coeff
-                                            CS, HF)
+                                                      NH * HF * HF,
+                                                      HF * HF,
+                                                      HF,
+                                                      1,  # strides for W
+                                                      NH * CS * HF,
+                                                      CS * HF,
+                                                      HF,
+                                                      1,  # strides for ABCO, output
+                                                      NH * CS,
+                                                      CS,
+                                                      1,
+                                                      1,  # strides for coeff
+                                                      CS, HF)
                 else:
                     _m1_decode_kernel[grid](W1_init, W1_grad, XA, XB, XC, coeff, output,
                                             NH * HF * HF,
@@ -1437,6 +1448,77 @@ class TttM1BMMTritonModule(TttBaseModule):
                                             1,
                                             1,  # strides for coeff
                                             CS, HF)
+
+        output = output.reshape(B_mul_NH, N, HF)
+        return output, None
+
+
+class TttM1BMMTKModule(TttBaseModule):
+
+    def __init__(self, config: TttConfig, layer_idx: Optional[int] = None):
+        super().__init__(config, layer_idx)
+        self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim, self.head_dim)))
+        self.b1 = nn.Parameter(torch.ones(size=(self.num_heads, 1, self.head_dim)))
+
+    def process_inner_loop(self, inputs, inner_chunk_size, last_chunk_params_dic,
+                           is_prefill=False,
+                           is_last_in_chunk=False,
+                           cache_params=None):
+
+        B_mul_NH, N, HF = inputs['XA'].shape  # [B*nh,N,f]
+        B = B_mul_NH // self.num_heads
+        NH = self.num_heads
+        W1_init = cache_params.params_dict["W1_states"][self.layer_idx].reshape(B, NH, HF, HF)
+        b1_init = cache_params.params_dict["b1_states"][self.layer_idx].reshape(B, NH, 1, HF)
+        W1_grad = cache_params.params_dict["W1_grad"][self.layer_idx].reshape(B, NH, HF, HF)
+        b1_grad = cache_params.params_dict["b1_grad"][self.layer_idx].reshape(B, NH, 1, HF)
+
+        if is_prefill:
+            CS = inner_chunk_size
+            NC = N // CS
+            inputs = tree_map(lambda x: x.reshape(B, NH, NC, CS, -1), inputs)  # [B*nh,N,f] -> [B,nh,NC,CS,f/1]
+            XA, XB, XC, coeff = inputs['XA'], inputs['XB'], inputs['XC'], inputs['coeff']  # [B,nh,NC,CS,f/1]
+            coeff_last = coeff[...,-1:,:]  # [B,nh,NC,1,1]
+            output = torch.empty_like(XA)  # [B,nh,NC,CS,f]
+
+            tk_m1_prefill.prefill_whole_loop(W1_init, XA, XB, XC, output)
+
+        else:
+            CS = N
+            inputs = tree_map(lambda x: x.reshape(B, NH, N, -1), inputs)  # [B*nh,N=1,f], [B*nh,N=1,1] -> [BS,nh,N=1,f/1]
+            XA, XB, XC, coeff = inputs['XA'], inputs['XB'], inputs['XC'], inputs['coeff']  # [B,nh,N,f/1]
+            output = torch.empty_like(XA) # [B,nh,N,f]
+            grid = (B, NH, 1)
+            if is_last_in_chunk:
+                _m1_decode_end_chunk_kernel[grid](W1_init, W1_grad, XA, XB, XC, coeff, output,
+                                                  NH * HF * HF,
+                                                  HF * HF,
+                                                  HF,
+                                                  1,  # strides for W
+                                                  NH * CS * HF,
+                                                  CS * HF,
+                                                  HF,
+                                                  1,  # strides for ABCO, output
+                                                  NH * CS,
+                                                  CS,
+                                                  1,
+                                                  1,  # strides for coeff
+                                                  CS, HF)
+            else:
+                _m1_decode_kernel[grid](W1_init, W1_grad, XA, XB, XC, coeff, output,
+                                        NH * HF * HF,
+                                        HF * HF,
+                                        HF,
+                                        1,  # strides for W
+                                        NH * CS * HF,
+                                        CS * HF,
+                                        HF,
+                                        1,  # strides for ABCO, output
+                                        NH * CS,
+                                        CS,
+                                        1,
+                                        1,  # strides for coeff
+                                        CS, HF)
 
         output = output.reshape(B_mul_NH, N, HF)
         return output, None
@@ -1754,6 +1836,70 @@ class TttM2BMMTritonModule(TttBaseModule):
         output = output.reshape(B_mul_NH, N, HF)
         return output, None
 
+
+class TttM2BMMTKModule(TttBaseModule):
+
+    def __init__(self, config: TttConfig, layer_idx: Optional[int] = None):
+        super().__init__(config, layer_idx)
+        self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim, 4 * self.head_dim)))
+        self.b1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, 1, 4 * self.head_dim)))
+        self.W2 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, 4 * self.head_dim, self.head_dim)))
+        self.b2 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, 1, self.head_dim)))
+
+    def process_inner_loop(self, inputs, inner_chunk_size, last_chunk_params_dic,
+                           is_prefill=False,
+                           is_last_in_chunk=False,
+                           cache_params=None):
+
+        B_mul_NH, N, HF = inputs['XA'].shape  # [B*nh,N,f]
+        HF_prime = self.W1.shape[-1]
+        B = B_mul_NH // self.num_heads
+        NH = self.num_heads
+
+        W1_init = cache_params.params_dict["W1_states"][self.layer_idx].reshape(B, NH, HF, 4 * HF)
+        W1_grad = cache_params.params_dict["W1_grad"][self.layer_idx].reshape(B, NH, HF, 4 * HF)
+        W2_init = cache_params.params_dict["W2_states"][self.layer_idx].reshape(B, NH, 4 * HF, HF)
+        W2_grad = cache_params.params_dict["W2_grad"][self.layer_idx].reshape(B, NH, 4 * HF, HF)
+
+        if is_prefill:
+            CS = inner_chunk_size
+            NC = N // CS
+            inputs = tree_map(lambda x: x.reshape(B, NH, NC, CS, -1), inputs)  # [B*nh,N,f] -> [B,nh,NC,CS,f/1]
+            XA, XB, XC, coeff = inputs['XA'], inputs['XB'], inputs['XC'], inputs['coeff']  # [B,nh,NC,CS,f/1]
+            coeff_last = coeff[..., -1:, :]  # [B,nh,NC,1,1]
+            output = torch.empty_like(XA)  # [B,nh,NC,CS,f]
+
+            tk_m2_prefill.prefill_whole_loop(W1_init, W2_init, XA, XB, XC, output)
+
+        else:
+            CS = N
+            inputs = tree_map(lambda x: x.reshape(B, NH, N, -1), inputs)  # [B*nh,N=1,f], [B*nh,N=1,1] -> [BS,nh,N=1,f/1]
+            XA, XB, XC, coeff = inputs['XA'], inputs['XB'], inputs['XC'], inputs['coeff']  # [B,nh,N,f/1]
+            output = torch.empty_like(XA)  # [B,nh,N,f]
+            grid = (B, NH, 1)
+            if is_last_in_chunk:
+                _m2_decode_end_chunk_kernel[grid](W1_init, W1_grad, W2_init, W2_grad,
+                                                  XA, XB, XC, coeff,
+                                                  output,
+                                                  NH * HF * HF_prime, HF * HF_prime, HF_prime, 1,  # strides for W1: [B,NH,HF,HF_prime]
+                                                  NH * HF_prime * HF, HF_prime * HF, HF, 1,  # strides for W2
+                                                  NH * CS * HF, CS * HF, HF, 1,  # strides for ABCO, output
+                                                  NH * CS * 1, CS * 1, 1, 1,  # strides for coeff
+                                                  CS=CS, HF=HF, HF_prime=HF_prime)
+            else:
+                _m2_decode_kernel[grid](W1_init, W1_grad, W2_init, W2_grad,
+                                        XA, XB, XC, coeff,
+                                        output,
+                                        NH * HF * HF_prime, HF * HF_prime, HF_prime, 1,
+                                        # strides for W1: [B,NH,HF,HF_prime]
+                                        NH * HF_prime * HF, HF_prime * HF, HF, 1,  # strides for W2
+                                        NH * CS * HF, CS * HF, HF, 1,  # strides for ABCO, output
+                                        NH * CS * 1, CS * 1, 1, 1,  # strides for coeff
+                                        CS=CS, HF=HF, HF_prime=HF_prime)
+
+        output = output.reshape(B_mul_NH, N, HF)
+        return output, None
+
 ##########################################
 
 
@@ -1767,10 +1913,14 @@ class TttDecoderLayer(nn.Module):
             self.self_attn = TttM1BMMModule(config=config, layer_idx=layer_idx)
         elif config.inner_net == 'mlp_1_dual_triton':
             self.self_attn = TttM1BMMTritonModule(config=config, layer_idx=layer_idx)
+        elif config.inner_net == 'mlp_1_dual_tk':
+            self.self_attn = TttM1BMMTKModule(config=config, layer_idx=layer_idx)
         elif config.inner_net == 'mlp_2_dual':
             self.self_attn = TttM2BMMModule(config=config, layer_idx=layer_idx)
         elif config.inner_net == 'mlp_2_dual_triton':
             self.self_attn = TttM2BMMTritonModule(config=config, layer_idx=layer_idx)
+        elif config.inner_net == 'mlp_2_dual_tk':
+            self.self_attn = TttM2BMMTKModule(config=config, layer_idx=layer_idx)
         else:
             raise NotImplementedError(f"Inner {config.inner_net} Not Implemented!")
 
