@@ -25,7 +25,7 @@ from ...utils import ModelOutput, logging
 from .configuration_ttt import TttConfig
 
 from transformers.models.ttt_full_prefill_decode_optimize.generation import GenerationMixin, TttCache
-from mamba_ssm.ops.triton.layernorm import RMSNorm, rms_norm_fn
+from transformers.models.mamba_ssm.ops.triton.layernorm import RMSNorm, rms_norm_fn
 from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 
 try:
@@ -1460,6 +1460,13 @@ class TttM1BMMTKModule(TttBaseModule):
         self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim, self.head_dim)))
         self.b1 = nn.Parameter(torch.ones(size=(self.num_heads, 1, self.head_dim)))
 
+        if self.config.use_compile:
+            self.decode_end_chunk = torch.compile(m1_decode_end_chunk)
+            self.decode = torch.compile(m1_decode)
+        else:
+            self.decode_end_chunk = m1_decode_end_chunk
+            self.decode = m1_decode
+
     def process_inner_loop(self, inputs, inner_chunk_size, last_chunk_params_dic,
                            is_prefill=False,
                            is_last_in_chunk=False,
@@ -1468,12 +1475,13 @@ class TttM1BMMTKModule(TttBaseModule):
         B_mul_NH, N, HF = inputs['XA'].shape  # [B*nh,N,f]
         B = B_mul_NH // self.num_heads
         NH = self.num_heads
-        W1_init = cache_params.params_dict["W1_states"][self.layer_idx].reshape(B, NH, HF, HF)
-        b1_init = cache_params.params_dict["b1_states"][self.layer_idx].reshape(B, NH, 1, HF)
-        W1_grad = cache_params.params_dict["W1_grad"][self.layer_idx].reshape(B, NH, HF, HF)
-        b1_grad = cache_params.params_dict["b1_grad"][self.layer_idx].reshape(B, NH, 1, HF)
 
         if is_prefill:
+            W1_init = cache_params.params_dict["W1_states"][self.layer_idx].reshape(B, NH, HF, HF)
+            b1_init = cache_params.params_dict["b1_states"][self.layer_idx].reshape(B, NH, 1, HF)
+            W1_grad = cache_params.params_dict["W1_grad"][self.layer_idx].reshape(B, NH, HF, HF)
+            b1_grad = cache_params.params_dict["b1_grad"][self.layer_idx].reshape(B, NH, 1, HF)
+
             CS = inner_chunk_size
             NC = N // CS
             inputs = tree_map(lambda x: x.reshape(B, NH, NC, CS, -1), inputs)  # [B*nh,N,f] -> [B,nh,NC,CS,f/1]
@@ -1483,44 +1491,34 @@ class TttM1BMMTKModule(TttBaseModule):
 
             tk_m1_prefill.prefill_whole_loop(W1_init, XA, XB, XC, output)
 
-        else:
-            CS = N
-            inputs = tree_map(lambda x: x.reshape(B, NH, N, -1), inputs)  # [B*nh,N=1,f], [B*nh,N=1,1] -> [BS,nh,N=1,f/1]
-            XA, XB, XC, coeff = inputs['XA'], inputs['XB'], inputs['XC'], inputs['coeff']  # [B,nh,N,f/1]
-            output = torch.empty_like(XA) # [B,nh,N,f]
-            grid = (B, NH, 1)
-            if is_last_in_chunk:
-                _m1_decode_end_chunk_kernel[grid](W1_init, W1_grad, XA, XB, XC, coeff, output,
-                                                  NH * HF * HF,
-                                                  HF * HF,
-                                                  HF,
-                                                  1,  # strides for W
-                                                  NH * CS * HF,
-                                                  CS * HF,
-                                                  HF,
-                                                  1,  # strides for ABCO, output
-                                                  NH * CS,
-                                                  CS,
-                                                  1,
-                                                  1,  # strides for coeff
-                                                  CS, HF)
-            else:
-                _m1_decode_kernel[grid](W1_init, W1_grad, XA, XB, XC, coeff, output,
-                                        NH * HF * HF,
-                                        HF * HF,
-                                        HF,
-                                        1,  # strides for W
-                                        NH * CS * HF,
-                                        CS * HF,
-                                        HF,
-                                        1,  # strides for ABCO, output
-                                        NH * CS,
-                                        CS,
-                                        1,
-                                        1,  # strides for coeff
-                                        CS, HF)
+            output = output.reshape(B_mul_NH, N, HF)
 
-        output = output.reshape(B_mul_NH, N, HF)
+        else:
+            states = {
+                "W1_states": cache_params.params_dict["W1_states"][self.layer_idx],
+                "b1_states": cache_params.params_dict["b1_states"][self.layer_idx],
+                "W1_grad": cache_params.params_dict["W1_grad"][self.layer_idx],
+                "b1_grad": cache_params.params_dict["b1_grad"][self.layer_idx],
+            }
+
+            # @xinhao: decoding from a prompt of length 1 will always have `inner_chunk_size=remainder=1`
+            B_mul_NH, N, HF = inputs['XA'].shape  # [B*nh,N=1,f]
+
+            if is_last_in_chunk:
+                output = self.decode_end_chunk(
+                    states,  # [B*nh,f,f], cloned from W1, safe for in-place op
+                    inputs,  # [B*nh,f]
+                    self.ln_weight,  # [nh,1,f]
+                    self.ln_bias,  # [nh,1,f]
+                )  # ret: [B*nh,N=1,f]
+            else:
+                output = self.decode(
+                    states,  # [B*nh,f,f], cloned from W1, safe for in-place op
+                    inputs,  # [B*nh,f]
+                    self.ln_weight,  # [nh,1,f]
+                    self.ln_bias,  # [nh,1,f]
+                )  # ret: [B*nh,N=1,f]
+
         return output, None
 
 ##########################################

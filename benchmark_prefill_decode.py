@@ -48,7 +48,7 @@ parser = argparse.ArgumentParser(description="Generation benchmarking")
 parser.add_argument("--logdir", type=str, default="./exp/clean")
 parser.add_argument("--model-name", type=str, default="ttt-1b")
 # state-spaces/mamba-130m | meta-llama/Llama-2-7b | state-spaces/mamba-1.4b | ttt-125m | ttt-1b | ttt-profile
-parser.add_argument("--mode", type=str, default="prefill", choices=["prefill", "decode"])
+parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16"])
 parser.add_argument("--promptlen", type=int, default=1)
 parser.add_argument("--genlen", type=int, default=128)
 parser.add_argument("--batch", type=int, default=1)
@@ -91,7 +91,12 @@ torch.random.manual_seed(0)  # @xinhao: make sure model init is fixed
 
 repeats = 3
 device = "cuda"
-dtype = torch.float16  # @xinhao: follow mamba benchmark
+if args.dtype == 'fp16':
+    dtype = torch.float16  # @xinhao: follow mamba benchmark
+elif args.dtype == 'bf16':
+    dtype = torch.bfloat16
+else:
+    raise NotImplementedError
 logger.info("dtype: " + str(dtype))
 
 logger.info(f"Loading model {args.model_name}")
@@ -173,16 +178,9 @@ else:
 
 
 out = fn(0)  # capture graph if cg=True, will not be timed
-if args.mode == 'decode':
-    logger.info(f"Decode succeeds. output.sequences.shape: {out.sequences.shape}")
-    out_len = len(out.sequences[0])
-else:
-    logger.info("Prefill succeeds.")
-    out_len = len(input_ids[0])
+logger.info("Succeeded.")
+out_len = len(out.sequences[0])
 in_len = len(input_ids[0])
-if args.mode == 'decode':
-    print(tokenizer.batch_decode(out.sequences[0].tolist()[:5]))
-    print('=================')
 del out
 
 if args.profile:
@@ -193,15 +191,14 @@ if args.profile:
                  with_flops=True, with_stack=True, with_modules=True
         ) as prof:
            fn(0)
-    prof.export_chrome_trace(osp.join(args.logdir, f"{args.mode}_trace.json"))
-    prof.export_stacks(osp.join(args.logdir, f"{args.mode}_cuda_flamedata.txt"), "self_cuda_time_total")
-    prof.export_stacks(osp.join(args.logdir, f"{args.mode}_cpu_flamedata.txt"), "self_cpu_time_total")
+    prof.export_chrome_trace(osp.join(args.logdir, f"trace.json"))
+    prof.export_stacks(osp.join(args.logdir, f"cuda_flamedata.txt"), "self_cuda_time_total")
+    prof.export_stacks(osp.join(args.logdir, f"cpu_flamedata.txt"), "self_cpu_time_total")
     torch.cuda.synchronize()
 
-    logger.info(f"Mode: {args.mode}")
     logger.info(f"Prompt length: {in_len}, generation length: {out_len - in_len}")
-    logger.info(f"SUCCESS: RECORDED TRACE TO {args.logdir}/{args.mode}_trace.json")
-    logger.info(f"SUCCESS: RECORDED FLAME DATA TO {args.logdir}/{args.mode}_[cuda,cpu]_flamedata.txt")
+    logger.info(f"SUCCESS: RECORDED TRACE TO {args.logdir}/trace.json")
+    logger.info(f"SUCCESS: RECORDED FLAME DATA TO {args.logdir}/[cuda,cpu]_flamedata.txt")
     logger.info("==================================")
 
 else:
@@ -213,9 +210,8 @@ else:
     torch.cuda.synchronize()
     avg_time = (time.time() - start) / repeats
 
-    logger.info(f"Mode: {args.mode}")
     logger.info(f"Prompt length: {in_len}, generation length: {out_len - in_len}")
-    logger.info(f"{args.model_name} prompt processing + decoding time: {avg_time * 1000:.0f}ms")
+    logger.info(f"Prompt processing + Decoding time: {avg_time * 1000:.0f}ms")
     logger.info(f"Throughput (total tok = prefill + decode): {args.batch * out_len / avg_time:.3f} tokens / s")
     logger.info(f"Throughput (total tok = decode): {args.batch * (out_len - in_len) / avg_time:.3f} tokens / s")
     logger.info("==================================")

@@ -14,12 +14,12 @@ from einops import rearrange, repeat
 try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 except ImportError:
-    causal_conv1d_fn, causal_conv1d_update = None
+    causal_conv1d_fn, causal_conv1d_update = None, None
 
 try:
     from transformers.models.mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn
 except ImportError:
-    selective_scan_fn, mamba_inner_fn = None, None, None
+    selective_scan_fn, mamba_inner_fn = None, None
 
 try:
     from transformers.models.mamba_ssm.ops.triton.selective_state_update import selective_state_update
