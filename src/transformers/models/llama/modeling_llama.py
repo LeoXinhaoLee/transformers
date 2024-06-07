@@ -18,6 +18,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """PyTorch LLaMA model."""
+import pdb
 
 import math
 import warnings
@@ -496,6 +497,10 @@ class LlamaFlashAttention2(LlamaAttention):
         )
 
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
+
+        # @xinhao: test QKVO-MLP Only
+        # attn_output = query_states + key_states + value_states
+
         attn_output = self.o_proj(attn_output)
 
         if not output_attentions:

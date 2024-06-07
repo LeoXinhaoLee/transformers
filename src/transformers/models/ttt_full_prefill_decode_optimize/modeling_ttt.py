@@ -821,6 +821,106 @@ class TttM2BMMModule(TttBaseModule):
 
         return XCW_batch, None
 
+
+def m2_prefill_whole_loop(states, inputs, NC):
+
+    output_tensor = torch.empty_like(inputs['XA'])
+
+    for i in range(NC):
+        W1_init = states['W1_states']
+        W2_init = states['W2_states']
+        XA_chunk, XB_chunk, XC_chunk, \
+        coeff_chunk, coeff_chunk_last = inputs['XA'][i], inputs['XB'][i], inputs['XC'][i], \
+                                        inputs['coeff'][i], inputs['coeff_last'][i]
+
+        Z1 = XB_chunk @ W1_init  # [B*nh,K,f] @ [B*nh,f,f] -> [B*nh,K,f]
+        Z2 = Z1 @ W2_init
+        reconstruction_target = XA_chunk - XB_chunk
+        grad_l_wrt_Z2 = Z2 - reconstruction_target  # [B*nh,K=1,f]
+        grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2_init.transpose(-1, -2)
+
+        Attn1 = torch.tril(XC_chunk @ XB_chunk.transpose(-1, -2))  # [B*nh,K,K]
+        Z1_bar = XC_chunk @ W1_init - (
+                    coeff_chunk * Attn1) @ grad_l_wrt_Z1  # [B*nh,K,f] @ [B*nh,f,f] - ([B*nh,K,1] * [B*nh,K,K]) @ [B*nh,K,f]
+
+        Attn2 = torch.tril(Z1_bar @ Z1.transpose(-1, -2))  # [B*nh,K,K]
+        Z2_bar = Z1_bar @ W2_init - (coeff_chunk * Attn2) @ grad_l_wrt_Z2
+
+        W1_init.sub_((coeff_chunk_last * XB_chunk).transpose(-1, -2) @ grad_l_wrt_Z1)  # in-place update: [B*nh,f,f] - ([B*nh,1,1] * [B*nh,K,f].t) @ [B*nh,K,f]
+        W2_init.sub_((coeff_chunk_last * Z1).transpose(-1, -2) @ grad_l_wrt_Z2)  # in-place update: [B*nh,f,f] - ([B*nh,1,1] * [B*nh,K,f].t) @ [B*nh,K,f]
+        output_tensor[i] = Z2_bar
+
+    return output_tensor
+
+
+class TttM2BMMWholeLoopModule(TttBaseModule):
+    def __init__(self, config: TttConfig, layer_idx: Optional[int] = None):
+        super().__init__(config, layer_idx)
+        self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim, 4 * self.head_dim)))
+        self.b1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, 1, 4 * self.head_dim)))
+        self.W2 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, 4 * self.head_dim, self.head_dim)))
+        self.b2 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, 1, self.head_dim)))
+
+        if self.config.use_compile:
+            self.prefill_chunk = torch.compile(m2_prefill_whole_loop, mode='max-autotune')
+            self.decode_end_chunk = torch.compile(m2_decode_end_chunk)
+            self.decode = torch.compile(m2_decode)
+        else:
+            self.prefill_chunk = m2_prefill_whole_loop
+            self.decode_end_chunk = m2_decode_end_chunk
+            self.decode = m2_decode
+
+    def process_inner_loop(self, inputs, inner_chunk_size, last_chunk_params_dic,
+                           is_prefill=False,
+                           is_last_in_chunk=False,
+                           cache_params=None):
+        states = {
+            "W1_states": cache_params.params_dict["W1_states"][self.layer_idx],
+            "W1_grad": cache_params.params_dict["W1_grad"][self.layer_idx],
+            "b1_states": cache_params.params_dict["b1_states"][self.layer_idx],
+            "b1_grad": cache_params.params_dict["b1_grad"][self.layer_idx],
+            "W2_states": cache_params.params_dict["W2_states"][self.layer_idx],
+            "W2_grad": cache_params.params_dict["W2_grad"][self.layer_idx],
+            "b2_states": cache_params.params_dict["b2_states"][self.layer_idx],
+            "b2_grad": cache_params.params_dict["b2_grad"][self.layer_idx],
+        }
+
+        if is_prefill:
+            B_mul_NH, N, HF = inputs['XA'].shape  # [B*nh,N,f]
+            NC = N // inner_chunk_size
+            inputs = tree_map(lambda x: x.reshape(B_mul_NH, NC, inner_chunk_size, -1).transpose(1, 0).contiguous(),
+                              inputs)  # [B*nh,N,f] -> [B*nh,NC,CS,f] -> [NC,B*nh,CS,f]
+            inputs['coeff_last'] = inputs['coeff'][..., -1:, :]  # pre-sclice: [NC,B*nh,1,1]
+
+            XCW_batch = self.prefill_chunk(
+                states,  # [B*nh,f,f]
+                inputs,  # [NC,B*nh,CS,f]
+                NC,
+            )
+            XCW_batch = XCW_batch.transpose(1, 0).reshape(B_mul_NH, -1, HF).contiguous()  # [B*h,N,f]
+
+        else:
+            # @xinhao: decoding from a prompt of length 1 will always have `inner_chunk_size=remainder=1`
+            B_mul_NH, N, HF = inputs['XA'].shape  # [B*nh,N=1,f]
+
+            if is_last_in_chunk:
+                XCW_batch = self.decode_end_chunk(
+                    states,  # [B*nh,f,f], cloned from W1, safe for in-place op
+                    inputs,  # [B*nh,f]
+                    self.ln_weight,  # [nh,1,f]
+                    self.ln_bias,  # [nh,1,f]
+                )  # ret: [B*nh,N=1,f]
+            else:
+                XCW_batch = self.decode(
+                    states,  # [B*nh,f,f], cloned from W1, safe for in-place op
+                    inputs,  # [B*nh,f]
+                    self.ln_weight,  # [nh,1,f]
+                    self.ln_bias,  # [nh,1,f]
+                )  # ret: [B*nh,N=1,f]
+
+        return XCW_batch, None
+
+
 ##########################################
 
 
@@ -1915,6 +2015,8 @@ class TttDecoderLayer(nn.Module):
             self.self_attn = TttM1BMMTKModule(config=config, layer_idx=layer_idx)
         elif config.inner_net == 'mlp_2_dual':
             self.self_attn = TttM2BMMModule(config=config, layer_idx=layer_idx)
+        elif config.inner_net == 'mlp_2_dual_whole_loop':
+            self.self_attn = TttM2BMMWholeLoopModule(config=config, layer_idx=layer_idx)
         elif config.inner_net == 'mlp_2_dual_triton':
             self.self_attn = TttM2BMMTritonModule(config=config, layer_idx=layer_idx)
         elif config.inner_net == 'mlp_2_dual_tk':
