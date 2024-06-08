@@ -1967,7 +1967,7 @@ class TttM2BMMTKModule(TttBaseModule):
             coeff_last = coeff[..., -1:, :]  # [B,nh,NC,1,1]
             output = torch.empty_like(XA)  # [B,nh,NC,CS,f]
 
-            tk_m2_prefill.prefill_whole_loop(W1_init, W2_init, XA, XB, XC, output)
+            tk_m2_prefill.prefill_whole_loop_fp16(W1_init, W2_init, XA, XB, XC, output)
 
         else:
             CS = N
