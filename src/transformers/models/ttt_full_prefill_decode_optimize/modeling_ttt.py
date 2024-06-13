@@ -168,6 +168,7 @@ class TttBaseModule(nn.Module):
         self.conv_kernel = config.conv_kernel
         
         token_idx = (self.config.inner_net_lr / self.head_dim) / torch.arange(1, self.inner_chunk_size + 1)
+        token_idx = token_idx.unsqueeze(1).expand(-1, self.head_dim).contiguous()  # [CS,f]
         self.register_buffer("token_idx", token_idx, persistent=False)
 
         self.qkv_proj = nn.Linear(self.hidden_size, 3 * self.hidden_size + self.num_heads, bias=False)  # share QK so can add Gate
@@ -199,10 +200,6 @@ class TttBaseModule(nn.Module):
         # self.ln_bias = nn.Parameter(torch.tile(ln_bias_data.reshape(1, 1, 1, -1), (1, self.num_heads, 1, 1)))  # [1,h,1,f]
         self.ln_bias = torch.tile(ln_bias_data.reshape(1, 1, 1, -1), (1, self.num_heads, 1, 1)).to(torch.float16).to('cuda')
 
-        # if config.use_compile:
-        #     self.get_inner_loop_inputs = torch.compile(self._get_inner_loop_inputs)
-        # else:
-        #     self.get_inner_loop_inputs = self._get_inner_loop_inputs
         self.get_inner_loop_inputs = self._get_inner_loop_inputs
 
     def conv_qk(
@@ -337,8 +334,10 @@ class TttBaseModule(nn.Module):
         XC = XC.reshape(B, L, self.num_heads, self.head_dim).permute(0,2,1,3).reshape(-1, L, self.head_dim)  # [B*nh,N,f]
         XB = XB.reshape(B, L, self.num_heads, self.head_dim).permute(0,2,1,3).reshape(-1, L, self.head_dim)
 
-        ilr_gated = F.sigmoid(ilr_gated.permute(0,2,1).reshape(-1,1,1))  # [B,N=1,nh] -> [B,nh,N=1] -> [B*nh,N=1,1]
+        ilr_gated = F.sigmoid(ilr_gated.permute(0,2,1).reshape(-1,L,1))  # [B,N,nh] -> [B,nh,N] -> [B*nh,N,1]
+
         coeff = self.token_idx[inner_chunk_step_offset] * ilr_gated   # [B*nh,N=1,1]
+
         return XC, XB, XA, coeff, XGate
 
     def forward_chunk(
@@ -405,8 +404,8 @@ class TttBaseModule(nn.Module):
                            is_prefill, is_last_in_chunk, cache_params=None,):
         """
         Inputs:
-            XA, XB, XC: [B, n_chunk, chunk_size, F] or [B, n_chunk // 4, 4 * chunk_size, F]
-            coeff: [B, n_chunk, chunk_size, 1] or [B,nh, n_chunk / 4, 4 * K, 1]
+            XA, XB, XC: [B*nh, N, f]
+            coeff: [B*nh, N, CS, CS]
         Outputs:
             [B,N,F]
         """
