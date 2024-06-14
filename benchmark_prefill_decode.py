@@ -39,9 +39,6 @@ from transformers import LlamaForCausalLM, LlamaConfig
 from transformers.models.mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel  # copy from mamba repo, modify generation to avoid OOM
 from transformers.models.ttt.configuration_ttt import TTT_STANDARD_CONFIGS, TttConfig  # 125m and 1b config
 
-# from transformers.models.ttt_benchmark_prefill_decode.modeling_ttt import TttForCausalLM  # TODO: prefill and decode, but not optimized
-# from transformers.models.ttt_benchmark_decode_optimize.modeling_ttt import TttForCausalLM  # TODO: Only support decode, but is optimized
-# from transformers.models.ttt_full_decode_optimize.modeling_ttt import TttForCausalLM  # TODO: Only support decode, but is optimized
 from transformers.models.ttt_full_prefill_decode_optimize.modeling_ttt import TttForCausalLM
 
 parser = argparse.ArgumentParser(description="Generation benchmarking")
@@ -128,6 +125,7 @@ else:
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")  # meta-llama/Llama-2-7b
     config = LlamaConfig.from_json_file('./llama_config/config.json')  # 1B llama config
     config._attn_implementation = args.attn_impl  # @xinhao: llama config use `_attn_implementation` to select attn
+    config.dtype = dtype
     model = LlamaForCausalLM(config).to(device=device, dtype=dtype)
 
 model.eval()
