@@ -195,10 +195,10 @@ class TttBaseModule(nn.Module):
         # @xinhao: ln_weight and _bias must be normal tensor instead of nn.Parameter, otherwise will have triton error
         ln_weight_data = nn.LayerNorm(self.head_dim).weight.data
         # self.ln_weight = nn.Parameter(torch.tile(ln_weight_data.reshape(1, 1, 1, -1), (1, self.num_heads, 1, 1)))  # [1,h,1,f]
-        self.ln_weight = torch.tile(ln_weight_data.reshape(1, 1, 1, -1), (1, self.num_heads, 1, 1)).to(self.config.dtype).to('cuda')
+        self.ln_weight = torch.tile(ln_weight_data.reshape(1, 1, 1, -1), (1, self.num_heads, 1, 1)).to(self.config.dtype).to('cuda') * 1.
         ln_bias_data = nn.LayerNorm(self.head_dim).bias.data
         # self.ln_bias = nn.Parameter(torch.tile(ln_bias_data.reshape(1, 1, 1, -1), (1, self.num_heads, 1, 1)))  # [1,h,1,f]
-        self.ln_bias = torch.tile(ln_bias_data.reshape(1, 1, 1, -1), (1, self.num_heads, 1, 1)).to(self.config.dtype).to('cuda')
+        self.ln_bias = torch.tile(ln_bias_data.reshape(1, 1, 1, -1), (1, self.num_heads, 1, 1)).to(self.config.dtype).to('cuda') * 1.
 
         self.out_norm = nn.LayerNorm(self.hidden_size)
 
@@ -354,6 +354,12 @@ class TttBaseModule(nn.Module):
         XC = XC.reshape(B, L, self.num_heads, self.head_dim).permute(0,2,1,3).reshape(-1, L, self.head_dim)  # [B*nh,N,f]
         XB = XB.reshape(B, L, self.num_heads, self.head_dim).permute(0,2,1,3).reshape(-1, L, self.head_dim)
         ilr_gated = F.sigmoid(ilr_gated.permute(0,2,1).reshape(-1,L,1))  # [B,N,nh] -> [B,nh,N] -> [B*nh,N,1]
+
+        XA = XA.contiguous()
+        XB = XB.contiguous()
+        XC = XC.contiguous()
+        XGate = XGate.contiguous()
+        ilr_gated = ilr_gated.contiguous()
 
         return XC, XB, XA, token_idx, ilr_gated, XGate
 
@@ -1125,327 +1131,226 @@ else:
         tl.store(W1_ptr, W1_data.to(W1.type.element_ty))
 
 ####### Decode #######
-decode_lnb_flag = False
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_stages=1, num_warps=8),
+        triton.Config({}, num_stages=1, num_warps=4),
+        triton.Config({}, num_stages=1, num_warps=2),
+    ],
+    key=['HF'],
+    restore_value=['__W1', '__b1', '__W1_grad', '__b1_grad']
+)
+@triton.jit
+def _m1_decode_kernel(__W1, __W1_grad, __b1, __b1_grad,
+                      __XA, __XB, __XC,
+                      __ln_weight, __ln_bias,
+                      __ilr_gated, __token_idx, __Out,
+                      stride_w_batch, stride_w_head, stride_w_fin,
+                      stride_b_batch, stride_b_head, stride_b_f,
+                      stride_x_batch, stride_x_head, stride_x_n,
+                      stride_ln_head, stride_ln_f,
+                      stride_ilr_batch, stride_ilr_head,
+                      CS: tl.constexpr, HF: tl.constexpr):
+    batch = tl.program_id(0)
+    head = tl.program_id(1)
 
-if decode_lnb_flag:
-    @triton.autotune(
-        configs=[
-            triton.Config({}, num_stages=1, num_warps=8),
-            triton.Config({}, num_stages=1, num_warps=4),
-            triton.Config({}, num_stages=1, num_warps=2),
-        ],
-        key=['HF'],
-        restore_value=['W1_init', 'W1_grad', 'b1_init', 'b1_grad'],
-    )
-    @triton.jit
-    def _m1_decode_kernel(
-            W1_init, W1_grad, b1_init, b1_grad,
-            XA, XB, XC, coeff, Out,
-            ln_weight, ln_bias,
+    rc = tl.arange(0, CS)
+    rf = tl.arange(0, HF)
 
-            stride_w_batch, stride_w_head, stride_w_in, stride_w_out,
-            stride_b_batch, stride_b_head, stride_b_in, stride_b_out,
-            stride_ln_head, stride_ln_f,
-            stride_x_batch, stride_x_head, stride_x_n, stride_x_f,
-            stride_coeff_batch, stride_coeff_head,
-            CS: tl.constexpr, HF: tl.constexpr
-    ):
-        batch = tl.program_id(0)
-        head = tl.program_id(1)
+    W_dtype = __W1.type.element_ty
+    O_dtype = __Out.type.element_ty
 
-        rc = tl.arange(0, CS)
-        rf = tl.arange(0, HF)
+    x_block_offset = batch * stride_x_batch + head * stride_x_head
+    w_block_offset = batch * stride_w_batch + head * stride_w_head
+    b_block_offset = batch * stride_b_batch + head * stride_b_head
+    ln_block_offset = head * stride_ln_head
+    ilr_block_offset = batch * stride_ilr_batch + head * stride_ilr_head
 
-        W_dtype = W1_init.type.element_ty
-        O_dtype = Out.type.element_ty
+    x_inner_offset = rc[:, None] * stride_x_n + rf[None, :]
+    w_inner_offset = rf[:, None] * stride_w_fin + rf[None, :]
+    b_inner_offset = rc[:, None] * stride_b_f + rf[None, :]
+    ln_inner_offset = rc[:, None] * stride_ln_f + rf[None, :]
 
-        abco_offset = batch * stride_x_batch + head * stride_x_head
-        coeff_offset = batch * stride_coeff_batch + head * stride_coeff_head
+    x_offset = x_block_offset + x_inner_offset
+    w_offset = w_block_offset + w_inner_offset
+    b_offset = b_block_offset + b_inner_offset
+    ln_offset = ln_block_offset + ln_inner_offset
+    ilr_offset = ilr_block_offset
 
-        w_offset = batch * stride_w_batch + head * stride_w_head
-        b_offset = batch * stride_b_batch + head * stride_b_head
-        ln_offset = head * stride_ln_head
+    _XA = __XA + x_offset
+    _XB = __XB + x_offset
+    _XC = __XC + x_offset
+    _Out = __Out + x_offset
+    _W1 = __W1 + w_offset
+    _W1_grad = __W1_grad + w_offset
+    _b1 = __b1 + b_offset
+    _b1_grad = __b1_grad + b_offset
+    _ln_weight = __ln_weight + ln_offset
+    _ln_bias = __ln_bias + ln_offset
+    _ilr_gated = __ilr_gated + ilr_offset
+    _token_idx = __token_idx
 
-        XA = XA + abco_offset + (rc[:, None] * stride_x_n + rf[None, :] * stride_x_f)
-        XB = XB + abco_offset + (rc[:, None] * stride_x_n + rf[None, :] * stride_x_f)
-        XC = XC + abco_offset + (rc[:, None] * stride_x_n + rf[None, :] * stride_x_f)
-        Out = Out + abco_offset + (rf[None, :] * stride_x_f)
-        coeff = coeff + coeff_offset
+    XA = tl.load(_XA)
+    XB = tl.load(_XB)
+    XC = tl.load(_XC)
+    token_idx = tl.load(_token_idx)
+    ilr_gated = tl.load(_ilr_gated)
+    W1 = tl.load(_W1)
+    W1_grad = tl.load(_W1_grad)
+    b1 = tl.load(_b1)
+    b1_grad = tl.load(_b1_grad)
+    ln_weight = tl.load(_ln_weight)
+    ln_bias = tl.load(_ln_bias)
 
-        W1_init = W1_init + w_offset + (rf[:, None] * stride_w_in + rf[None, :] * stride_w_out)  # [f,f]
-        W1_grad = W1_grad + w_offset + (rf[:, None] * stride_w_in + rf[None, :] * stride_w_out)
+    Z1 = tl.sum(tl.trans(XB) * W1, axis=0)[None, :] + b1  # [1,f] @ [f,f] + [1,f]
+    l2_target = XA - XB
 
-        b1_init = b1_init + b_offset + rf[None, :] * stride_b_out  # [1,f]
-        b1_grad = b1_grad + b_offset + rf[None, :] * stride_b_out
+    mu = tl.sum(Z1, 1) / HF
+    var = tl.sum((Z1 - mu) * (Z1 - mu), 1) / HF
 
-        ln_weight = ln_weight + ln_offset + rf[None, :] * stride_ln_f  # [1,f]
-        ln_bias = ln_bias + ln_offset + rf[None, :] * stride_ln_f
+    std = tl.sqrt(var + 1e-6)
+    Z1_hat = (Z1 - mu) / std  # [1,f]
 
-        XA_data = tl.load(XA)
-        XB_data = tl.load(XB)
-        XC_data = tl.load(XC)
-        coeff_data = tl.load(coeff)
-        W1_init_data = tl.load(W1_init)
-        W1_grad_data = tl.load(W1_grad)
-        b1_init_data = tl.load(b1_init)
-        b1_grad_data = tl.load(b1_grad)
-        ln_weight_data = tl.load(ln_weight)
-        ln_bias_data = tl.load(ln_bias)
+    # Scale and shift
+    LN_out = ln_weight * Z1_hat + ln_bias  # [1,f] * [K=1,f] + [1,f]
 
-        Z1 = tl.sum(tl.trans(XB_data) * W1_init_data, 0) + b1_init_data  # [1,HF]: same as PT
-        reconstruction_target = XA_data - XB_data  # [1,HF]
+    dl_dLN_out = LN_out - l2_target  # [1,f]
 
-        mu = tl.sum(Z1) / HF  # [1,]
-        var = tl.sum((Z1 - mu) * (Z1 - mu)) / HF  # [1,]
-        std = tl.sqrt(var + 1e-6)
-        x_hat = (Z1 - mu) / std  # [1,f], err from PT: 4e-3
-        y = ln_weight_data * x_hat + ln_bias_data  # [1,f], err: 4.54
+    dl_dZ1_hat = dl_dLN_out * ln_weight  # [1,f]
 
-        grad_output = y - reconstruction_target  # [1,f]
-        grad_x_hat = ln_weight_data * grad_output  # [1,f]
-        grad_l_Z1 = (
-                (1.0 / HF)
-                * (
-                    HF * grad_x_hat  # [1,f]
-                    - tl.sum(grad_x_hat)  #[1,]
-                    - x_hat * tl.sum(grad_x_hat * x_hat)  # [1,f] * [1,]
-                )
-                / std
-        )  # grad_l_Z1: [1,f]
+    dl_dZ1_term_1 = HF * dl_dZ1_hat
+    dl_dZ1_term_2 = tl.sum(dl_dZ1_hat, 1)
+    dl_dZ1_term_3 = Z1_hat * tl.sum(dl_dZ1_hat * Z1_hat, 1)
+    dl_dZ1_sum = dl_dZ1_term_1 + dl_dZ1_term_2 + dl_dZ1_term_3
+    dl_dZ1 = dl_dZ1_sum / (std * HF * 100)
+    dl_dZ1 = dl_dZ1 * 100.
 
-        W1_grad_data += (tl.trans(XB_data) * grad_l_Z1)  # @xinhao: tl.dot(tl.trans(XB_chunk), Z1) doesn't support [HF,1] @ [1,HF]
-        b1_grad_data += grad_l_Z1
-        W1_init_data -= coeff_data * W1_grad_data
-        b1_init_data -= coeff_data * b1_grad_data
-        Z1_bar = tl.sum(tl.trans(XC_data) * W1_init_data, 0) + b1_init_data  # Z1_bar
+    ilr_mul_dl_dZ1 = ilr_gated * dl_dZ1  # [K=1,1] * [K=1,f]
 
-        # Post LN
-        mu = tl.sum(Z1_bar) / HF  # [1,]
-        var = tl.sum((Z1_bar - mu) * (Z1_bar - mu)) / HF  # [1,]
-        std = tl.sqrt(var + 1e-6)
-        x_hat_bar = (Z1_bar - mu) / std  # [1,f]
-        Z1_bar = XC_data + (ln_weight_data * x_hat_bar + ln_bias_data)  # XC + LN(Z1_bar): [1,f]
+    ##
+    W1_grad += tl.trans(XB) * ilr_mul_dl_dZ1
+    b1_grad += ilr_mul_dl_dZ1
 
-        tl.store(Out, Z1_bar.to(O_dtype))
-        # tl.store(Out, x_hat.to(O_dtype))  # cg err
-        # tl.store(Out, Z1.to(O_dtype))
-        # tl.store(Out, reconstruction_target.to(O_dtype))
-        # tl.store(Out, XC_data.to(O_dtype))
+    W1_bar = W1 - token_idx * W1_grad
+    b1_bar = b1 - token_idx * b1_grad
 
-        tl.store(W1_grad, W1_grad_data.to(W_dtype))
-        tl.store(b1_grad, b1_grad_data.to(W_dtype))
+    Z1_bar = tl.sum(tl.trans(XC) * W1_bar, axis=0)[None, :] + b1_bar
 
-    @triton.autotune(
-        configs=[
-            triton.Config({}, num_stages=1, num_warps=8),
-            triton.Config({}, num_stages=1, num_warps=4),
-            triton.Config({}, num_stages=1, num_warps=2),
-        ],
-        key=['HF'],
-        restore_value=['W1_init', 'W1_grad', 'b1_init', 'b1_grad'],
-    )
-    @triton.jit
-    def _m1_decode_end_chunk_kernel(
-            W1_init, W1_grad, b1_init, b1_grad,
-            XA, XB, XC, coeff, Out,
-            ln_weight, ln_bias,
-
-            stride_w_batch, stride_w_head, stride_w_in, stride_w_out,
-            stride_b_batch, stride_b_head, stride_b_in, stride_b_out,
-            stride_ln_head, stride_ln_f,
-            stride_x_batch, stride_x_head, stride_x_n, stride_x_f,
-            stride_coeff_batch, stride_coeff_head,
-            CS: tl.constexpr, HF: tl.constexpr
-    ):
-        batch = tl.program_id(0)
-        head = tl.program_id(1)
-
-        rc = tl.arange(0, CS)
-        rf = tl.arange(0, HF)
-
-        W_dtype = W1_init.type.element_ty
-        O_dtype = Out.type.element_ty
-
-        abco_offset = batch * stride_x_batch + head * stride_x_head
-        coeff_offset = batch * stride_coeff_batch + head * stride_coeff_head
-
-        w_offset = batch * stride_w_batch + head * stride_w_head
-        b_offset = batch * stride_b_batch + head * stride_b_head
-        ln_offset = head * stride_ln_head
-
-        XA = XA + abco_offset + (rc[:, None] * stride_x_n + rf[None, :] * stride_x_f)
-        XB = XB + abco_offset + (rc[:, None] * stride_x_n + rf[None, :] * stride_x_f)
-        XC = XC + abco_offset + (rc[:, None] * stride_x_n + rf[None, :] * stride_x_f)
-        Out = Out + abco_offset + (rf[None, :] * stride_x_f)
-        coeff = coeff + coeff_offset
-
-        W1_init = W1_init + w_offset + (rf[:, None] * stride_w_in + rf[None, :] * stride_w_out)  # [f,f]
-        W1_grad = W1_grad + w_offset + (rf[:, None] * stride_w_in + rf[None, :] * stride_w_out)
-
-        b1_init = b1_init + b_offset + rf[None, :] * stride_b_out  # [1,f]
-        b1_grad = b1_grad + b_offset + rf[None, :] * stride_b_out
-
-        ln_weight = ln_weight + ln_offset + rf[None, :] * stride_ln_f  # [1,f]
-        ln_bias = ln_bias + ln_offset + rf[None, :] * stride_ln_f
-
-        XA_data = tl.load(XA)
-        XB_data = tl.load(XB)
-        XC_data = tl.load(XC)
-        coeff_data = tl.load(coeff)
-        W1_init_data = tl.load(W1_init)
-        W1_grad_data = tl.load(W1_grad)
-        b1_init_data = tl.load(b1_init)
-        b1_grad_data = tl.load(b1_grad)
-
-        ln_weight_data = tl.load(ln_weight)
-        ln_bias_data = tl.load(ln_bias)
-
-        Z1 = tl.sum(tl.trans(XB_data) * W1_init_data, 0) + b1_init_data  # [1,HF]: same as PT
-        reconstruction_target = XA_data - XB_data  # [1,HF]
-
-        mu = tl.sum(Z1) / HF  # [1,]
-        var = tl.sum((Z1 - mu) * (Z1 - mu)) / HF  # [1,]
-        std = tl.sqrt(var + 1e-6)
-        x_hat = (Z1 - mu) / std  # [1,f], err from PT: 4e-3
-        y = ln_weight_data * x_hat + ln_bias_data  # [1,f], err: 4.54
-
-        grad_output = y - reconstruction_target  # [1,f]
-        grad_x_hat = ln_weight_data * grad_output  # [1,f]
-        grad_l_Z1 = (
-                (1.0 / HF)
-                * (
-                    HF * grad_x_hat  # [1,f]
-                    - tl.sum(grad_x_hat)  #[1,]
-                    - x_hat * tl.sum(grad_x_hat * x_hat)  # [1,f] * [1,]
-                )
-                / std
-        )  # grad_l_Z1: [1,f]
-
-        W1_grad_data += (tl.trans(XB_data) * grad_l_Z1)  # @xinhao: tl.dot(tl.trans(XB_chunk), Z1) doesn't support [HF,1] @ [1,HF]
-        b1_grad_data += grad_l_Z1
-        W1_init_data -= coeff_data * W1_grad_data
-        b1_init_data -= coeff_data * b1_grad_data
-        Z1_bar = tl.sum(tl.trans(XC_data) * W1_init_data, 0) + b1_init_data  # Z1_bar
-
-        # Post LN
-        mu = tl.sum(Z1_bar) / HF  # [1,]
-        var = tl.sum((Z1_bar - mu) * (Z1_bar - mu)) / HF  # [1,]
-        std = tl.sqrt(var + 1e-6)
-        x_hat_bar = (Z1_bar - mu) / std  # [1,f]
-        Z1_bar = XC_data + (ln_weight_data * x_hat_bar + ln_bias_data)  # XC + LN(Z1_bar): [1,f]
-
-        tl.store(Out, Z1_bar.to(O_dtype))
-        tl.store(W1_init, W1_init_data.to(W_dtype))
-        tl.store(W1_grad, tl.zeros_like(W1_grad_data).to(W_dtype))
-        tl.store(b1_init, b1_init_data.to(W_dtype))
-        tl.store(b1_grad, tl.zeros_like(b1_grad_data).to(W_dtype))
-
-else:
-    @triton.autotune(
-        configs=[
-            triton.Config({}, num_stages=1, num_warps=8),
-            triton.Config({}, num_stages=1, num_warps=4),
-            triton.Config({}, num_stages=1, num_warps=2),
-        ],
-        key=['HF'],
-        restore_value=['W1_init', 'W1_grad']
-    )
-    @triton.jit
-    def _m1_decode_kernel(W1_init, W1_grad, XA, XB, XC, coeff, Out,
-                          stride_wb, stride_wh, stride_wf, stride_wd,
-                          stride_ab, stride_ah, stride_ac, stride_af,
-                          stride_cb, stride_ch, stride_cn, stride_cc,
-                          CS: tl.constexpr, HF: tl.constexpr):
-        batch = tl.program_id(0)
-        head = tl.program_id(1)
-
-        rc = tl.arange(0, CS)
-        rf = tl.arange(0, HF)
-
-        W_dtype = W1_init.type.element_ty
-        O_dtype = Out.type.element_ty
-
-        abco_offset = batch * stride_ab + head * stride_ah
-        w_offset = batch * stride_wb + head * stride_wh
-        coeff_offset = batch * stride_cb + head * stride_ch
-
-        XA = XA + abco_offset + (rc[:, None] * stride_ac + rf[None, :] * stride_af)
-        XB = XB + abco_offset + (rc[:, None] * stride_ac + rf[None, :] * stride_af)
-        XC = XC + abco_offset + (rc[:, None] * stride_ac + rf[None, :] * stride_af)
-        Out = Out + abco_offset
-        W1_init = W1_init + w_offset + (rf[:, None] * stride_wf + rf[None, :] * stride_wd)
-        W1_grad = W1_grad + w_offset + (rf[:, None] * stride_wf + rf[None, :] * stride_wd)
-        coeff = coeff + coeff_offset + rc * stride_cc
-        Out_chunk = Out + (rf * stride_af)
-
-        XA_chunk = tl.load(XA)
-        XB_chunk = tl.load(XB)
-        XC_chunk = tl.load(XC)
-        coeff_chunk = tl.load(coeff)
-        W1_init_data = tl.load(W1_init)
-        W1_grad_data = tl.load(W1_grad)
-
-        Z1 = tl.sum(tl.trans(XB_chunk) * W1_init_data, 0) - XA_chunk
-        W1_grad_data += tl.trans(XB_chunk) * Z1
-        W1_init_data -= coeff_chunk * W1_grad_data
-        Z1_bar = tl.sum(tl.trans(XC_chunk) * W1_init_data, 0)
-
-        tl.store(Out_chunk, Z1_bar.to(Out.type.element_ty))
-        tl.store(W1_grad, W1_grad_data.to(W_dtype))
+    tl.store(_Out, Z1_bar.to(O_dtype))
+    tl.store(_W1_grad, W1_grad.to(W_dtype))
+    tl.store(_b1_grad, b1_grad.to(W_dtype))
 
 
-    @triton.autotune(
-        configs=[
-            triton.Config({}, num_stages=1, num_warps=8),
-            triton.Config({}, num_stages=1, num_warps=4),
-            triton.Config({}, num_stages=1, num_warps=2),
-        ],
-        key=['HF'],
-        restore_value=['W1_init', 'W1_grad']
-    )
-    @triton.jit
-    def _m1_decode_end_chunk_kernel(W1_init, W1_grad, XA, XB, XC, coeff, Out,
-                          stride_wb, stride_wh, stride_wf, stride_wd,
-                          stride_ab, stride_ah, stride_ac, stride_af,
-                          stride_cb, stride_ch, stride_cn, stride_cc,
-                          CS: tl.constexpr, HF: tl.constexpr):
-        batch = tl.program_id(0)
-        head = tl.program_id(1)
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_stages=1, num_warps=8),
+        triton.Config({}, num_stages=1, num_warps=4),
+        triton.Config({}, num_stages=1, num_warps=2),
+    ],
+    key=['HF'],
+    restore_value=['__W1', '__b1', '__W1_grad', '__b1_grad']
+)
+@triton.jit
+def _m1_decode_end_chunk_kernel(__W1, __W1_grad, __b1, __b1_grad,
+                                __XA, __XB, __XC,
+                                __ln_weight, __ln_bias,
+                                __ilr_gated, __token_idx, __Out,
+                                stride_w_batch, stride_w_head, stride_w_fin,
+                                stride_b_batch, stride_b_head, stride_b_f,
+                                stride_x_batch, stride_x_head, stride_x_n,
+                                stride_ln_head, stride_ln_f,
+                                stride_ilr_batch, stride_ilr_head,
+                                CS: tl.constexpr, HF: tl.constexpr):
+    batch = tl.program_id(0)
+    head = tl.program_id(1)
 
-        rc = tl.arange(0, CS)
-        rf = tl.arange(0, HF)
+    rc = tl.arange(0, CS)
+    rf = tl.arange(0, HF)
 
-        W_dtype = W1_init.type.element_ty
-        O_dtype = Out.type.element_ty
+    W_dtype = __W1.type.element_ty
+    O_dtype = __Out.type.element_ty
 
-        abco_offset = batch * stride_ab + head * stride_ah
-        w_offset = batch * stride_wb + head * stride_wh
-        coeff_offset = batch * stride_cb + head * stride_ch
+    x_block_offset = batch * stride_x_batch + head * stride_x_head
+    w_block_offset = batch * stride_w_batch + head * stride_w_head
+    b_block_offset = batch * stride_b_batch + head * stride_b_head
+    ln_block_offset = head * stride_ln_head
+    ilr_block_offset = batch * stride_ilr_batch + head * stride_ilr_head
 
-        XA = XA + abco_offset + (rc[:, None] * stride_ac + rf[None, :] * stride_af)
-        XB = XB + abco_offset + (rc[:, None] * stride_ac + rf[None, :] * stride_af)
-        XC = XC + abco_offset + (rc[:, None] * stride_ac + rf[None, :] * stride_af)
-        Out = Out + abco_offset
-        W1_init = W1_init + w_offset + (rf[:, None] * stride_wf + rf[None, :] * stride_wd)
-        W1_grad = W1_grad + w_offset + (rf[:, None] * stride_wf + rf[None, :] * stride_wd)
-        coeff = coeff + coeff_offset + rc * stride_cc
-        Out_chunk = Out + (rf * stride_af)
+    x_inner_offset = rc[:, None] * stride_x_n + rf[None, :]
+    w_inner_offset = rf[:, None] * stride_w_fin + rf[None, :]
+    b_inner_offset = rc[:, None] * stride_b_f + rf[None, :]
+    ln_inner_offset = rc[:, None] * stride_ln_f + rf[None, :]
 
-        XA_chunk = tl.load(XA)
-        XB_chunk = tl.load(XB)
-        XC_chunk = tl.load(XC)
-        coeff_chunk = tl.load(coeff)
-        W1_init_data = tl.load(W1_init)
-        W1_grad_data = tl.load(W1_grad)
+    x_offset = x_block_offset + x_inner_offset
+    w_offset = w_block_offset + w_inner_offset
+    b_offset = b_block_offset + b_inner_offset
+    ln_offset = ln_block_offset + ln_inner_offset
+    ilr_offset = ilr_block_offset
 
-        Z1 = tl.sum(tl.trans(XB_chunk) * W1_init_data, 0) - XA_chunk
-        W1_grad_data += tl.trans(XB_chunk) * Z1
-        W1_init_data -= coeff_chunk * W1_grad_data
-        Z1_bar = tl.sum(tl.trans(XC_chunk) * W1_init_data, 0)
+    _XA = __XA + x_offset
+    _XB = __XB + x_offset
+    _XC = __XC + x_offset
+    _Out = __Out + x_offset
+    _W1 = __W1 + w_offset
+    _W1_grad = __W1_grad + w_offset
+    _b1 = __b1 + b_offset
+    _b1_grad = __b1_grad + b_offset
+    _ln_weight = __ln_weight + ln_offset
+    _ln_bias = __ln_bias + ln_offset
+    _ilr_gated = __ilr_gated + ilr_offset
+    _token_idx = __token_idx
 
-        tl.store(Out_chunk, Z1_bar.to(Out.type.element_ty))
-        tl.store(W1_init, W1_init_data.to(W_dtype))
-        tl.store(W1_grad, tl.zeros_like(W1_grad_data).to(W_dtype))
+    XA = tl.load(_XA)
+    XB = tl.load(_XB)
+    XC = tl.load(_XC)
+    token_idx = tl.load(_token_idx)
+    ilr_gated = tl.load(_ilr_gated)
+    W1 = tl.load(_W1)
+    W1_grad = tl.load(_W1_grad)
+    b1 = tl.load(_b1)
+    b1_grad = tl.load(_b1_grad)
+    ln_weight = tl.load(_ln_weight)
+    ln_bias = tl.load(_ln_bias)
+
+    Z1 = tl.sum(tl.trans(XB) * W1, axis=0)[None, :] + b1  # [1,f] @ [f,f] + [1,f]
+    l2_target = XA - XB
+
+    mu = tl.sum(Z1, 1) / HF
+    var = tl.sum((Z1 - mu) * (Z1 - mu), 1) / HF
+
+    std = tl.sqrt(var + 1e-6)
+    Z1_hat = (Z1 - mu) / std  # [1,f]
+
+    # Scale and shift
+    LN_out = ln_weight * Z1_hat + ln_bias  # [1,f] * [K=1,f] + [1,f]
+
+    dl_dLN_out = LN_out - l2_target  # [1,f]
+
+    dl_dZ1_hat = dl_dLN_out * ln_weight  # [1,f]
+
+    dl_dZ1_term_1 = HF * dl_dZ1_hat
+    dl_dZ1_term_2 = tl.sum(dl_dZ1_hat, 1)
+    dl_dZ1_term_3 = Z1_hat * tl.sum(dl_dZ1_hat * Z1_hat, 1)
+    dl_dZ1_sum = dl_dZ1_term_1 + dl_dZ1_term_2 + dl_dZ1_term_3
+    dl_dZ1 = dl_dZ1_sum / (std * HF * 100)
+    dl_dZ1 = dl_dZ1 * 100.
+
+    ilr_mul_dl_dZ1 = ilr_gated * dl_dZ1  # [K=1,1] * [K=1,f]
+
+    ##
+    W1_grad += tl.trans(XB) * ilr_mul_dl_dZ1
+    b1_grad += ilr_mul_dl_dZ1
+
+    W1_bar = W1 - token_idx * W1_grad
+    b1_bar = b1 - token_idx * b1_grad
+
+    Z1_bar = tl.sum(tl.trans(XC) * W1_bar, axis=0)[None, :] + b1_bar
+
+    tl.store(_Out, Z1_bar.to(O_dtype))
+    tl.store(_W1, W1_bar.to(W_dtype))
+    tl.store(_b1, b1_bar.to(W_dtype))
+    tl.store(_W1_grad, tl.zeros_like(W1_grad).to(W_dtype))
+    tl.store(_b1_grad, tl.zeros_like(b1_grad).to(W_dtype))
 
 
 class TttM1BMMTritonModule(TttBaseModule):
@@ -1459,6 +1364,8 @@ class TttM1BMMTritonModule(TttBaseModule):
                            is_prefill=False,
                            is_last_in_chunk=False,
                            cache_params=None):
+
+        raise NotImplementedError  # @xinhao: triton decode kernel has been updated, but this module has not
 
         B_mul_NH, N, HF = inputs['XA'].shape  # [B*nh,N,f]
         B = B_mul_NH // self.num_heads
@@ -1507,7 +1414,7 @@ class TttM1BMMTritonModule(TttBaseModule):
             inputs = tree_map(lambda x: x.reshape(B, NH, N, -1), inputs)  # [B*nh,N=1,f], [B*nh,N=1,1] -> [BS,nh,N=1,f/1]
             XA, XB, XC, coeff = inputs['XA'], inputs['XB'], inputs['XC'], inputs['coeff']  # [B,nh,N,f/1]
             output = torch.empty_like(XA) # [B,nh,N,f]
-            grid = (B, NH, 1)
+
             if decode_lnb_flag:
                 # with LN and bias
                 if is_last_in_chunk:
@@ -1627,39 +1534,63 @@ class TttM1BMMTKModule(TttBaseModule):
             make_last_b_matrix[:,-1] = 1.
             make_last_coeff_1_matrix[-1,:] = 1.
 
-            tk_m1_prefill.prefill_whole_loop_LN_bias(W1_init, b1_init, ln_weight, ln_bias,
-                                                     cumsum_matrix, make_last_b_matrix, make_last_coeff_1_matrix,
-                                                     XA, XB, XC, coeff, output)
+            # tk_m1_prefill.prefill_whole_loop_LN_bias(W1_init, b1_init, ln_weight, ln_bias,
+            #                                          cumsum_matrix, make_last_b_matrix, make_last_coeff_1_matrix,
+            #                                          XA, XB, XC, coeff, output)
+            tk_m1_prefill.prefill_whole_loop_LN_bias_fp16(
+                W1_init, b1_init, ln_weight, ln_bias,
+                cumsum_matrix, make_last_b_matrix, make_last_coeff_1_matrix,
+                XA, XB, XC, coeff, output
+            )
             b1_init = b1_init[:,:,-1:,:].reshape(B_mul_NH, 1, -1)
             cache_params.params_dict["b1_states"][self.layer_idx].copy_(b1_init)
 
-            output = output.reshape(B_mul_NH, N, HF)
+            # output = output.reshape(B_mul_NH, N, HF)
 
         else:
-            states = {
-                "W1_states": cache_params.params_dict["W1_states"][self.layer_idx],
-                "b1_states": cache_params.params_dict["b1_states"][self.layer_idx],
-                "W1_grad": cache_params.params_dict["W1_grad"][self.layer_idx],
-                "b1_grad": cache_params.params_dict["b1_grad"][self.layer_idx],
-            }
+            W1 = cache_params.params_dict["W1_states"][self.layer_idx].reshape(B, NH, HF, HF)
+            b1 = cache_params.params_dict["b1_states"][self.layer_idx].reshape(B, NH, 1, HF)
+            W1_grad = cache_params.params_dict["W1_grad"][self.layer_idx].reshape(B, NH, HF, HF)
+            b1_grad = cache_params.params_dict["b1_grad"][self.layer_idx].reshape(B, NH, 1, HF)
+
+            token_idx = inputs.pop('token_idx')  # [1,1,1]
 
             # @xinhao: decoding from a prompt of length 1 will always have `inner_chunk_size=remainder=1`
-            B_mul_NH, N, HF = inputs['XA'].shape  # [B*nh,N=1,f]
+            inputs = tree_map(lambda x: x.reshape(B, NH, N, -1), inputs)  # [B*nh,N=1,f], [B*nh,N=1,1] -> [BS,nh,N=1,f/1]
+            XA, XB, XC, ilr_gated = inputs['XA'], inputs['XB'], inputs['XC'], inputs['ilr_gated']  # [B,nh,N=1,f/1]
+
+            # output = torch.empty_like(XA)  # [B,nh,N,f]
+            output = torch.zeros_like(XA)  # [B,nh,N,f]
+            grid = (B, NH, 1)
+            CS = 1
 
             if is_last_in_chunk:
-                output = self.decode_end_chunk(
-                    states,  # [B*nh,f,f], cloned from W1, safe for in-place op
-                    inputs,  # [B*nh,f]
-                    self.ln_weight,  # [nh,1,f]
-                    self.ln_bias,  # [nh,1,f]
-                )  # ret: [B*nh,N=1,f]
+                _m1_decode_end_chunk_kernel[grid](W1, W1_grad, b1, b1_grad,
+                                                  XA, XB, XC,
+                                                  self.ln_weight, self.ln_bias,
+                                                  ilr_gated, token_idx, output,
+                                                  W1.stride(0), W1.stride(1), W1.stride(2),
+                                                  b1.stride(0), b1.stride(1), b1.stride(2),
+                                                  XA.stride(0), XA.stride(1), XA.stride(2),
+                                                  self.ln_weight.stride(1), self.ln_weight.stride(2),
+                                                  ilr_gated.stride(0), ilr_gated.stride(1),
+                                                  CS, HF)
+
             else:
-                output = self.decode(
-                    states,  # [B*nh,f,f], cloned from W1, safe for in-place op
-                    inputs,  # [B*nh,f]
-                    self.ln_weight,  # [nh,1,f]
-                    self.ln_bias,  # [nh,1,f]
-                )  # ret: [B*nh,N=1,f]
+                # @xinhao: XB and XC have the same stride, but different from XA's due to different way of getting XBC and XA
+                # @xinhao: Either (1) .contiguous() in get_inner_input(), or (2) use differnt strides at triton kernel
+                _m1_decode_kernel[grid](W1, W1_grad, b1, b1_grad,
+                                        XA, XB, XC,
+                                        self.ln_weight, self.ln_bias,
+                                        ilr_gated, token_idx, output,
+                                        W1.stride(0), W1.stride(1), W1.stride(2),
+                                        b1.stride(0), b1.stride(1), b1.stride(2),
+                                        XA.stride(0), XA.stride(1), XA.stride(2),
+                                        self.ln_weight.stride(1), self.ln_weight.stride(2),
+                                        ilr_gated.stride(0), ilr_gated.stride(1),
+                                        CS, HF)
+
+        output = output.reshape(B_mul_NH, N, HF)
 
         output = self.residual_add_post_LN(XC_residual, output)  # post LN
 
