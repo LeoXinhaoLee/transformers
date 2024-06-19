@@ -219,7 +219,6 @@ class TttBaseModule(nn.Module):
         XCW_batch = F.gelu(XGate, approximate='tanh') * self.out_norm(XCW_batch)  # [B*nh,N,f] *  [B*nh,N,f]
         return XCW_batch.contiguous()
 
-
     def conv_qk(
         self,
         XCB,
@@ -1136,6 +1135,15 @@ else:
         triton.Config({}, num_stages=1, num_warps=8),
         triton.Config({}, num_stages=1, num_warps=4),
         triton.Config({}, num_stages=1, num_warps=2),
+        triton.Config({}, num_stages=2, num_warps=8),
+        triton.Config({}, num_stages=2, num_warps=4),
+        triton.Config({}, num_stages=2, num_warps=2),
+        triton.Config({}, num_stages=3, num_warps=8),
+        triton.Config({}, num_stages=3, num_warps=4),
+        triton.Config({}, num_stages=3, num_warps=2),
+        triton.Config({}, num_stages=4, num_warps=8),
+        triton.Config({}, num_stages=4, num_warps=4),
+        triton.Config({}, num_stages=4, num_warps=2),
     ],
     key=['HF'],
     restore_value=['__W1', '__b1', '__W1_grad', '__b1_grad']
@@ -1230,15 +1238,25 @@ def _m1_decode_kernel(__W1, __W1_grad, __b1, __b1_grad,
     ##
     W1_grad += tl.trans(XB) * ilr_mul_dl_dZ1
     b1_grad += ilr_mul_dl_dZ1
+    tl.store(_W1_grad, W1_grad.to(W_dtype))
+    tl.store(_b1_grad, b1_grad.to(W_dtype))
 
     W1_bar = W1 - token_idx * W1_grad
     b1_bar = b1 - token_idx * b1_grad
 
     Z1_bar = tl.sum(tl.trans(XC) * W1_bar, axis=0)[None, :] + b1_bar
 
+    ## Residual + Post LN
+    mu_bar = tl.sum(Z1_bar, 1) / HF
+    var_bar = tl.sum((Z1_bar - mu_bar) * (Z1_bar - mu_bar), 1) / HF
+    std_bar = tl.sqrt(var_bar + 1e-6)
+    Z1_bar_hat = (Z1_bar - mu_bar) / std_bar  # [1,f]
+    LN_out_bar = ln_weight * Z1_bar_hat + ln_bias  # [1,f] * [K=1,f] + [1,f]
+    Z1_bar = XC + LN_out_bar
+
     tl.store(_Out, Z1_bar.to(O_dtype))
-    tl.store(_W1_grad, W1_grad.to(W_dtype))
-    tl.store(_b1_grad, b1_grad.to(W_dtype))
+    # tl.store(_W1_grad, W1_grad.to(W_dtype))
+    # tl.store(_b1_grad, b1_grad.to(W_dtype))
 
 
 @triton.autotune(
@@ -1246,6 +1264,15 @@ def _m1_decode_kernel(__W1, __W1_grad, __b1, __b1_grad,
         triton.Config({}, num_stages=1, num_warps=8),
         triton.Config({}, num_stages=1, num_warps=4),
         triton.Config({}, num_stages=1, num_warps=2),
+        triton.Config({}, num_stages=2, num_warps=8),
+        triton.Config({}, num_stages=2, num_warps=4),
+        triton.Config({}, num_stages=2, num_warps=2),
+        triton.Config({}, num_stages=3, num_warps=8),
+        triton.Config({}, num_stages=3, num_warps=4),
+        triton.Config({}, num_stages=3, num_warps=2),
+        triton.Config({}, num_stages=4, num_warps=8),
+        triton.Config({}, num_stages=4, num_warps=4),
+        triton.Config({}, num_stages=4, num_warps=2),
     ],
     key=['HF'],
     restore_value=['__W1', '__b1', '__W1_grad', '__b1_grad']
@@ -1340,17 +1367,29 @@ def _m1_decode_end_chunk_kernel(__W1, __W1_grad, __b1, __b1_grad,
     ##
     W1_grad += tl.trans(XB) * ilr_mul_dl_dZ1
     b1_grad += ilr_mul_dl_dZ1
+    tl.store(_W1_grad, tl.zeros_like(W1_grad).to(W_dtype))
+    tl.store(_b1_grad, tl.zeros_like(b1_grad).to(W_dtype))
 
     W1_bar = W1 - token_idx * W1_grad
     b1_bar = b1 - token_idx * b1_grad
+    tl.store(_W1, W1_bar.to(W_dtype))
+    tl.store(_b1, b1_bar.to(W_dtype))
 
     Z1_bar = tl.sum(tl.trans(XC) * W1_bar, axis=0)[None, :] + b1_bar
 
+    ## Residual + Post LN
+    mu_bar = tl.sum(Z1_bar, 1) / HF
+    var_bar = tl.sum((Z1_bar - mu_bar) * (Z1_bar - mu_bar), 1) / HF
+    std_bar = tl.sqrt(var_bar + 1e-6)
+    Z1_bar_hat = (Z1_bar - mu_bar) / std_bar  # [1,f]
+    LN_out_bar = ln_weight * Z1_bar_hat + ln_bias  # [1,f] * [K=1,f] + [1,f]
+    Z1_bar = XC + LN_out_bar
+
     tl.store(_Out, Z1_bar.to(O_dtype))
-    tl.store(_W1, W1_bar.to(W_dtype))
-    tl.store(_b1, b1_bar.to(W_dtype))
-    tl.store(_W1_grad, tl.zeros_like(W1_grad).to(W_dtype))
-    tl.store(_b1_grad, tl.zeros_like(b1_grad).to(W_dtype))
+    # tl.store(_W1, W1_bar.to(W_dtype))
+    # tl.store(_b1, b1_bar.to(W_dtype))
+    # tl.store(_W1_grad, tl.zeros_like(W1_grad).to(W_dtype))
+    # tl.store(_b1_grad, tl.zeros_like(b1_grad).to(W_dtype))
 
 
 class TttM1BMMTritonModule(TttBaseModule):
@@ -1559,8 +1598,8 @@ class TttM1BMMTKModule(TttBaseModule):
             inputs = tree_map(lambda x: x.reshape(B, NH, N, -1), inputs)  # [B*nh,N=1,f], [B*nh,N=1,1] -> [BS,nh,N=1,f/1]
             XA, XB, XC, ilr_gated = inputs['XA'], inputs['XB'], inputs['XC'], inputs['ilr_gated']  # [B,nh,N=1,f/1]
 
-            # output = torch.empty_like(XA)  # [B,nh,N,f]
-            output = torch.zeros_like(XA)  # [B,nh,N,f]
+            output = torch.empty_like(XA)  # [B,nh,N,f]
+            # output = torch.zeros_like(XA)  # [B,nh,N,f]
             grid = (B, NH, 1)
             CS = 1
 
@@ -1592,7 +1631,7 @@ class TttM1BMMTKModule(TttBaseModule):
 
         output = output.reshape(B_mul_NH, N, HF)
 
-        output = self.residual_add_post_LN(XC_residual, output)  # post LN
+        # output = self.residual_add_post_LN(XC_residual, output)  # residual + postLN
 
         return output, None
 
@@ -2081,11 +2120,6 @@ class TttDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states = self.mlp_forward(hidden_states)
-        # hidden_states = torch.utils.checkpoint.checkpoint(
-        #     self.mlp_forward,
-        #     hidden_states,
-        #     use_reentrant=False,
-        # )
 
         return hidden_states, residual
 
@@ -2231,12 +2265,6 @@ class TttModel(TttPreTrainedModel):
                     is_prefill=is_prefill,
                     is_last_in_chunk=is_last_in_chunk,
                 )
-                # hidden_states, residual = torch.utils.checkpoint.checkpoint(
-                #     decoder_layer.__call__,
-                #     hidden_states, residual,
-                #     attention_mask, position_ids, cache_params, is_prefill, is_last_in_chunk,
-                #     use_reentrant=False,
-                # )
 
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
@@ -2284,14 +2312,9 @@ class TttForCausalLM(TttPreTrainedModel):
         self.model = TttModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        # if config.use_compile:
-        #     self.get_output_logits = torch.compile(self._get_output_logits)
-        # else:
-        #     self.get_output_logits = self._get_output_logits
-
         self.get_output_logits = self._get_output_logits
 
-            # Initialize weights and apply final processing
+        # Initialize weights and apply final processing
         # self.post_init()
         self.config = config
 
@@ -2398,20 +2421,6 @@ class TttForCausalLM(TttPreTrainedModel):
             is_prefill=is_prefill,
             is_last_in_chunk=is_last_in_chunk,
         )
-        # outputs = torch.utils.checkpoint.checkpoint(
-        #     self.model.__call__,
-        #     input_ids,
-        #     attention_mask,
-        #     position_ids,
-        #     inputs_embeds,
-        #     cache_params,
-        #     output_hidden_states,
-        #     return_dict,
-        #     use_cache,
-        #     is_prefill,
-        #     is_last_in_chunk,
-        #     use_reentrant=False,
-        # )
 
         hidden_states = outputs[0][:,-1:,:]  # [BS,N,F] -> [BS,1,F] to avoid OOM when prefilling
         if self.config.pretraining_tp > 1:
