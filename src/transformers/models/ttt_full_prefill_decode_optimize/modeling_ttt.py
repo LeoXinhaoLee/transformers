@@ -148,6 +148,79 @@ class TttMLP(nn.Module):
         return down_proj
 
 
+@triton.jit
+def tanh(x):
+    # Tanh is just a scaled sigmoid
+    return 2 * tl.sigmoid(2 * x) - 1
+
+
+# from xformers impl.
+@triton.jit
+def gelu(x):
+    return 0.5 * x * (1 + tanh(0.79788456 * (x + 0.044715 * x * x * x)))
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_stages=1, num_warps=8),
+        triton.Config({}, num_stages=1, num_warps=4),
+        triton.Config({}, num_stages=1, num_warps=2),
+        triton.Config({}, num_stages=2, num_warps=8),
+        triton.Config({}, num_stages=2, num_warps=4),
+        triton.Config({}, num_stages=2, num_warps=2),
+        triton.Config({}, num_stages=3, num_warps=8),
+        triton.Config({}, num_stages=3, num_warps=4),
+        triton.Config({}, num_stages=3, num_warps=2),
+        triton.Config({}, num_stages=4, num_warps=8),
+        triton.Config({}, num_stages=4, num_warps=4),
+        triton.Config({}, num_stages=4, num_warps=2),
+    ],
+    key=['F'],
+)
+@triton.jit
+def _fuse_gate_ln_kernel(__XGate, __X, __Out,
+                         __ln_weight, __ln_bias,
+                         stride_x_batch,
+                         F: tl.constexpr):
+    batch = tl.program_id(0)
+
+    rf = tl.arange(0, F)
+
+    O_dtype = __Out.type.element_ty
+
+    x_block_offset = batch * stride_x_batch
+
+    x_inner_offset = rf[None, :]
+    ln_inner_offset = rf[None, :]
+
+    x_offset = x_block_offset + x_inner_offset
+    ln_offset = ln_inner_offset
+
+    _XGate = __XGate + x_offset
+    _X = __X + x_offset
+    _Out = __Out + x_offset
+    _ln_weight = __ln_weight + ln_offset
+    _ln_bias = __ln_bias + ln_offset
+
+    XGate = tl.load(_XGate)
+    X = tl.load(_X)
+    ln_weight = tl.load(_ln_weight)
+    ln_bias = tl.load(_ln_bias)
+
+    ## LN(X)
+    mu = tl.sum(X, 1) / F
+    var = tl.sum((X - mu) * (X - mu), 1) / F
+    std = tl.sqrt(var + 1e-6)
+    X_hat = (X - mu) / std  # [1,f]
+    LN_X = ln_weight * X_hat + ln_bias  # [1,f] * [K=1,f] + [1,f]
+
+    ## gelu(XGate)
+    XGate_activated = gelu(XGate)
+
+    output = XGate_activated * LN_X
+    tl.store(_Out, output.to(O_dtype))
+
+
 class TttBaseModule(nn.Module):
 
     def __init__(self, config: TttConfig, layer_idx: Optional[int] = None):
@@ -191,7 +264,6 @@ class TttBaseModule(nn.Module):
             padding=self.conv_kernel - 1,
         )
 
-        self.decoder_ln_fn = partial(F.layer_norm, normalized_shape=[self.head_dim], eps=1e-6)
         # @xinhao: ln_weight and _bias must be normal tensor instead of nn.Parameter, otherwise will have triton error
         ln_weight_data = nn.LayerNorm(self.head_dim).weight.data
         # self.ln_weight = nn.Parameter(torch.tile(ln_weight_data.reshape(1, 1, 1, -1), (1, self.num_heads, 1, 1)))  # [1,h,1,f]
@@ -200,7 +272,11 @@ class TttBaseModule(nn.Module):
         # self.ln_bias = nn.Parameter(torch.tile(ln_bias_data.reshape(1, 1, 1, -1), (1, self.num_heads, 1, 1)))  # [1,h,1,f]
         self.ln_bias = torch.tile(ln_bias_data.reshape(1, 1, 1, -1), (1, self.num_heads, 1, 1)).to(self.config.dtype).to('cuda') * 1.
 
-        self.out_norm = nn.LayerNorm(self.hidden_size)
+        # self.out_norm = nn.LayerNorm(self.hidden_size)
+        out_ln_weight_data = nn.LayerNorm(self.hidden_size).weight.data
+        out_ln_bias_data = nn.LayerNorm(self.hidden_size).bias.data
+        self.out_ln_weight_data = out_ln_weight_data.to(self.config.dtype).to('cuda')  # [1,F]
+        self.out_ln_bias_data = out_ln_bias_data.to(self.config.dtype).to('cuda')
 
         if self.config.use_compile:
             self.residual_add_post_LN = torch.compile(self._residual_add_post_LN)
@@ -209,15 +285,31 @@ class TttBaseModule(nn.Module):
             self.residual_add_post_LN = self._residual_add_post_LN
             self.gate_out_norm = self._gate_out_norm
 
+        # self.decode_gate_out_norm = self._gate_out_norm
+        self.decode_gate_out_norm = self._decode_gate_out_norm
+
     def _residual_add_post_LN(self, XC, XCW_batch):
         XCW_batch = XC + ln_fwd(XCW_batch, self.ln_weight, self.ln_bias)  # post LN
         return XCW_batch
 
     def _gate_out_norm(self, B, N, XGate, XCW_batch):
-        XGate = XGate.reshape(B, self.num_heads, N, self.head_dim).permute(0, 2, 1, 3).reshape(B, N, - 1)
-        XCW_batch = XCW_batch.reshape(B, self.num_heads, N, self.head_dim).permute(0, 2, 1, 3).reshape(B, N, - 1)
+        XGate = XGate.reshape(B, self.num_heads, N, self.head_dim).permute(0, 2, 1, 3).reshape(B, N, -1)
+        XCW_batch = XCW_batch.reshape(B, self.num_heads, N, self.head_dim).permute(0, 2, 1, 3).reshape(B, N, -1)
         XCW_batch = F.gelu(XGate, approximate='tanh') * self.out_norm(XCW_batch)  # [B*nh,N,f] *  [B*nh,N,f]
         return XCW_batch.contiguous()
+
+    def _decode_gate_out_norm(self, B, N, XGate, XCW_batch):
+        XGate = XGate.reshape(B, self.num_heads,
+                              N, self.head_dim).permute(0, 2, 1, 3).reshape(B, N, -1).contiguous()
+        XCW_batch = XCW_batch.reshape(B, self.num_heads,
+                                      N, self.head_dim).permute(0, 2, 1, 3).reshape(B, N, -1).contiguous()
+        output = torch.empty_like(XCW_batch)  # [B,N,F]
+        grid = (B, 1, 1)
+        _fuse_gate_ln_kernel[grid](XGate, XCW_batch, output,
+                                   self.out_ln_weight_data, self.out_ln_bias_data,
+                                   XCW_batch.stride(0),
+                                   self.hidden_size)
+        return output
 
     def conv_qk(
         self,
@@ -371,7 +463,7 @@ class TttBaseModule(nn.Module):
         inner_chunk_size: Optional[int] = None,
         last_chunk_params_dic: Optional[Dict[str, torch.Tensor]] = None,
         return_params: Optional[bool] = False,
-        is_prefill: Optional[bool] = None,
+        is_prefill: Optional[bool] = False,
         is_last_in_chunk: Optional[bool] = None,
     ):
         XC, XB, XA, token_idx, ilr_gated, XGate = self.get_inner_loop_inputs(
@@ -397,7 +489,11 @@ class TttBaseModule(nn.Module):
         # XC = XB = XA = XGate = hidden_states.reshape(B, N, self.num_heads, self.head_dim).permute(0,2,1,3).reshape(-1, N, self.head_dim)
         # XCW_batch = XA + XB + XC; batch_params_dict = None
 
-        XCW_batch = self.gate_out_norm(B, N, XGate, XCW_batch)
+        if is_prefill:
+            XCW_batch = self.gate_out_norm(B, N, XGate, XCW_batch)
+        else:
+            XCW_batch = self.decode_gate_out_norm(B, N, XGate, XCW_batch)
+
         z_batch = self.project_inner_loop_outputs(XCW_batch)  # [B,N,F]
 
         if return_params:
@@ -1599,7 +1695,6 @@ class TttM1BMMTKModule(TttBaseModule):
             XA, XB, XC, ilr_gated = inputs['XA'], inputs['XB'], inputs['XC'], inputs['ilr_gated']  # [B,nh,N=1,f/1]
 
             output = torch.empty_like(XA)  # [B,nh,N,f]
-            # output = torch.zeros_like(XA)  # [B,nh,N,f]
             grid = (B, NH, 1)
             CS = 1
 
