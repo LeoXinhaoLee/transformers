@@ -169,8 +169,7 @@ tags
 .ruff_cache
 
 # Xinhao's dev
-*NLP*.sh
-*GCP*.sh
+*.sh
 *.out
 exp
 profile

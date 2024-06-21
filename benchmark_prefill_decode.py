@@ -103,7 +103,18 @@ is_ttt = args.model_name.startswith("ttt")
 if is_mamba:
     assert not args.use_compile, "Mamba does not support torch.compile!"
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
-    model = MambaLMHeadModel.from_pretrained(args.model_name, device=device, dtype=dtype)
+    # model = MambaLMHeadModel.from_pretrained(args.model_name, device=device, dtype=dtype)
+    config = {
+        "d_model": 2048,
+        "n_layer": 48,
+        "vocab_size": 32000,  # llama2 tokenizer's vocab size
+        "ssm_cfg": {},
+        "rms_norm": True,
+        "residual_in_fp32": True,
+        "fused_add_norm": True,
+        "pad_vocab_size_multiple": 8
+    }
+    model = MambaLMHeadModel(**config, device=device, dtype=dtype)
 elif is_ttt:
     ttt_size = args.model_name.split('-')[-1]
     if ttt_size == 'profile':
@@ -111,7 +122,7 @@ elif is_ttt:
     elif ttt_size not in TTT_STANDARD_CONFIGS.keys():
         raise NotImplementedError(f"TTT Config {args.model_name} Not Implemented!")
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
-    ttt_config = TttConfig(**TTT_STANDARD_CONFIGS[ttt_size])
+    ttt_config = TttConfig(**TTT_STANDARD_CONFIGS[ttt_size], vocab_size=32000)
     ttt_config.inner_net = args.inner_net
     ttt_config.use_compile = args.use_compile
     ttt_config.dtype = dtype
@@ -123,7 +134,7 @@ elif is_ttt:
     model = TttForCausalLM(ttt_config).to(device=device, dtype=dtype)
 else:
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")  # meta-llama/Llama-2-7b
-    config = LlamaConfig.from_json_file('./llama_config/config.json')  # 1B llama config
+    config = LlamaConfig.from_json_file('./llama_config/config.json')  # 1B llama config, vocab size=32000
     config._attn_implementation = args.attn_impl  # @xinhao: llama config use `_attn_implementation` to select attn
     config.dtype = dtype
     model = LlamaForCausalLM(config).to(device=device, dtype=dtype)
