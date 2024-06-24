@@ -43,7 +43,9 @@ dtype = torch.float16  # @xinhao: follow mamba benchmark
 config = LlamaConfig.from_json_file('./llama_config/config_1b.json')  # 1B llama config
 config._attn_implementation = args.attn_impl  # @xinhao: llama config use `_attn_implementation` to select attn
 model = LlamaForCausalLM(config).to(dtype=dtype)
-model.push_to_hub("LeoLearntoCode/llama-1.3b")
+# model.push_to_hub("LeoLearntoCode/llama-1.3b")
+model.push_to_hub("LeoLearntoCode/llama-1.3b-16k")
+
 #
 # config = LlamaConfig.from_json_file('./llama_config/config_125m.json')  # 1B llama config
 # config._attn_implementation = args.attn_impl  # @xinhao: llama config use `_attn_implementation` to select attn

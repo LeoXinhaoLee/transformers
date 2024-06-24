@@ -8,7 +8,7 @@
   "hidden_size": 2048,
   "initializer_range": 0.02,
   "intermediate_size": 5504,
-  "max_position_embeddings": 16384,
+  "max_position_embeddings": 8200,
   "model_type": "llama",
   "num_attention_heads": 32,
   "num_hidden_layers": 24,
@@ -21,5 +21,5 @@
   "torch_dtype": "float16",
   "transformers_version": "4.31.0",
   "use_cache": true,
-  "vocab_size": 50277
+  "vocab_size": 32000
 }

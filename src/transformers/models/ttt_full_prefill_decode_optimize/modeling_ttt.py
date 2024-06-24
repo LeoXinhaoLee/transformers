@@ -272,9 +272,9 @@ class TttBaseModule(nn.Module):
         # self.ln_bias = nn.Parameter(torch.tile(ln_bias_data.reshape(1, 1, 1, -1), (1, self.num_heads, 1, 1)))  # [1,h,1,f]
         self.ln_bias = torch.tile(ln_bias_data.reshape(1, 1, 1, -1), (1, self.num_heads, 1, 1)).to(self.config.dtype).to('cuda') * 1.
 
-        # self.out_norm = nn.LayerNorm(self.hidden_size)
-        out_ln_weight_data = nn.LayerNorm(self.hidden_size).weight.data
-        out_ln_bias_data = nn.LayerNorm(self.hidden_size).bias.data
+        self.out_norm = nn.LayerNorm(self.hidden_size)
+        out_ln_weight_data = self.out_norm.weight.data
+        out_ln_bias_data = self.out_norm.bias.data
         self.out_ln_weight_data = out_ln_weight_data.to(self.config.dtype).to('cuda')  # [1,F]
         self.out_ln_bias_data = out_ln_bias_data.to(self.config.dtype).to('cuda')
 
@@ -586,7 +586,6 @@ def m1_prefill_chunk(states, inputs, i, ln_weight, ln_bias, Attn_b):
     Z1 = XB_chunk @ W1_init + b1_init  # [B*nh,K,f] @ [B*nh,f,f] -> [B*nh,K,f]
     reconstruction_target = XA_chunk - XB_chunk
     grad_l_wrt_Z1 = ln_fused_l2_bwd(Z1, reconstruction_target, ln_weight, ln_bias)  # [B*nh,K=1,f]: torch.compile makes it a lot faster
-    # grad_l_wrt_Z1 = Z1 - reconstruction_target
 
     b1_bar = b1_init - (coeff_chunk * Attn_b) @ grad_l_wrt_Z1
 
@@ -738,58 +737,38 @@ class TttM1BMMModule(TttBaseModule):
 
 ####### M2 Decode Module #######
 ## With LN
-# def m2_prefill_chunk(states, inputs, i, ln_weight, ln_bias):
-#     W1_init = states['W1_states']
-#     b1_init = states['b1_states']
-#     W2_init = states['W2_states']
-#     b2_init = states['b2_states']
-#     XA_chunk, XB_chunk, XC_chunk, \
-#     coeff_chunk, coeff_chunk_last = inputs['XA'][i], inputs['XB'][i], inputs['XC'][i], \
-#                                     inputs['coeff'][i], inputs['coeff_last'][i]
-#
-#     Z1 = XB_chunk @ W1_init + b1_init  # [B*nh,K,f] @ [B*nh,f,f] -> [B*nh,K,f]
-#     X2 = F.gelu(Z1, approximate='tanh')
-#     Z2 = X2 @ W2_init + b2_init
-#     reconstruction_target = XA_chunk - XB_chunk
-#     grad_l_wrt_Z2 = ln_fused_l2_bwd(Z2, reconstruction_target, ln_weight, ln_bias)  # [B*nh,K=1,f]
-#     grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2_init.transpose(-1, -2) * diff_gelu(Z1)
-#
-#     b1_bar = b1_init - coeff_chunk * torch.cumsum(grad_l_wrt_Z1, dim=1)  # [B*nh,1,f] - [B*nh,K,1] * [B*nh,K,f]
-#     Attn1 = torch.tril(XC_chunk @ XB_chunk.transpose(-1, -2))  # [B*nh,K,K]
-#     Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1 + b1_bar  # [B*nh,K,f] @ [B*nh,f,f] - ([B*nh,K,1] * [B*nh,K,K]) @ [B*nh,K,f]
-#     X2_bar = F.gelu(Z1_bar, approximate='tanh')  # X2_bar
-#
-#     b2_bar = b2_init - coeff_chunk * torch.cumsum(grad_l_wrt_Z2, dim=1)  # [B*nh,1,f] - [B*nh,K,1] * [B*nh,K,f]
-#     Attn2 = torch.tril(X2_bar @ X2.transpose(-1, -2))  # [B*nh,K,K]
-#     Z2_bar = X2_bar @ W2_init - (coeff_chunk * Attn2) @ grad_l_wrt_Z2 + b2_bar
-#
-#     W1_init.sub_((coeff_chunk_last * XB_chunk).transpose(-1, -2) @ grad_l_wrt_Z1)  # in-place update: [B*nh,f,f] - ([B*nh,1,1] * [B*nh,K,f].t) @ [B*nh,K,f]
-#     b1_init.copy_(b1_bar[:,-1:])
-#     W2_init.sub_((coeff_chunk_last * X2).transpose(-1, -2) @ grad_l_wrt_Z2)  # in-place update: [B*nh,f,f] - ([B*nh,1,1] * [B*nh,K,f].t) @ [B*nh,K,f]
-#     b2_init.copy_(b2_bar[:, -1:])
-#     return Z2_bar
-
-def m2_prefill_chunk(states, inputs, i, ln_weight, ln_bias):
+def m2_prefill_chunk(states, inputs, i, ln_weight, ln_bias, Attn_b):
     W1_init = states['W1_states']
+    b1_init = states['b1_states']
     W2_init = states['W2_states']
+    b2_init = states['b2_states']
     XA_chunk, XB_chunk, XC_chunk, \
     coeff_chunk, coeff_chunk_last = inputs['XA'][i], inputs['XB'][i], inputs['XC'][i], \
-                                    inputs['coeff'][i], inputs['coeff_last'][i]
+                                    inputs['coeff'][i], inputs['coeff_last'][i]  # [B*nh,CS,CS], [B*nh,1,CS]
 
-    Z1 = XB_chunk @ W1_init  # [B*nh,K,f] @ [B*nh,f,f] -> [B*nh,K,f]
-    Z2 = Z1 @ W2_init
-    reconstruction_target = XA_chunk - XB_chunk
-    grad_l_wrt_Z2 = Z2 - reconstruction_target  # [B*nh,K=1,f]
-    grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2_init.transpose(-1, -2)
+    Z1 = XB_chunk @ W1_init + b1_init  # [B*nh,K,f] @ [B*nh,f,4f] + [B*nh,1,4f] -> [B*nh,K,4f]
+    X2 = F.gelu(Z1, approximate='tanh')
+    Z2 = X2 @ W2_init + b2_init
 
+    l2_target = XA_chunk - XB_chunk
+    grad_l_wrt_Z2 = ln_fused_l2_bwd(Z2, l2_target, ln_weight, ln_bias)  # [B*nh,K=1,f]
+    grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2_init.transpose(-1, -2) * diff_gelu(Z1)
+
+    b1_bar = b1_init - (coeff_chunk * Attn_b) @ grad_l_wrt_Z1  # [B*nh,1,4f] - ([B*nh,K,K] * [K,K]) @ [B*nh,K,4f]
     Attn1 = torch.tril(XC_chunk @ XB_chunk.transpose(-1, -2))  # [B*nh,K,K]
-    Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1  # [B*nh,K,f] @ [B*nh,f,f] - ([B*nh,K,1] * [B*nh,K,K]) @ [B*nh,K,f]
+    Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1 + b1_bar  # [B*nh,K,f] @ [B*nh,f,4f] - ([K,K] * [B*nh,K,K]) @ [B*nh,K,4f] + [B*nh,K,4f]
 
-    Attn2 = torch.tril(Z1_bar @ Z1.transpose(-1, -2))  # [B*nh,K,K]
-    Z2_bar = Z1_bar @ W2_init - (coeff_chunk * Attn2) @ grad_l_wrt_Z2
+    X2_bar = F.gelu(Z1_bar, approximate='tanh')
 
-    W1_init.sub_((coeff_chunk_last * XB_chunk).transpose(-1, -2) @ grad_l_wrt_Z1)  # in-place update: [B*nh,f,f] - ([B*nh,1,1] * [B*nh,K,f].t) @ [B*nh,K,f]
-    W2_init.sub_((coeff_chunk_last * Z1).transpose(-1, -2) @ grad_l_wrt_Z2)  # in-place update: [B*nh,f,f] - ([B*nh,1,1] * [B*nh,K,f].t) @ [B*nh,K,f]
+    b2_bar = b2_init - (coeff_chunk * Attn_b) @ grad_l_wrt_Z2  # [B*nh,1,4f] - ([B*nh,K,K] * [K,K]) @ [B*nh,K,4f]
+    Attn2 = torch.tril(X2_bar @ X2.transpose(-1, -2))  # [B*nh,K,K]
+    Z2_bar = X2_bar @ W2_init - (coeff_chunk * Attn2) @ grad_l_wrt_Z2 + b2_bar
+
+    W1_init.sub_((coeff_chunk_last * XB_chunk.transpose(-1, -2)) @ grad_l_wrt_Z1)  # in-place update: [B*nh,f,4f] - ([B*nh,1,K] * [B*nh,K,f].t) @ [B*nh,K,4f]
+    b1_init.copy_(b1_bar[:,-1:])
+    W2_init.sub_((coeff_chunk_last * X2.transpose(-1, -2)) @ grad_l_wrt_Z2)  # in-place update: [B*nh,4f,f] - ([B*nh,1,K] * [B*nh,K,4f].t) @ [B*nh,K,f]
+    b2_init.copy_(b2_bar[:, -1:])
+
     return Z2_bar
 
 def m2_decode_end_chunk(states, inputs, ln_weight, ln_bias):
@@ -803,29 +782,30 @@ def m2_decode_end_chunk(states, inputs, ln_weight, ln_bias):
     b2_grad = states['b2_grad']
 
     XA_chunk, XB_chunk, \
-    XC_chunk, coeff_chunk = inputs['XA'], inputs['XB'], inputs['XC'], inputs['coeff']
+    XC_chunk, token_idx, ilr_gated = inputs['XA'], inputs['XB'], inputs['XC'], \
+                                     inputs['token_idx'], inputs['ilr_gated']  # [B*nh,N=1,f], [1,1,1], [B*nh,N=1,1]
 
-    Z1 = XB_chunk @ W1_init + b1_init  # [B*nh,K=1,f] @ [B*nh,f,f] -> [B*nh,K=1,f]
+    Z1 = XB_chunk @ W1_init + b1_init  # [B*nh,K=1,f] @ [B*nh,f,f] + [B*nh,1,f] -> [B*nh,K=1,f]
     X2 = F.gelu(Z1, approximate='tanh')
     Z2 = X2 @ W2_init + b2_init
 
-    reconstruction_target = XA_chunk - XB_chunk
-    grad_l_wrt_Z2 = ln_fused_l2_bwd(Z2, reconstruction_target, ln_weight, ln_bias)  # [B*nh,K=1,f]
-    grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2_init.transpose(-1, -2) * diff_gelu(Z1)
+    l2_target = XA_chunk - XB_chunk
+    grad_l_wrt_Z2 = ilr_gated * ln_fused_l2_bwd(Z2, l2_target, ln_weight, ln_bias)  # [B*nh,K=1,f]
+    grad_l_wrt_Z1 = ilr_gated * (grad_l_wrt_Z2 @ W2_init.transpose(-1, -2) * diff_gelu(Z1))  # [B*nh,K=1,4f]
 
-    W1_grad.add_(XB_chunk.transpose(-1, -2) @ grad_l_wrt_Z1)  # [B*nh,1,f].t @ [B*nh,1,f] + [B*nh,f,f]
+    W1_grad.add_(XB_chunk.transpose(-1, -2) @ grad_l_wrt_Z1)  # [B*nh,1,f].t @ [B*nh,1,4f]
     b1_grad.add_(grad_l_wrt_Z1)
-    W1_init.sub_(coeff_chunk * W1_grad)
-    b1_init.sub_(coeff_chunk * b1_grad)
+    W1_init.sub_(token_idx * W1_grad)
+    b1_init.sub_(token_idx * b1_grad)
     Z1_bar = XC_chunk @ W1_init + b1_init  # [B*nh,K=1,f] @ ([B*nh,f,f] - [B*nh,1,1] * [B*nh,f,f])
+
     X2_bar = F.gelu(Z1_bar, approximate='tanh')
 
-    W2_grad.add_(X2.transpose(-1, -2) @ grad_l_wrt_Z2)  # [B*nh,f,f]
+    W2_grad.add_(X2.transpose(-1, -2) @ grad_l_wrt_Z2)  # [B*nh,K,4f].t @ [B*nh,K,f]
     b2_grad.add_(grad_l_wrt_Z2)
-    W2_init.sub_(coeff_chunk * W2_grad)
-    b2_init.sub_(coeff_chunk * b2_grad)
+    W2_init.sub_(token_idx * W2_grad)
+    b2_init.sub_(token_idx * b2_grad)
     Z2_bar = X2_bar @ W2_init + b2_init  # [B*nh,K=1,f]
-    Z2_bar = XC_chunk + ln_fwd(Z2_bar, ln_weight, ln_bias)
 
     W1_grad.zero_()
     b1_grad.zero_()
@@ -845,31 +825,33 @@ def m2_decode(states, inputs, ln_weight, ln_bias):
     b2_grad = states['b2_grad']
 
     XA_chunk, XB_chunk, \
-    XC_chunk, coeff_chunk = inputs['XA'], inputs['XB'], inputs['XC'], inputs['coeff']
+    XC_chunk, token_idx, ilr_gated = inputs['XA'], inputs['XB'], inputs['XC'], \
+                                     inputs['token_idx'], inputs['ilr_gated']  # [B*nh,N=1,f], [1,1,1], [B*nh,N=1,1]
 
     Z1 = XB_chunk @ W1_init + b1_init  # [B*nh,K=1,f] @ [B*nh,f,f] + [B*nh,1,f] -> [B*nh,K=1,f]
     X2 = F.gelu(Z1, approximate='tanh')
     Z2 = X2 @ W2_init + b2_init
 
-    reconstruction_target = XA_chunk - XB_chunk
-    grad_l_wrt_Z2 = ln_fused_l2_bwd(Z2, reconstruction_target, ln_weight, ln_bias)  # [B*nh,K=1,f]
-    grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2_init.transpose(-1, -2) * diff_gelu(Z1)
+    l2_target = XA_chunk - XB_chunk
+    grad_l_wrt_Z2 = ilr_gated * ln_fused_l2_bwd(Z2, l2_target, ln_weight, ln_bias)  # [B*nh,K=1,f]
+    grad_l_wrt_Z1 = ilr_gated * (grad_l_wrt_Z2 @ W2_init.transpose(-1, -2) * diff_gelu(Z1))  # [B*nh,K=1,4f]
 
-    W1_grad.add_(XB_chunk.transpose(-1, -2) @ grad_l_wrt_Z1)  # [B*nh,1,f].t @ [B*nh,1,f] + [B*nh,f,f]
+    W1_grad.add_(XB_chunk.transpose(-1, -2) @ grad_l_wrt_Z1)  # [B*nh,1,f].t @ [B*nh,1,4f]
     b1_grad.add_(grad_l_wrt_Z1)
-    W1_last = W1_init - (coeff_chunk * W1_grad)
-    b1_last = b1_init - (coeff_chunk * b1_grad)
+    W1_last = W1_init - token_idx * W1_grad
+    b1_last = b1_init - token_idx * b1_grad
     Z1_bar = XC_chunk @ W1_last + b1_last  # [B*nh,K=1,f] @ ([B*nh,f,f] - [B*nh,1,1] * [B*nh,f,f])
+
     X2_bar = F.gelu(Z1_bar, approximate='tanh')
 
-    W2_grad.add_(X2.transpose(-1, -2) @ grad_l_wrt_Z2)  # [B*nh,f,f]
+    W2_grad.add_(X2.transpose(-1, -2) @ grad_l_wrt_Z2)  # [B*nh,K,4f].t @ [B*nh,K,f]
     b2_grad.add_(grad_l_wrt_Z2)
-    W2_last = W2_init - (coeff_chunk * W2_grad)
-    b2_last = b2_init - (coeff_chunk * b2_grad)
+    W2_last = W2_init - token_idx * W2_grad
+    b2_last = b2_init - token_idx * b2_grad
     Z2_bar = X2_bar @ W2_last + b2_last  # [B*nh,K=1,f]
-    Z2_bar = XC_chunk + ln_fwd(Z2_bar, ln_weight, ln_bias)
 
     return Z2_bar
+
 
 class TttM2BMMModule(TttBaseModule):
     def __init__(self, config: TttConfig, layer_idx: Optional[int] = None):
@@ -902,19 +884,25 @@ class TttM2BMMModule(TttBaseModule):
             "b2_states": cache_params.params_dict["b2_states"][self.layer_idx],
             "b2_grad": cache_params.params_dict["b2_grad"][self.layer_idx],
         }
+        XC_residual = inputs['XC']
 
         if is_prefill:
             B_mul_NH, N, HF = inputs['XA'].shape  # [B*nh,N,f]
             NC = N // inner_chunk_size
             inputs = tree_map(lambda x: x.reshape(B_mul_NH, NC, inner_chunk_size, -1).transpose(1, 0).contiguous(),
                               inputs)  # [B*nh,N,f] -> [B*nh,NC,CS,f] -> [NC,B*nh,CS,f]
-            inputs['coeff_last'] = inputs['coeff'][..., -1:, :]  # pre-sclice: [NC,B*nh,1,1]
+            ilr_gated = inputs.pop('ilr_gated').transpose(-1, -2)  # [NC,B*nh,1,CS]
+            inputs['coeff'] = self.token_idx * ilr_gated  # [1,1,CS,1] * [NC,B*nh,1,CS] -> [NC,B*nh,CS,CS]
+            inputs['coeff_last'] = inputs['coeff'][..., -1:, :]  # pre-sclice: [NC,B*nh,1,CS]
+
+            Attn_b = torch.tril(torch.ones(inner_chunk_size, inner_chunk_size,
+                                           dtype=ilr_gated.dtype, device=ilr_gated.device))  # [CS,CS]
 
             def for_loop(states, inputs):
                 output_tensor = torch.empty_like(inputs['XA'])
                 for i in range(NC):
                     Z2_bar = self.prefill_chunk(states, inputs, i,
-                                                self.ln_weight, self.ln_bias)
+                                                self.ln_weight, self.ln_bias, Attn_b)
                     output_tensor[i] = Z2_bar
                 return output_tensor  # [NC, B*nh, K, f]
 
@@ -930,117 +918,20 @@ class TttM2BMMModule(TttBaseModule):
 
             if is_last_in_chunk:
                 XCW_batch = self.decode_end_chunk(
-                    states,  # [B*nh,f,f], cloned from W1, safe for in-place op
+                    states,  # [B*nh,f,f]
                     inputs,  # [B*nh,f]
                     self.ln_weight,  # [nh,1,f]
                     self.ln_bias,  # [nh,1,f]
                 )  # ret: [B*nh,N=1,f]
             else:
                 XCW_batch = self.decode(
-                    states,  # [B*nh,f,f], cloned from W1, safe for in-place op
+                    states,  # [B*nh,f,f]
                     inputs,  # [B*nh,f]
                     self.ln_weight,  # [nh,1,f]
                     self.ln_bias,  # [nh,1,f]
                 )  # ret: [B*nh,N=1,f]
 
-        return XCW_batch, None
-
-
-def m2_prefill_whole_loop(states, inputs, NC):
-
-    output_tensor = torch.empty_like(inputs['XA'])
-
-    for i in range(NC):
-        W1_init = states['W1_states']
-        W2_init = states['W2_states']
-        XA_chunk, XB_chunk, XC_chunk, \
-        coeff_chunk, coeff_chunk_last = inputs['XA'][i], inputs['XB'][i], inputs['XC'][i], \
-                                        inputs['coeff'][i], inputs['coeff_last'][i]
-
-        Z1 = XB_chunk @ W1_init  # [B*nh,K,f] @ [B*nh,f,f] -> [B*nh,K,f]
-        Z2 = Z1 @ W2_init
-        reconstruction_target = XA_chunk - XB_chunk
-        grad_l_wrt_Z2 = Z2 - reconstruction_target  # [B*nh,K=1,f]
-        grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2_init.transpose(-1, -2)
-
-        Attn1 = torch.tril(XC_chunk @ XB_chunk.transpose(-1, -2))  # [B*nh,K,K]
-        Z1_bar = XC_chunk @ W1_init - (
-                    coeff_chunk * Attn1) @ grad_l_wrt_Z1  # [B*nh,K,f] @ [B*nh,f,f] - ([B*nh,K,1] * [B*nh,K,K]) @ [B*nh,K,f]
-
-        Attn2 = torch.tril(Z1_bar @ Z1.transpose(-1, -2))  # [B*nh,K,K]
-        Z2_bar = Z1_bar @ W2_init - (coeff_chunk * Attn2) @ grad_l_wrt_Z2
-
-        W1_init.sub_((coeff_chunk_last * XB_chunk).transpose(-1, -2) @ grad_l_wrt_Z1)  # in-place update: [B*nh,f,f] - ([B*nh,1,1] * [B*nh,K,f].t) @ [B*nh,K,f]
-        W2_init.sub_((coeff_chunk_last * Z1).transpose(-1, -2) @ grad_l_wrt_Z2)  # in-place update: [B*nh,f,f] - ([B*nh,1,1] * [B*nh,K,f].t) @ [B*nh,K,f]
-        output_tensor[i] = Z2_bar
-
-    return output_tensor
-
-
-class TttM2BMMWholeLoopModule(TttBaseModule):
-    def __init__(self, config: TttConfig, layer_idx: Optional[int] = None):
-        super().__init__(config, layer_idx)
-        self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim, 4 * self.head_dim)))
-        self.b1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, 1, 4 * self.head_dim)))
-        self.W2 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, 4 * self.head_dim, self.head_dim)))
-        self.b2 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, 1, self.head_dim)))
-
-        if self.config.use_compile:
-            self.prefill_chunk = torch.compile(m2_prefill_whole_loop, mode='max-autotune')
-            self.decode_end_chunk = torch.compile(m2_decode_end_chunk)
-            self.decode = torch.compile(m2_decode)
-        else:
-            self.prefill_chunk = m2_prefill_whole_loop
-            self.decode_end_chunk = m2_decode_end_chunk
-            self.decode = m2_decode
-
-    def process_inner_loop(self, inputs, inner_chunk_size, last_chunk_params_dic,
-                           is_prefill=False,
-                           is_last_in_chunk=False,
-                           cache_params=None):
-        states = {
-            "W1_states": cache_params.params_dict["W1_states"][self.layer_idx],
-            "W1_grad": cache_params.params_dict["W1_grad"][self.layer_idx],
-            "b1_states": cache_params.params_dict["b1_states"][self.layer_idx],
-            "b1_grad": cache_params.params_dict["b1_grad"][self.layer_idx],
-            "W2_states": cache_params.params_dict["W2_states"][self.layer_idx],
-            "W2_grad": cache_params.params_dict["W2_grad"][self.layer_idx],
-            "b2_states": cache_params.params_dict["b2_states"][self.layer_idx],
-            "b2_grad": cache_params.params_dict["b2_grad"][self.layer_idx],
-        }
-
-        if is_prefill:
-            B_mul_NH, N, HF = inputs['XA'].shape  # [B*nh,N,f]
-            NC = N // inner_chunk_size
-            inputs = tree_map(lambda x: x.reshape(B_mul_NH, NC, inner_chunk_size, -1).transpose(1, 0).contiguous(),
-                              inputs)  # [B*nh,N,f] -> [B*nh,NC,CS,f] -> [NC,B*nh,CS,f]
-            inputs['coeff_last'] = inputs['coeff'][..., -1:, :]  # pre-sclice: [NC,B*nh,1,1]
-
-            XCW_batch = self.prefill_chunk(
-                states,  # [B*nh,f,f]
-                inputs,  # [NC,B*nh,CS,f]
-                NC,
-            )
-            XCW_batch = XCW_batch.transpose(1, 0).reshape(B_mul_NH, -1, HF).contiguous()  # [B*h,N,f]
-
-        else:
-            # @xinhao: decoding from a prompt of length 1 will always have `inner_chunk_size=remainder=1`
-            B_mul_NH, N, HF = inputs['XA'].shape  # [B*nh,N=1,f]
-
-            if is_last_in_chunk:
-                XCW_batch = self.decode_end_chunk(
-                    states,  # [B*nh,f,f], cloned from W1, safe for in-place op
-                    inputs,  # [B*nh,f]
-                    self.ln_weight,  # [nh,1,f]
-                    self.ln_bias,  # [nh,1,f]
-                )  # ret: [B*nh,N=1,f]
-            else:
-                XCW_batch = self.decode(
-                    states,  # [B*nh,f,f], cloned from W1, safe for in-place op
-                    inputs,  # [B*nh,f]
-                    self.ln_weight,  # [nh,1,f]
-                    self.ln_bias,  # [nh,1,f]
-                )  # ret: [B*nh,N=1,f]
+        XCW_batch = self.residual_add_post_LN(XC_residual, XCW_batch)
 
         return XCW_batch, None
 
@@ -1049,181 +940,6 @@ class TttM2BMMWholeLoopModule(TttBaseModule):
 
 
 ####### M1 Triton Decode Module #######
-
-####### Prefill #######
-
-prefill_lnb_flag = False
-
-if prefill_lnb_flag:
-    @triton.autotune(
-        configs=[
-            triton.Config({}, num_stages=7, num_warps=8),
-            triton.Config({}, num_stages=6, num_warps=8),
-            triton.Config({}, num_stages=5, num_warps=8),
-            triton.Config({}, num_stages=4, num_warps=8),
-            triton.Config({}, num_stages=3, num_warps=8),
-            triton.Config({}, num_stages=3, num_warps=4),
-            triton.Config({}, num_stages=4, num_warps=4),
-            triton.Config({}, num_stages=6, num_warps=4),
-        ],
-        key=['N_CHUNK'],
-        restore_value=['W1_init', 'b1_init'],
-    )
-    @triton.jit
-    def _m1_prefill_kernel(
-            W1_init, b1_init,
-            XA, XB, XC, coeff, coeff_last, Out,
-            ln_weight, ln_bias,
-
-            stride_w_batch, stride_w_head, stride_w_in, stride_w_out,
-            stride_b_batch, stride_b_head, stride_b_in, stride_b_out,
-            stride_ln_head, stride_ln_f,
-            stride_x_batch, stride_x_head, stride_x_nc, stride_x_cs, stride_x_f,
-            stride_coeff_batch, stride_coeff_head, stride_coeff_nc, stride_coeff_cs,
-
-            CS: tl.constexpr,
-            HF: tl.constexpr,
-            N_CHUNK: tl.constexpr
-    ):
-        batch = tl.program_id(0)
-        head = tl.program_id(1)
-        abco_offset = batch * stride_x_batch + head * stride_x_head
-        coeff_offset = batch * stride_coeff_batch + head * stride_coeff_head
-        coeff_last_offset = coeff_offset
-        w_offset = batch * stride_w_batch + head * stride_w_head
-        b_offset = batch * stride_b_batch + head * stride_b_head
-        ln_offset = head * stride_ln_head
-
-        W_dtype = W1_init.type.element_ty
-        O_dtype = Out.type.element_ty
-
-        rc = tl.arange(0, CS)
-        rf = tl.arange(0, HF)
-
-        XA_blk_ptr = XA + abco_offset
-        XB_blk_ptr = XB + abco_offset
-        XC_blk_ptr = XC + abco_offset
-        Out_blk_ptr = Out + abco_offset
-
-        coeff_blk_ptr = coeff + coeff_offset
-        coeff_last_blk_ptr = coeff_last + coeff_last_offset
-
-        W1_data_blk_ptr = W1_init + w_offset + (rf[:, None] * stride_w_in + rf[None, :] * stride_w_out)
-        b1_data_blk_ptr = b1_init + b_offset + rf[None, :] * stride_b_out  # [1,f]
-        W1_data = tl.load(W1_data_blk_ptr)  # [f,f]
-        b1_data = tl.load(b1_data_blk_ptr)  # [1,f]
-
-        ln_blk_shape = ln_offset + rf[None, :] * stride_ln_f  # [1,f]
-        ln_weight_data = tl.load(ln_weight + ln_blk_shape)
-        ln_bias_data = tl.load(ln_bias + ln_blk_shape)
-
-        for i in range(N_CHUNK):
-            local_abco_offset = i * stride_x_nc + (rc[:, None] * stride_x_cs + rf[None, :] * stride_x_f)
-            local_coeff_offset = i * stride_coeff_nc
-            local_coeff_last_offset = local_coeff_offset
-
-            XA_chunk = tl.load(XA_blk_ptr + local_abco_offset)
-            XB_chunk = tl.load(XB_blk_ptr + local_abco_offset)
-            XC_chunk = tl.load(XC_blk_ptr + local_abco_offset)  # [CS,f]
-            coeff_chunk = tl.load(coeff_blk_ptr + local_coeff_offset + rc * stride_coeff_cs)[:,None]  # [CS,1]
-            coeff_chunk_last = tl.load(coeff_last_blk_ptr + local_coeff_last_offset)  # scaler
-
-            Z1 = tl.dot(XB_chunk, W1_data) + b1_data  # [CS,f] @ [f,f] -> [CS,f]
-            reconstruction_target = XA_chunk - XB_chunk  # [CS,f]
-            mu = tl.sum(Z1, 1) / HF  # [CS,]
-            mu = mu[:,None]  # [CS,1]
-            var = tl.sum((Z1 - mu) * (Z1 - mu), 1) / HF  # [CS,]
-            var = var[:,None]
-            std = tl.sqrt(var + 1e-6)
-            x_hat = (Z1 - mu) / std  # [CS,f]
-            y = ln_weight_data * x_hat + ln_bias_data  # [CS,f]
-
-            grad_output = y - reconstruction_target  # [CS,f]
-            grad_x_hat = ln_weight_data * grad_output  # [CS,f]
-            grad_l_Z1 = (
-                    (1.0 / HF)
-                    * (
-                            HF * grad_x_hat  # [CS,f]
-                            - tl.sum(grad_x_hat, 1)[:,None]  # [CS,]
-                            - x_hat * (tl.sum(grad_x_hat * x_hat, 1))[:,None]  # [CS,f] * [CS,]
-                    )
-                    / std
-            ).to(W_dtype)  # grad_l_Z1: [CS,f]
-            #
-            mask = rc[:, None] >= rc[None, :]
-            Attn1_full = tl.dot(XC_chunk, tl.trans(XB_chunk))
-            Attn1 = tl.where(mask, Attn1_full, 0).to(W_dtype)  # [CS,CS]
-
-            # b1_bar = (b1_data - coeff_chunk * tl.cumsum(grad_l_Z1, 0)).to(W_dtype)   # [CS,f] - [CS,1] * [CS,f]
-            b1_bar = b1_data - coeff_chunk * grad_l_Z1
-            Z1_bar = tl.dot(XC_chunk, W1_data) - tl.dot((coeff_chunk * Attn1), grad_l_Z1) + b1_bar  # [CS,f]
-
-            W1_data -= tl.dot(tl.trans(coeff_chunk_last * XB_chunk), grad_l_Z1).to(W_dtype)
-            # TODO: (1) update b1_data; (2) cumsum for b1_bar
-
-            # tl.store(Out_blk_ptr + local_abco_offset, Z1_bar.to(O_dtype))  #.to(Output_chunk_ptr.type.element_ty)
-
-        tl.store(W1_data_blk_ptr, W1_data)
-        tl.store(b1_data_blk_ptr, b1_data)
-
-else:
-    @triton.autotune(
-        configs=[
-            triton.Config({}, num_stages=7, num_warps=8),
-            triton.Config({}, num_stages=6, num_warps=8),
-            triton.Config({}, num_stages=5, num_warps=8),
-            triton.Config({}, num_stages=4, num_warps=8),
-            triton.Config({}, num_stages=3, num_warps=8),
-            triton.Config({}, num_stages=3, num_warps=4),
-            triton.Config({}, num_stages=4, num_warps=4),
-            triton.Config({}, num_stages=6, num_warps=4),
-        ],
-        key=['N_CHUNK'],
-    )
-    @triton.jit
-    def _m1_prefill_kernel(W1, XA, XB, XC, coeff_last, coeff, Out,
-                           stride_ab, stride_ah, stride_an, stride_ac, stride_af,
-                           stride_eb, stride_eh, stride_en, stride_ec,
-                           stride_pb, stride_ph, stride_pn,
-                           stride_wb, stride_wh, stride_wf, stride_wd,
-                           CS: tl.constexpr, HF: tl.constexpr,
-                           N_CHUNK: tl.constexpr):
-        batch = tl.program_id(0)
-        head = tl.program_id(1)
-        abco_offset = batch * stride_ab + head * stride_ah
-        w_offset = batch * stride_wb + head * stride_wh
-        coeff_offset = batch * stride_eb + head * stride_eh
-        coeff_last_offset = batch * stride_pb + head * stride_ph
-
-        rc = tl.arange(0, CS)
-        rf = tl.arange(0, HF)
-        XA = XA + abco_offset
-        XB = XB + abco_offset
-        XC = XC + abco_offset
-        Out = Out + abco_offset
-        W1_ptr = W1 + w_offset + rf[:, None] * stride_wf + rf[None, :] * stride_wd
-        W1_data = tl.load(W1_ptr)
-        coeff = coeff + coeff_offset
-        coeff_last = coeff_last + coeff_last_offset
-        for i in range(N_CHUNK):
-            local_abco_offset = i * stride_an
-            local_coeff_offset = i * stride_en
-            local_coeff_last_offset = i * stride_pn
-            XA_chunk = tl.load(XA + local_abco_offset + (rc[:, None] * stride_ac + rf[None, :] * stride_af))
-            XB_chunk = tl.load(XB + local_abco_offset + (rc[:, None] * stride_ac + rf[None, :] * stride_af))
-            XC_chunk = tl.load(XC + local_abco_offset + (rc[:, None] * stride_ac + rf[None, :] * stride_af))
-            coeff_chunk = tl.load(coeff + local_coeff_offset + rc * stride_ec)
-            coeff_chunk_last = tl.load(coeff_last + local_coeff_last_offset)
-
-            Z1 = tl.dot(XB_chunk, W1_data) - XA_chunk
-            mask = rc[:, None] >= rc[None, :]
-            Attn1_full = tl.dot(XC_chunk, tl.trans(XB_chunk))
-            Attn1 = tl.where(mask, Attn1_full, 0)
-            Z1_bar = tl.dot(XC_chunk, W1_data) - tl.dot((coeff_chunk[:, None] * Attn1), Z1)
-            W1_data -= tl.dot(tl.trans(coeff_chunk_last * XB_chunk).to(Z1.dtype), Z1).to(W1.type.element_ty)
-            Out_chunk = Out + local_abco_offset + (rc[:, None] * stride_ac + rf[None, :] * stride_af)
-            tl.store(Out_chunk, Z1_bar.to(Out.type.element_ty))
-        tl.store(W1_ptr, W1_data.to(W1.type.element_ty))
 
 ####### Decode #######
 @triton.autotune(
@@ -1353,7 +1069,6 @@ def _m1_decode_kernel(__W1, __W1_grad, __b1, __b1_grad,
     tl.store(_Out, Z1_bar.to(O_dtype))
     # tl.store(_W1_grad, W1_grad.to(W_dtype))
     # tl.store(_b1_grad, b1_grad.to(W_dtype))
-
 
 @triton.autotune(
     configs=[
@@ -1488,136 +1203,6 @@ def _m1_decode_end_chunk_kernel(__W1, __W1_grad, __b1, __b1_grad,
     # tl.store(_b1_grad, tl.zeros_like(b1_grad).to(W_dtype))
 
 
-class TttM1BMMTritonModule(TttBaseModule):
-
-    def __init__(self, config: TttConfig, layer_idx: Optional[int] = None):
-        super().__init__(config, layer_idx)
-        self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim, self.head_dim)))
-        self.b1 = nn.Parameter(torch.ones(size=(self.num_heads, 1, self.head_dim)))
-
-    def process_inner_loop(self, inputs, inner_chunk_size, last_chunk_params_dic,
-                           is_prefill=False,
-                           is_last_in_chunk=False,
-                           cache_params=None):
-
-        raise NotImplementedError  # @xinhao: triton decode kernel has been updated, but this module has not
-
-        B_mul_NH, N, HF = inputs['XA'].shape  # [B*nh,N,f]
-        B = B_mul_NH // self.num_heads
-        NH = self.num_heads
-        W1_init = cache_params.params_dict["W1_states"][self.layer_idx].reshape(B, NH, HF, HF)
-        b1_init = cache_params.params_dict["b1_states"][self.layer_idx].reshape(B, NH, 1, HF)
-        W1_grad = cache_params.params_dict["W1_grad"][self.layer_idx].reshape(B, NH, HF, HF)
-        b1_grad = cache_params.params_dict["b1_grad"][self.layer_idx].reshape(B, NH, 1, HF)
-
-        if is_prefill:
-            CS = inner_chunk_size
-            NC = N // CS
-            inputs = tree_map(lambda x: x.reshape(B, NH, NC, CS, -1), inputs)  # [B*nh,N,f] -> [B,nh,NC,CS,f/1]
-            XA, XB, XC, coeff = inputs['XA'], inputs['XB'], inputs['XC'], inputs['coeff']  # [B,nh,NC,CS,f/1]
-            coeff_last = coeff[...,-1:,:]  # [B,nh,NC,1,1]
-            output = torch.empty_like(XA)  # [B,nh,NC,CS,f]
-
-            grid = (B, NH, 1)
-            if prefill_lnb_flag:
-                # with LN and bias
-                _m1_prefill_kernel[grid](W1_init, b1_init,
-                                        XA, XB, XC, coeff, coeff_last, output,
-                                        self.ln_weight, self.ln_bias,
-
-                                        W1_init.stride(0), W1_init.stride(1), W1_init.stride(2), W1_init.stride(3),
-                                        b1_init.stride(0), b1_init.stride(1), b1_init.stride(2), b1_init.stride(3),
-                                        self.ln_weight.stride(1), self.ln_weight.stride(2),
-
-                                        XA.stride(0), XA.stride(1), XA.stride(2), XA.stride(3), XA.stride(4),
-                                        coeff.stride(0), coeff.stride(1),  coeff.stride(2), coeff.stride(3), # strides for coeff
-
-                                        CS, HF, NC)
-            else:
-                _m1_prefill_kernel[grid](
-                     W1_init,  # [B,nh,f,f], cloned from W1, safe for in-place op
-                     XA, XB, XC, coeff_last, coeff, output,
-                     NH * NC * CS * HF, NC * CS * HF, CS * HF, HF, 1,  # strides for A,B,C,O
-                     NH * NC * CS, NC * CS, CS, 1,  # strides for E
-                     NH * NC, NC, 1,  # strides for last coeff
-                     NH * HF * HF, HF * HF, HF, 1,  # strides for W1
-                     CS, HF,
-                     NC
-                     )
-        else:
-            CS = N
-            inputs = tree_map(lambda x: x.reshape(B, NH, N, -1), inputs)  # [B*nh,N=1,f], [B*nh,N=1,1] -> [BS,nh,N=1,f/1]
-            XA, XB, XC, coeff = inputs['XA'], inputs['XB'], inputs['XC'], inputs['coeff']  # [B,nh,N,f/1]
-            output = torch.empty_like(XA) # [B,nh,N,f]
-
-            if decode_lnb_flag:
-                # with LN and bias
-                if is_last_in_chunk:
-                    _m1_decode_end_chunk_kernel[grid](W1_init, W1_grad, b1_init, b1_grad,
-                                            XA, XB, XC, coeff, output,
-                                            self.ln_weight, self.ln_bias,
-
-                                            W1_init.stride(0), W1_init.stride(1), W1_init.stride(2), W1_init.stride(3),
-                                            b1_init.stride(0), b1_init.stride(1), b1_init.stride(2), b1_init.stride(3),
-
-                                            self.ln_weight.stride(1), self.ln_weight.stride(2),
-                                            XA.stride(0), XA.stride(1), XA.stride(2), XA.stride(3),  # strides for ABC, output
-                                            coeff.stride(0), coeff.stride(1),  # strides for coeff
-
-                                            CS, HF)
-                else:
-                    _m1_decode_kernel[grid](W1_init, W1_grad, b1_init, b1_grad,
-                                          XA, XB, XC, coeff, output,
-                                          self.ln_weight, self.ln_bias,
-
-                                          W1_init.stride(0), W1_init.stride(1), W1_init.stride(2),
-                                          W1_init.stride(3),
-                                          b1_init.stride(0), b1_init.stride(1), b1_init.stride(2),
-                                          b1_init.stride(3),
-
-                                          self.ln_weight.stride(1), self.ln_weight.stride(2),
-                                          XA.stride(0), XA.stride(1), XA.stride(2), XA.stride(3),
-                                          # strides for ABC, output
-                                          coeff.stride(0), coeff.stride(1),  # strides for coeff
-
-                                          CS, HF)
-
-            else:
-                if is_last_in_chunk:
-                    _m1_decode_end_chunk_kernel[grid](W1_init, W1_grad, XA, XB, XC, coeff, output,
-                                                      NH * HF * HF,
-                                                      HF * HF,
-                                                      HF,
-                                                      1,  # strides for W
-                                                      NH * CS * HF,
-                                                      CS * HF,
-                                                      HF,
-                                                      1,  # strides for ABCO, output
-                                                      NH * CS,
-                                                      CS,
-                                                      1,
-                                                      1,  # strides for coeff
-                                                      CS, HF)
-                else:
-                    _m1_decode_kernel[grid](W1_init, W1_grad, XA, XB, XC, coeff, output,
-                                            NH * HF * HF,
-                                            HF * HF,
-                                            HF,
-                                            1,  # strides for W
-                                            NH * CS * HF,
-                                            CS * HF,
-                                            HF,
-                                            1,  # strides for ABCO, output
-                                            NH * CS,
-                                            CS,
-                                            1,
-                                            1,  # strides for coeff
-                                            CS, HF)
-
-        output = output.reshape(B_mul_NH, N, HF)
-        return output, None
-
-
 class TttM1BMMTKModule(TttBaseModule):
 
     def __init__(self, config: TttConfig, layer_idx: Optional[int] = None):
@@ -1647,7 +1232,6 @@ class TttM1BMMTKModule(TttBaseModule):
             W1_init = cache_params.params_dict["W1_states"][self.layer_idx].reshape(B, NH, HF, HF)
             b1_init = cache_params.params_dict["b1_states"][self.layer_idx].reshape(B, NH, 1, HF)
 
-            B_mul_NH, N, HF = inputs['XA'].shape  # [B*nh,N,f]
             CS = inner_chunk_size
             NC = N // CS
             inputs = tree_map(lambda x: x.reshape(B, NH, NC, CS, -1).contiguous(), inputs)  # [B*nh,N,f/1] -> [B,nh,nc,cs,f/1]
@@ -1971,79 +1555,6 @@ def _m2_decode_end_chunk_kernel(W1_init, W1_grad, W2_init, W2_grad,
     tl.store(W2_grad, tl.zeros_like(W2_grad_data).to(W_dtype))
 
 
-class TttM2BMMTritonModule(TttBaseModule):
-
-    def __init__(self, config: TttConfig, layer_idx: Optional[int] = None):
-        super().__init__(config, layer_idx)
-        self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim, 4 * self.head_dim)))
-        self.b1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, 1, 4 * self.head_dim)))
-        self.W2 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, 4 * self.head_dim, self.head_dim)))
-        self.b2 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, 1, self.head_dim)))
-
-    def process_inner_loop(self, inputs, inner_chunk_size, last_chunk_params_dic,
-                           is_prefill=False,
-                           is_last_in_chunk=False,
-                           cache_params=None):
-
-        B_mul_NH, N, HF = inputs['XA'].shape  # [B*nh,N,f]
-        HF_prime = self.W1.shape[-1]
-        B = B_mul_NH // self.num_heads
-        NH = self.num_heads
-
-        W1_init = cache_params.params_dict["W1_states"][self.layer_idx].reshape(B, NH, HF, 4 * HF)
-        W1_grad = cache_params.params_dict["W1_grad"][self.layer_idx].reshape(B, NH, HF, 4 * HF)
-        W2_init = cache_params.params_dict["W2_states"][self.layer_idx].reshape(B, NH, 4 * HF, HF)
-        W2_grad = cache_params.params_dict["W2_grad"][self.layer_idx].reshape(B, NH, 4 * HF, HF)
-
-        if is_prefill:
-            CS = inner_chunk_size
-            NC = N // CS
-            inputs = tree_map(lambda x: x.reshape(B, NH, NC, CS, -1), inputs)  # [B*nh,N,f] -> [B,nh,NC,CS,f/1]
-            XA, XB, XC, coeff = inputs['XA'], inputs['XB'], inputs['XC'], inputs['coeff']  # [B,nh,NC,CS,f/1]
-            coeff_last = coeff[..., -1:, :]  # [B,nh,NC,1,1]
-            output = torch.empty_like(XA)  # [B,nh,NC,CS,f]
-            grid = (B, NH, 1)
-            _m2_prefill_kernel[grid](W2_init,  # [B,nh,f,f], cloned from W1, safe for in-place op
-                                     W2_init,
-                                     XA, XB, XC, coeff_last, coeff, output,
-                                     NH * NC * CS * HF, NC * CS * HF, CS * HF, HF, 1,  # strides for A,B,C,O
-                                     NH * NC * CS, NC * CS, CS, 1,  # strides for E
-                                     NH * NC, NC, 1,  # strides for last coeff
-                                     NH * HF * HF_prime, HF * HF_prime, HF_prime, 1,  # strides for W1
-                                     HF,  # stride for W2
-                                     CS, HF, HF_prime,
-                                     NC
-                                     )
-        else:
-            CS = N
-            inputs = tree_map(lambda x: x.reshape(B, NH, N, -1), inputs)  # [B*nh,N=1,f], [B*nh,N=1,1] -> [BS,nh,N=1,f/1]
-            XA, XB, XC, coeff = inputs['XA'], inputs['XB'], inputs['XC'], inputs['coeff']  # [B,nh,N,f/1]
-            output = torch.empty_like(XA)  # [B,nh,N,f]
-            grid = (B, NH, 1)
-            if is_last_in_chunk:
-                _m2_decode_end_chunk_kernel[grid](W1_init, W1_grad, W2_init, W2_grad,
-                                                  XA, XB, XC, coeff,
-                                                  output,
-                                                  NH * HF * HF_prime, HF * HF_prime, HF_prime, 1,  # strides for W1: [B,NH,HF,HF_prime]
-                                                  NH * HF_prime * HF, HF_prime * HF, HF, 1,  # strides for W2
-                                                  NH * CS * HF, CS * HF, HF, 1,  # strides for ABCO, output
-                                                  NH * CS * 1, CS * 1, 1, 1,  # strides for coeff
-                                                  CS=CS, HF=HF, HF_prime=HF_prime)
-            else:
-                _m2_decode_kernel[grid](W1_init, W1_grad, W2_init, W2_grad,
-                                        XA, XB, XC, coeff,
-                                        output,
-                                        NH * HF * HF_prime, HF * HF_prime, HF_prime, 1,
-                                        # strides for W1: [B,NH,HF,HF_prime]
-                                        NH * HF_prime * HF, HF_prime * HF, HF, 1,  # strides for W2
-                                        NH * CS * HF, CS * HF, HF, 1,  # strides for ABCO, output
-                                        NH * CS * 1, CS * 1, 1, 1,  # strides for coeff
-                                        CS=CS, HF=HF, HF_prime=HF_prime)
-
-        output = output.reshape(B_mul_NH, N, HF)
-        return output, None
-
-
 class TttM2BMMTKModule(TttBaseModule):
 
     def __init__(self, config: TttConfig, layer_idx: Optional[int] = None):
@@ -2053,59 +1564,95 @@ class TttM2BMMTKModule(TttBaseModule):
         self.W2 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, 4 * self.head_dim, self.head_dim)))
         self.b2 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, 1, self.head_dim)))
 
+        if self.config.use_compile:
+            self.decode_end_chunk = torch.compile(m2_decode_end_chunk)
+            self.decode = torch.compile(m2_decode)
+        else:
+            self.decode_end_chunk = m2_decode_end_chunk
+            self.decode = m2_decode
+
     def process_inner_loop(self, inputs, inner_chunk_size, last_chunk_params_dic,
                            is_prefill=False,
                            is_last_in_chunk=False,
                            cache_params=None):
 
         B_mul_NH, N, HF = inputs['XA'].shape  # [B*nh,N,f]
-        HF_prime = self.W1.shape[-1]
         B = B_mul_NH // self.num_heads
         NH = self.num_heads
-
-        W1_init = cache_params.params_dict["W1_states"][self.layer_idx].reshape(B, NH, HF, 4 * HF)
-        W1_grad = cache_params.params_dict["W1_grad"][self.layer_idx].reshape(B, NH, HF, 4 * HF)
-        W2_init = cache_params.params_dict["W2_states"][self.layer_idx].reshape(B, NH, 4 * HF, HF)
-        W2_grad = cache_params.params_dict["W2_grad"][self.layer_idx].reshape(B, NH, 4 * HF, HF)
+        states = {
+            "W1_states": cache_params.params_dict["W1_states"][self.layer_idx],
+            "W1_grad": cache_params.params_dict["W1_grad"][self.layer_idx],
+            "b1_states": cache_params.params_dict["b1_states"][self.layer_idx],
+            "b1_grad": cache_params.params_dict["b1_grad"][self.layer_idx],
+            "W2_states": cache_params.params_dict["W2_states"][self.layer_idx],
+            "W2_grad": cache_params.params_dict["W2_grad"][self.layer_idx],
+            "b2_states": cache_params.params_dict["b2_states"][self.layer_idx],
+            "b2_grad": cache_params.params_dict["b2_grad"][self.layer_idx],
+        }
+        XC_residual = inputs['XC']
 
         if is_prefill:
+            W1_init = cache_params.params_dict["W1_states"][self.layer_idx].reshape(B, NH, HF, 4 * HF)
+            b1_init = cache_params.params_dict["b1_states"][self.layer_idx].reshape(B, NH, 1, 4 * HF)
+            W2_init = cache_params.params_dict["W2_states"][self.layer_idx].reshape(B, NH, 4 * HF, HF)
+            b2_init = cache_params.params_dict["b2_states"][self.layer_idx].reshape(B, NH, 1, HF)
+
             CS = inner_chunk_size
             NC = N // CS
-            inputs = tree_map(lambda x: x.reshape(B, NH, NC, CS, -1), inputs)  # [B*nh,N,f] -> [B,nh,NC,CS,f/1]
-            XA, XB, XC, coeff = inputs['XA'], inputs['XB'], inputs['XC'], inputs['coeff']  # [B,nh,NC,CS,f/1]
-            coeff_last = coeff[..., -1:, :]  # [B,nh,NC,1,1]
-            output = torch.empty_like(XA)  # [B,nh,NC,CS,f]
+            inputs = tree_map(lambda x: x.reshape(B, NH, NC, CS, -1).contiguous(), inputs)  # [B*nh,N,f/1] -> [B,nh,nc,cs,f/1]
+            ilr_gated = inputs.pop('ilr_gated').transpose(-1, -2)  # [B,nh,nc,1,cs]
+            inputs['coeff'] = self.token_idx[None, :] * ilr_gated  # [1,1,1,cs,1] * [B,nh,nc,1,cs] -> [B,nh,nc,CS,CS]
 
-            tk_m2_prefill.prefill_whole_loop_fp16(W1_init, W2_init, XA, XB, XC, output)
+            XA, XB, XC, coeff = inputs['XA'], inputs['XB'], inputs['XC'], inputs['coeff']  # [B,nh,nc,cs,f/1]
+            input_device = XA.device
+            input_dtype = XA.dtype
+            output = torch.empty_like(XA)
+
+            ln_weight = self.ln_weight.squeeze(0).expand(-1, CS, -1).contiguous()
+            ln_bias = self.ln_bias.squeeze(0).expand(-1, CS, -1).contiguous()
+            b1_init = b1_init.expand(-1, -1, CS, -1).contiguous()
+            b2_init = b2_init.expand(-1, -1, CS, -1).contiguous()
+            cumsum_matrix = torch.tril(torch.ones(CS, CS, dtype=input_dtype, device=input_device))
+            make_last_b_matrix = torch.zeros(CS, CS, dtype=input_dtype, device=input_device)
+            make_last_coeff_1_matrix = torch.zeros(CS, HF, dtype=input_dtype, device=input_device)
+            make_last_coeff_2_matrix = torch.zeros(CS, 4 * HF, dtype=input_dtype, device=input_device)
+            make_last_b_matrix[:, -1] = 1.
+            make_last_coeff_1_matrix[-1, :] = 1.
+            make_last_coeff_2_matrix[-1, :] = 1.
+
+            tk_m2_prefill.prefill_whole_loop_gelu_coeff_bias_LN_fp16(W1_init, W2_init, b1_init, b2_init,
+                                                                     ln_weight, ln_bias,
+                                                                     cumsum_matrix,
+                                                                     make_last_b_matrix,
+                                                                     make_last_coeff_1_matrix, make_last_coeff_2_matrix,
+                                                                     XA, XB, XC, coeff,
+                                                                     output)
+
+            b1_init = b1_init[:, :, -1:, :].reshape(B_mul_NH, 1, -1)
+            b2_init = b2_init[:, :, -1:, :].reshape(B_mul_NH, 1, -1)
+            cache_params.params_dict["b1_states"][self.layer_idx].copy_(b1_init)
+            cache_params.params_dict["b2_states"][self.layer_idx].copy_(b2_init)
 
         else:
-            CS = N
-            inputs = tree_map(lambda x: x.reshape(B, NH, N, -1), inputs)  # [B*nh,N=1,f], [B*nh,N=1,1] -> [BS,nh,N=1,f/1]
-            XA, XB, XC, coeff = inputs['XA'], inputs['XB'], inputs['XC'], inputs['coeff']  # [B,nh,N,f/1]
-            output = torch.empty_like(XA)  # [B,nh,N,f]
-            grid = (B, NH, 1)
+            # @xinhao: decoding from a prompt of length 1 will always have `inner_chunk_size=remainder=1`
             if is_last_in_chunk:
-                _m2_decode_end_chunk_kernel[grid](W1_init, W1_grad, W2_init, W2_grad,
-                                                  XA, XB, XC, coeff,
-                                                  output,
-                                                  NH * HF * HF_prime, HF * HF_prime, HF_prime, 1,  # strides for W1: [B,NH,HF,HF_prime]
-                                                  NH * HF_prime * HF, HF_prime * HF, HF, 1,  # strides for W2
-                                                  NH * CS * HF, CS * HF, HF, 1,  # strides for ABCO, output
-                                                  NH * CS * 1, CS * 1, 1, 1,  # strides for coeff
-                                                  CS=CS, HF=HF, HF_prime=HF_prime)
+                XCW_batch = self.decode_end_chunk(
+                    states,  # [B*nh,f,f]
+                    inputs,  # [B*nh,f]
+                    self.ln_weight,  # [nh,1,f]
+                    self.ln_bias,  # [nh,1,f]
+                )  # ret: [B*nh,N=1,f]
             else:
-                _m2_decode_kernel[grid](W1_init, W1_grad, W2_init, W2_grad,
-                                        XA, XB, XC, coeff,
-                                        output,
-                                        NH * HF * HF_prime, HF * HF_prime, HF_prime, 1,
-                                        # strides for W1: [B,NH,HF,HF_prime]
-                                        NH * HF_prime * HF, HF_prime * HF, HF, 1,  # strides for W2
-                                        NH * CS * HF, CS * HF, HF, 1,  # strides for ABCO, output
-                                        NH * CS * 1, CS * 1, 1, 1,  # strides for coeff
-                                        CS=CS, HF=HF, HF_prime=HF_prime)
+                XCW_batch = self.decode(
+                    states,  # [B*nh,f,f]
+                    inputs,  # [B*nh,f]
+                    self.ln_weight,  # [nh,1,f]
+                    self.ln_bias,  # [nh,1,f]
+                )  # ret: [B*nh,N=1,f]
 
-        output = output.reshape(B_mul_NH, N, HF)
-        return output, None
+        XCW_batch = self.residual_add_post_LN(XC_residual, XCW_batch)
+
+        return XCW_batch, None
 
 ##########################################
 
@@ -2118,16 +1665,10 @@ class TttDecoderLayer(nn.Module):
         # self.self_attn = TttM1Module(config=config, layer_idx=layer_idx)  # @xinhao: M1 vmap module
         if config.inner_net == 'mlp_1_dual':
             self.self_attn = TttM1BMMModule(config=config, layer_idx=layer_idx)
-        elif config.inner_net == 'mlp_1_dual_triton':
-            self.self_attn = TttM1BMMTritonModule(config=config, layer_idx=layer_idx)
         elif config.inner_net == 'mlp_1_dual_tk':
             self.self_attn = TttM1BMMTKModule(config=config, layer_idx=layer_idx)
         elif config.inner_net == 'mlp_2_dual':
             self.self_attn = TttM2BMMModule(config=config, layer_idx=layer_idx)
-        elif config.inner_net == 'mlp_2_dual_whole_loop':
-            self.self_attn = TttM2BMMWholeLoopModule(config=config, layer_idx=layer_idx)
-        elif config.inner_net == 'mlp_2_dual_triton':
-            self.self_attn = TttM2BMMTritonModule(config=config, layer_idx=layer_idx)
         elif config.inner_net == 'mlp_2_dual_tk':
             self.self_attn = TttM2BMMTKModule(config=config, layer_idx=layer_idx)
         else:
