@@ -1254,7 +1254,12 @@ class TttM1BMMTKModule(TttBaseModule):
             make_last_b_matrix[:,-1] = 1.
             make_last_coeff_1_matrix[-1,:] = 1.
 
-            tk_m1_prefill.prefill_whole_loop_LN_bias_fp16(
+            # tk_m1_prefill.prefill_whole_loop_LN_bias_fp16(
+            #     W1_init, b1_init, ln_weight, ln_bias,
+            #     cumsum_matrix, make_last_b_matrix, make_last_coeff_1_matrix,
+            #     XA, XB, XC, coeff, output
+            # )
+            tk_m1_prefill.prefill_whole_loop_LN_bias_res_PLN_fp16(
                 W1_init, b1_init, ln_weight, ln_bias,
                 cumsum_matrix, make_last_b_matrix, make_last_coeff_1_matrix,
                 XA, XB, XC, coeff, output
@@ -1263,7 +1268,7 @@ class TttM1BMMTKModule(TttBaseModule):
             cache_params.params_dict["b1_states"][self.layer_idx].copy_(b1_init)
 
             output = output.reshape(B_mul_NH, N, HF)
-            output = self.residual_add_post_LN(XC_residual, output)  # residual + postLN
+            # output = self.residual_add_post_LN(XC_residual, output)  # residual + postLN
 
         else:
             W1 = cache_params.params_dict["W1_states"][self.layer_idx].reshape(B, NH, HF, HF)
@@ -1696,21 +1701,27 @@ class TttM2BMMTKModule(TttBaseModule):
             make_last_coeff_1_matrix[-1, :] = 1.
             make_last_coeff_2_matrix[-1, :] = 1.
 
-            tk_m2_prefill.prefill_whole_loop_gelu_coeff_bias_LN_fp16(W1_init, W2_init, b1_init, b2_init,
+            # tk_m2_prefill.prefill_whole_loop_gelu_coeff_bias_LN_fp16(W1_init, W2_init, b1_init, b2_init,
+            #                                                          ln_weight, ln_bias,
+            #                                                          cumsum_matrix,
+            #                                                          make_last_b_matrix,
+            #                                                          make_last_coeff_1_matrix, make_last_coeff_2_matrix,
+            #                                                          XA, XB, XC, coeff,
+            #                                                          output)
+            tk_m2_prefill.prefill_whole_loop_gelu_coeff_bias_LN_res_PLN_fp16(W1_init, W2_init, b1_init, b2_init,
                                                                      ln_weight, ln_bias,
                                                                      cumsum_matrix,
                                                                      make_last_b_matrix,
                                                                      make_last_coeff_1_matrix, make_last_coeff_2_matrix,
                                                                      XA, XB, XC, coeff,
                                                                      output)
-
             b1_init = b1_init[:, :, -1:, :].reshape(B_mul_NH, 1, -1)
             b2_init = b2_init[:, :, -1:, :].reshape(B_mul_NH, 1, -1)
             cache_params.params_dict["b1_states"][self.layer_idx].copy_(b1_init)
             cache_params.params_dict["b2_states"][self.layer_idx].copy_(b2_init)
 
             output = output.reshape(B_mul_NH, N, HF)
-            output = self.residual_add_post_LN(XC_residual, output)  # residual + postLN
+            # output = self.residual_add_post_LN(XC_residual, output)  # residual + postLN
 
         else:
             W1 = cache_params.params_dict["W1_states"][self.layer_idx].reshape(B, NH, HF, HF_prime)
