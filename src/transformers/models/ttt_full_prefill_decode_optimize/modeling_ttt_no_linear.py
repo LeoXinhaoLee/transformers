@@ -473,16 +473,28 @@ class TttBaseModule(nn.Module):
         is_prefill: Optional[bool] = False,
         is_last_in_chunk: Optional[bool] = None,
     ):
-        XC, XB, XA, token_idx, ilr_gated, XGate = self.get_inner_loop_inputs(
-            hidden_states, position_ids=position_ids,
-            cache_params=cache_params, inner_chunk_size=inner_chunk_size, is_prefill=is_prefill
-        )
+        # XC, XB, XA, token_idx, ilr_gated, XGate = self.get_inner_loop_inputs(
+        #     hidden_states, position_ids=position_ids,
+        #     cache_params=cache_params, inner_chunk_size=inner_chunk_size, is_prefill=is_prefill
+        # )
+        XC  = hidden_states
+        token_idx = self.token_idx
+        B, L, D = XC.shape
+
+        XC = XC.reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3).reshape(-1, L, self.head_dim)  # [B*nh,N,f]
+        XB = XC
+        XA = XC
+
         B_mul_NH, N, HF = XA.shape
         B = B_mul_NH // self.num_heads
+
+        ilr_gated = torch.zeros((B_mul_NH, N, 1), dtype=XA.dtype, device=XA.device)
+
         if is_prefill:
             inputs = {'XC': XC, 'XB': XB, 'XA': XA, 'ilr_gated': ilr_gated}
         else:
             inputs = {'XC': XC, 'XB': XB, 'XA': XA, 'token_idx': token_idx, 'ilr_gated': ilr_gated}
+
         XCW_batch, batch_params_dict = self.process_inner_loop(
             inputs,
             inner_chunk_size=inner_chunk_size,
@@ -496,12 +508,14 @@ class TttBaseModule(nn.Module):
         # XC = XB = XA = XGate = hidden_states.reshape(B, N, self.num_heads, self.head_dim).permute(0,2,1,3).reshape(-1, N, self.head_dim)
         # XCW_batch = XA + XB + XC; batch_params_dict = None
 
-        if is_prefill:
-            XCW_batch = self.gate_out_norm(B, N, XGate, XCW_batch)
-        else:
-            XCW_batch = self.decode_gate_out_norm(B, N, XGate, XCW_batch)
+        # if is_prefill:
+        #     XCW_batch = self.gate_out_norm(B, N, XGate, XCW_batch)
+        # else:
+        #     XCW_batch = self.decode_gate_out_norm(B, N, XGate, XCW_batch)
 
-        z_batch = self.project_inner_loop_outputs(XCW_batch)  # [B,N,F]
+        # z_batch = self.project_inner_loop_outputs(XCW_batch)  # [B,N,F]
+
+        z_batch = XCW_batch.reshape(B, N, -1)
 
         if return_params:
             return z_batch, batch_params_dict
@@ -1833,22 +1847,22 @@ class TttDecoderLayer(nn.Module):
         # residual = hidden_states
         # hidden_states = self.input_layernorm(hidden_states)
 
-        if not self.fused_add_norm:
-            residual = (hidden_states + residual) if residual is not None else hidden_states
-            hidden_states = self.input_layernorm(residual.to(dtype=self.input_layernorm.weight.dtype))
-            if self.residual_in_fp32:
-                residual = residual.to(torch.float32)
-        else:
-            fused_add_norm_fn = rms_norm_fn
-            hidden_states, residual = fused_add_norm_fn(
-                hidden_states,
-                self.input_layernorm.weight,
-                self.input_layernorm.bias,
-                residual=residual,
-                prenorm=True,
-                residual_in_fp32=self.residual_in_fp32,
-                eps=self.input_layernorm.eps,
-            )
+        # if not self.fused_add_norm:
+        #     residual = (hidden_states + residual) if residual is not None else hidden_states
+        #     hidden_states = self.input_layernorm(residual.to(dtype=self.input_layernorm.weight.dtype))
+        #     if self.residual_in_fp32:
+        #         residual = residual.to(torch.float32)
+        # else:
+        #     fused_add_norm_fn = rms_norm_fn
+        #     hidden_states, residual = fused_add_norm_fn(
+        #         hidden_states,
+        #         self.input_layernorm.weight,
+        #         self.input_layernorm.bias,
+        #         residual=residual,
+        #         prenorm=True,
+        #         residual_in_fp32=self.residual_in_fp32,
+        #         eps=self.input_layernorm.eps,
+        #     )
         # TTT
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
@@ -1860,25 +1874,25 @@ class TttDecoderLayer(nn.Module):
         )
         # hidden_states = (residual + hidden_states).to(hidden_states.dtype)  # @xinhao: rms and add are fused in the next step
 
-        if not self.fused_add_norm:
-            residual = (hidden_states + residual) if residual is not None else hidden_states
-            hidden_states = self.post_attention_layernorm(residual.to(dtype=self.post_attention_layernorm.weight.dtype))
-            if self.residual_in_fp32:
-                residual = residual.to(torch.float32)
-        else:
-            fused_add_norm_fn = rms_norm_fn
-            hidden_states, residual = fused_add_norm_fn(
-                hidden_states,
-                self.post_attention_layernorm.weight,
-                self.post_attention_layernorm.bias,
-                residual=residual,
-                prenorm=True,
-                residual_in_fp32=self.residual_in_fp32,
-                eps=self.post_attention_layernorm.eps,
-            )
+        # if not self.fused_add_norm:
+        #     residual = (hidden_states + residual) if residual is not None else hidden_states
+        #     hidden_states = self.post_attention_layernorm(residual.to(dtype=self.post_attention_layernorm.weight.dtype))
+        #     if self.residual_in_fp32:
+        #         residual = residual.to(torch.float32)
+        # else:
+        #     fused_add_norm_fn = rms_norm_fn
+        #     hidden_states, residual = fused_add_norm_fn(
+        #         hidden_states,
+        #         self.post_attention_layernorm.weight,
+        #         self.post_attention_layernorm.bias,
+        #         residual=residual,
+        #         prenorm=True,
+        #         residual_in_fp32=self.residual_in_fp32,
+        #         eps=self.post_attention_layernorm.eps,
+        #     )
 
         # Fully Connected
-        hidden_states = self.mlp_forward(hidden_states)
+        # hidden_states = self.mlp_forward(hidden_states)
 
         return hidden_states, residual
 
@@ -2032,21 +2046,21 @@ class TttModel(TttPreTrainedModel):
             cache_params.seqlen_offset += inputs_embeds.shape[1]
 
         # hidden_states = self.norm(hidden_states)
-        if not self.fused_add_norm:
-            residual = (hidden_states + residual) if residual is not None else hidden_states
-            hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
-        else:
-            # Set prenorm=False here since we don't need the residual
-            fused_add_norm_fn = rms_norm_fn
-            hidden_states = fused_add_norm_fn(
-                hidden_states,
-                self.norm_f.weight,
-                self.norm_f.bias,
-                eps=self.norm_f.eps,
-                residual=residual,
-                prenorm=False,
-                residual_in_fp32=self.residual_in_fp32,
-            )
+        # if not self.fused_add_norm:
+        #     residual = (hidden_states + residual) if residual is not None else hidden_states
+        #     hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
+        # else:
+        #     # Set prenorm=False here since we don't need the residual
+        #     fused_add_norm_fn = rms_norm_fn
+        #     hidden_states = fused_add_norm_fn(
+        #         hidden_states,
+        #         self.norm_f.weight,
+        #         self.norm_f.bias,
+        #         eps=self.norm_f.eps,
+        #         residual=residual,
+        #         prenorm=False,
+        #         residual_in_fp32=self.residual_in_fp32,
+        #     )
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
@@ -2078,7 +2092,9 @@ class TttForCausalLM(TttPreTrainedModel):
         self.config = config
 
     def _get_output_logits(self, hidden_states):
-        logits = self.lm_head(hidden_states)
+        # logits = self.lm_head(hidden_states)
+        logits = torch.zeros((hidden_states.shape[0], 1, self.vocab_size),
+                             device=hidden_states.device, dtype=hidden_states.dtype)
         return logits
 
     def get_input_embeddings(self):
@@ -2181,6 +2197,7 @@ class TttForCausalLM(TttPreTrainedModel):
             is_last_in_chunk=is_last_in_chunk,
         )
 
+        # hidden_states = outputs[0][:,-1:,:]  # [BS,N,F] -> [BS,1,F] to avoid OOM when prefilling
         hidden_states = outputs[0]
         if self.config.pretraining_tp > 1:
             lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)

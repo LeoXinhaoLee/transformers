@@ -169,7 +169,6 @@ elif is_ttt:
         temperature=1.0,
         top_k=1,  # @xinhao: mamba src code: shortcut for greedy
         top_p=0,
-        i=i  # @xinhao: for debug output
     )
 else:
     if args.use_compile:
@@ -222,6 +221,7 @@ else:
 
     logger.info(f"Prompt length: {in_len}, generation length: {out_len - in_len}")
     logger.info(f"Prompt processing + Decoding time: {avg_time * 1000:.0f}ms")
+    logger.info(f"Throughput (total tok = prefill): {args.batch * in_len / avg_time:.3f} tokens / s")
     logger.info(f"Throughput (total tok = prefill + decode): {args.batch * out_len / avg_time:.3f} tokens / s")
     logger.info(f"Throughput (total tok = decode): {args.batch * (out_len - in_len) / avg_time:.3f} tokens / s")
     logger.info("==================================")
