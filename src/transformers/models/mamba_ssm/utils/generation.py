@@ -199,8 +199,8 @@ def decode(
         start.record()
 
     scores, sequences = [], [input_ids]
-    # if input_ids.shape[1] == 1:
-    #     inference_params.seqlen_offset = 1  # TODO: @xinhao: prompt=1 use decode mode directly as a hack
+    if input_ids.shape[1] == 1:
+        inference_params.seqlen_offset = 1  # TODO: @xinhao: prompt=1 use decode mode directly as a hack
 
     while not should_stop(sequences[-1], inference_params):
 
@@ -390,6 +390,8 @@ def capture_graph(
     inference_params.lengths_per_sample[:] = inference_params.seqlen_offset
 
     # Warmup before capture
+    # n_warmups = 16384
+    # print('Warmup: ', n_warmups)
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):

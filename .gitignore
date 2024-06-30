@@ -171,6 +171,7 @@ tags
 # Xinhao's dev
 *.sh
 *.out
+plot*
 exp
 profile
 history_scripts

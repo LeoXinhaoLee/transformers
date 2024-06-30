@@ -2197,8 +2197,7 @@ class TttForCausalLM(TttPreTrainedModel):
             is_last_in_chunk=is_last_in_chunk,
         )
 
-        # hidden_states = outputs[0][:,-1:,:]  # [BS,N,F] -> [BS,1,F] to avoid OOM when prefilling
-        hidden_states = outputs[0]
+        hidden_states = outputs[0][:,-1:,:]  # [BS,N,F] -> [BS,1,F] to avoid OOM when prefilling
         if self.config.pretraining_tp > 1:
             lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
             logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]

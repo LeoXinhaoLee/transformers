@@ -39,6 +39,7 @@ from transformers import LlamaForCausalLM, LlamaConfig
 from transformers.models.mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel  # copy from mamba repo, modify generation to avoid OOM
 from transformers.models.ttt.configuration_ttt import TTT_STANDARD_CONFIGS, TttConfig  # 125m and 1b config
 
+# from transformers.models.ttt_full_prefill_decode_optimize.modeling_ttt_no_linear import TttForCausalLM
 from transformers.models.ttt_full_prefill_decode_optimize.modeling_ttt import TttForCausalLM
 
 parser = argparse.ArgumentParser(description="Generation benchmarking")
@@ -104,16 +105,52 @@ if is_mamba:
     assert not args.use_compile, "Mamba does not support torch.compile!"
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
     # model = MambaLMHeadModel.from_pretrained(args.model_name, device=device, dtype=dtype)
+    ## 1.4B
     config = {
         "d_model": 2048,
         "n_layer": 48,
+        # "n_layer": 1,
         "vocab_size": 32000,  # llama2 tokenizer's vocab size
+        # "vocab_size": 1024,
         "ssm_cfg": {},
         "rms_norm": True,
         "residual_in_fp32": True,
         "fused_add_norm": True,
         "pad_vocab_size_multiple": 8
     }
+    ## 780M
+    # config = {
+    #     "d_model": 1536,
+    #     "n_layer": 48,
+    #     "vocab_size": 32000,
+    #     "ssm_cfg": {},
+    #     "rms_norm": True,
+    #     "residual_in_fp32": True,
+    #     "fused_add_norm": True,
+    #     "pad_vocab_size_multiple": 8
+    # }
+    ## 370M
+    # config = {
+    #     "d_model": 1024,
+    #     "n_layer": 48,
+    #     "vocab_size": 32000,
+    #     "ssm_cfg": {},
+    #     "rms_norm": True,
+    #     "residual_in_fp32": True,
+    #     "fused_add_norm": True,
+    #     "pad_vocab_size_multiple": 8
+    # }
+    ## 130M
+    # config = {
+    #     "d_model": 768,
+    #     "n_layer": 24,
+    #     "vocab_size": 50277,
+    #     "ssm_cfg": {},
+    #     "rms_norm": True,
+    #     "residual_in_fp32": True,
+    #     "fused_add_norm": True,
+    #     "pad_vocab_size_multiple": 8
+    # }
     model = MambaLMHeadModel(**config, device=device, dtype=dtype)
 elif is_ttt:
     ttt_size = args.model_name.split('-')[-1]
@@ -126,6 +163,10 @@ elif is_ttt:
     ttt_config.inner_net = args.inner_net
     ttt_config.use_compile = args.use_compile
     ttt_config.dtype = dtype
+
+    # ttt_config.num_hidden_layers = 1
+    # ttt_config.vocab_size = 1024
+
     # @xinhao: follow mamba-1.4b
     ttt_config.fused_add_norm = True
     ttt_config.residual_in_fp32 = True

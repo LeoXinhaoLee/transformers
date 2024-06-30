@@ -154,6 +154,7 @@ class MixerModel(nn.Module):
                 hidden_states, residual, inference_params=inference_params
             )
 
+        '''
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states
             hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
@@ -169,6 +170,7 @@ class MixerModel(nn.Module):
                 prenorm=False,
                 residual_in_fp32=self.residual_in_fp32,
             )
+        '''
 
         return hidden_states
 
@@ -211,6 +213,7 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
             )
         )
         self.tie_weights()
+        self.vocab_size = vocab_size
 
     def tie_weights(self):
         self.lm_head.weight = self.backbone.embedding.weight
@@ -226,8 +229,9 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         hidden_states = self.backbone(input_ids, inference_params=inference_params)
         # if num_last_tokens > 0:
         #     hidden_states = hidden_states[:, -num_last_tokens:]
-        hidden_states = hidden_states[:, -1:]
-        lm_logits = self.lm_head(hidden_states)
+        # lm_logits = self.lm_head(hidden_states)
+        lm_logits = torch.zeros((hidden_states.shape[0], 1, self.vocab_size),
+                                device=hidden_states.device, dtype=hidden_states.dtype)
         CausalLMOutput = namedtuple("CausalLMOutput", ["logits"])
         return CausalLMOutput(logits=lm_logits)
 
