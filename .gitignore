@@ -169,9 +169,11 @@ tags
 .ruff_cache
 
 # Xinhao's dev
+benchmark_scripts/
 *.sh
 *.out
 plot*
+test*
 exp
 profile
 history_scripts

@@ -39,7 +39,6 @@ from transformers import LlamaForCausalLM, LlamaConfig
 from transformers.models.mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel  # copy from mamba repo, modify generation to avoid OOM
 from transformers.models.ttt.configuration_ttt import TTT_STANDARD_CONFIGS, TttConfig  # 125m and 1b config
 
-# from transformers.models.ttt_full_prefill_decode_optimize.modeling_ttt_no_linear import TttForCausalLM
 from transformers.models.ttt_full_prefill_decode_optimize.modeling_ttt import TttForCausalLM
 
 parser = argparse.ArgumentParser(description="Generation benchmarking")
@@ -109,48 +108,13 @@ if is_mamba:
     config = {
         "d_model": 2048,
         "n_layer": 48,
-        # "n_layer": 1,
         "vocab_size": 32000,  # llama2 tokenizer's vocab size
-        # "vocab_size": 1024,
         "ssm_cfg": {},
         "rms_norm": True,
         "residual_in_fp32": True,
         "fused_add_norm": True,
         "pad_vocab_size_multiple": 8
     }
-    ## 780M
-    # config = {
-    #     "d_model": 1536,
-    #     "n_layer": 48,
-    #     "vocab_size": 32000,
-    #     "ssm_cfg": {},
-    #     "rms_norm": True,
-    #     "residual_in_fp32": True,
-    #     "fused_add_norm": True,
-    #     "pad_vocab_size_multiple": 8
-    # }
-    ## 370M
-    # config = {
-    #     "d_model": 1024,
-    #     "n_layer": 48,
-    #     "vocab_size": 32000,
-    #     "ssm_cfg": {},
-    #     "rms_norm": True,
-    #     "residual_in_fp32": True,
-    #     "fused_add_norm": True,
-    #     "pad_vocab_size_multiple": 8
-    # }
-    ## 130M
-    # config = {
-    #     "d_model": 768,
-    #     "n_layer": 24,
-    #     "vocab_size": 50277,
-    #     "ssm_cfg": {},
-    #     "rms_norm": True,
-    #     "residual_in_fp32": True,
-    #     "fused_add_norm": True,
-    #     "pad_vocab_size_multiple": 8
-    # }
     model = MambaLMHeadModel(**config, device=device, dtype=dtype)
 elif is_ttt:
     ttt_size = args.model_name.split('-')[-1]
@@ -163,10 +127,6 @@ elif is_ttt:
     ttt_config.inner_net = args.inner_net
     ttt_config.use_compile = args.use_compile
     ttt_config.dtype = dtype
-
-    # ttt_config.num_hidden_layers = 1
-    # ttt_config.vocab_size = 1024
-
     # @xinhao: follow mamba-1.4b
     ttt_config.fused_add_norm = True
     ttt_config.residual_in_fp32 = True
@@ -188,7 +148,7 @@ attn_mask = torch.ones_like(input_ids, dtype=torch.long, device=device)
 max_length = input_ids.shape[1] + args.genlen
 
 if is_mamba:
-    fn = lambda i: model.generate(
+    fn = lambda: model.generate(
         input_ids=input_ids,
         max_length=max_length,
         cg=(not args.no_cg),
@@ -200,7 +160,7 @@ if is_mamba:
         top_p=0,
     )
 elif is_ttt:
-    fn = lambda i: model.generate(
+    fn = lambda: model.generate(
         input_ids=input_ids,
         max_length=max_length,
         cg=(not args.no_cg),
@@ -216,7 +176,7 @@ else:
         model = torch.compile(model)  # @xinhao: can compile the whole Transformer for decode, though doesn't help
     if not args.no_cg:
         logger.info(f"CUDA Graph Not Implemented for Transformers")
-    fn = lambda i: model.generate(
+    fn = lambda: model.generate(
         input_ids=input_ids,
         attention_mask=attn_mask,
         max_length=max_length,
@@ -227,7 +187,7 @@ else:
     )
 
 
-out = fn(0)  # capture graph if cg=True, will not be timed
+out = fn()  # capture graph if cg=True, will not be timed
 logger.info("Succeeded.")
 out_len = len(out.sequences[0])
 in_len = len(input_ids[0])
@@ -240,7 +200,7 @@ if args.profile:
                  record_shapes=True, profile_memory=True, use_cuda=True,
                  with_flops=True, with_stack=True, with_modules=True
         ) as prof:
-           fn(0)
+           fn()
     prof.export_chrome_trace(osp.join(args.logdir, f"trace.json"))
     prof.export_stacks(osp.join(args.logdir, f"cuda_flamedata.txt"), "self_cuda_time_total")
     prof.export_stacks(osp.join(args.logdir, f"cpu_flamedata.txt"), "self_cpu_time_total")
@@ -256,7 +216,7 @@ else:
     torch.cuda.synchronize()
     start = time.time()
     for i in range(repeats):
-        fn(i)
+        fn()
     torch.cuda.synchronize()
     avg_time = (time.time() - start) / repeats
 
