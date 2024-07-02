@@ -24,7 +24,8 @@ from ...pytorch_utils import ALL_LAYERNORM_LAYERS
 from ...utils import ModelOutput, logging
 from .configuration_ttt import TttConfig
 
-from transformers.models.ttt_full_prefill_decode_optimize.generation import GenerationMixin, TttCache
+# from transformers.models.ttt_full_prefill_decode_optimize.generation import GenerationMixin, TttCache
+from transformers.models.ttt_full_prefill_decode_optimize.generation_logits import GenerationMixin, TttCache
 from transformers.models.mamba_ssm.ops.triton.layernorm import RMSNorm, rms_norm_fn
 from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 
@@ -591,8 +592,8 @@ def m1_prefill_chunk(states, inputs, i, ln_weight, ln_bias, Attn_b):
                                     inputs['coeff'][i], inputs['coeff_last'][i]  # [B*nh,CS,CS], [B*nh,1,CS]
 
     Z1 = XB_chunk @ W1_init + b1_init  # [B*nh,K,f] @ [B*nh,f,f] -> [B*nh,K,f]
-    reconstruction_target = XA_chunk - XB_chunk
-    grad_l_wrt_Z1 = ln_fused_l2_bwd(Z1, reconstruction_target, ln_weight, ln_bias)  # [B*nh,K=1,f]: torch.compile makes it a lot faster
+    l2_target = XA_chunk - XB_chunk
+    grad_l_wrt_Z1 = ln_fused_l2_bwd(Z1, l2_target, ln_weight, ln_bias)  # [B*nh,K=1,f]: torch.compile makes it a lot faster
 
     b1_bar = b1_init - (coeff_chunk * Attn_b) @ grad_l_wrt_Z1
 
@@ -616,8 +617,8 @@ def m1_decode_end_chunk(states, inputs, ln_weight, ln_bias):
                                      inputs['token_idx'], inputs['ilr_gated']  # [B*nh,N=1,f], [1,1,1], [B*nh,N=1,1]
 
     Z1 = XB_chunk @ W1_init + b1_init  # [B*nh,K=1,f] @ [B*nh,f,f] + [B*nh,1,f] -> [B*nh,K=1,f]
-    reconstruction_target = XA_chunk - XB_chunk
-    grad_l_wrt_Z1 = ln_fused_l2_bwd(Z1, reconstruction_target, ln_weight, ln_bias)  # [B*nh,K=1,f]
+    l2_target = XA_chunk - XB_chunk
+    grad_l_wrt_Z1 = ln_fused_l2_bwd(Z1, l2_target, ln_weight, ln_bias)  # [B*nh,K=1,f]
 
     grad_l_wrt_Z1 = ilr_gated * grad_l_wrt_Z1  # [B*nh,K=1,f]
 
@@ -644,8 +645,8 @@ def m1_decode(states, inputs, ln_weight, ln_bias):
                                      inputs['token_idx'], inputs['ilr_gated']  # [B*nh,N=1,f], [1,1,1], [B*nh,N=1,1]
 
     Z1 = XB_chunk @ W1_init + b1_init  # [B*nh,K=1,f] @ [B*nh,f,f] + [B*nh,1,f] -> [B*nh,K=1,f]
-    reconstruction_target = XA_chunk - XB_chunk
-    grad_l_wrt_Z1 = ln_fused_l2_bwd(Z1, reconstruction_target, ln_weight, ln_bias)  # [B*nh,K=1,f]
+    l2_target = XA_chunk - XB_chunk
+    grad_l_wrt_Z1 = ln_fused_l2_bwd(Z1, l2_target, ln_weight, ln_bias)  # [B*nh,K=1,f]
 
     grad_l_wrt_Z1 = ilr_gated * grad_l_wrt_Z1  # [B*nh,K=1,f]
 
@@ -2185,16 +2186,14 @@ class TttForCausalLM(TttPreTrainedModel):
             is_last_in_chunk=is_last_in_chunk,
         )
 
-        # hidden_states = outputs[0]
-        hidden_states = outputs[0][:,-1:,:]  # [BS,N,F] -> [BS,1,F] to avoid OOM when prefilling
+        hidden_states = outputs[0]
+        # hidden_states = outputs[0][:,-1:,:]  # [BS,N,F] -> [BS,1,F] to avoid OOM when prefilling
         if self.config.pretraining_tp > 1:
             lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
             logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
             logits = torch.cat(logits, dim=-1)
         else:
             logits = self.get_output_logits(hidden_states)
-            # logits = self.lm_head(hidden_states)
-        # logits = logits.float()
 
         loss = None
         if labels is not None:

@@ -27,7 +27,6 @@ parser.add_argument("--use_compile", action='store_true')
 parser.add_argument("--no_cg", action='store_true')    # @xinhao: currently only implemented for Mamba and TTT
 args = parser.parse_args()
 
-torch.random.manual_seed(0)
 device = "cuda"
 dtype = torch.float16
 
@@ -45,14 +44,22 @@ ttt_config_tk.inner_net = args.inner_net + '_tk'
 
 print('Inner Net: ', args.inner_net)
 
+torch.random.manual_seed(0)
 model_pt = TttForCausalLM(ttt_config_pt).to(device=device, dtype=dtype)
 model_pt.eval()
 print(f"Number of parameters (PT): {sum(p.numel() for p in model_pt.parameters() if p.requires_grad)}")
 
+torch.random.manual_seed(0)
 model_tk = TttForCausalLM(ttt_config_tk).to(device=device, dtype=dtype)
 model_tk.eval()
 print(f"Number of parameters (TK): {sum(p.numel() for p in model_tk.parameters() if p.requires_grad)}")
 
+def compare_model_params(model1, model2):
+    for param1, param2 in zip(model1.parameters(), model2.parameters()):
+        if not torch.equal(param1, param2):
+            raise ValueError("PT and TK model's params are different!")
+
+compare_model_params(model_pt, model_tk)
 
 input_ids = torch.randint(1, 32000, (args.batch, args.promptlen), dtype=torch.long, device=device)
 max_length = input_ids.shape[1] + args.genlen
@@ -65,7 +72,7 @@ fn_pt = lambda: model_pt.generate(
         output_scores=False,
         enable_timing=False,
         temperature=1.0,
-        top_k=1,  # @xinhao: mamba src code: shortcut for greedy
+        top_k=1,
         top_p=0)
 
 fn_tk = lambda: model_tk.generate(
@@ -76,13 +83,67 @@ fn_tk = lambda: model_tk.generate(
         output_scores=False,
         enable_timing=False,
         temperature=1.0,
-        top_k=1,  # @xinhao: mamba src code: shortcut for greedy
+        top_k=1,
         top_p=0)
 
 out_pt = fn_pt()  # capture graph if cg=True, will not be timed
-# out_tk = fn_tk()  # capture graph if cg=True, will not be timed
-# del out_pt, out_tk
+out_tk = fn_tk()  # capture graph if cg=True, will not be timed
+print("Succeeded.")
+print('Out Len: ', len(out_pt.sequences[0]))
+print('In Len: ', len(input_ids[0]))
+del out_pt, out_tk
 
 out_pt = fn_pt()
-print(out_pt[0].shape)
+sequence_pt, logits_list_pt = out_pt.sequences, out_pt.logits  # [BS,prompt_len+1+gen_len], [[BS,prompt_len,V], [BS,V], [BS,V], ...]
 
+out_tk = fn_tk()
+sequence_tk, logits_list_tk = out_tk.sequences, out_tk.logits  # [BS,prompt_len+1+gen_len], [[BS,prompt_len,V], [BS,V], [BS,V], ...]
+
+### Prefill ###
+prompt_logits_max_diff = []
+prompt_logits_mse_diff = []
+prompt_token_diff = []
+if args.promptlen > 1:
+    prompt_logits_pt = logits_list_pt[0]  # [BS, prompt_len, V]
+    prompt_logits_tk = logits_list_tk[0]
+    prompt_logits_max_diff = torch.abs(prompt_logits_pt - prompt_logits_tk).max(dim=2)[0].max(dim=0)[0].cpu().numpy()  # [prompt_len,]
+    prompt_logits_mse_diff = ((prompt_logits_pt - prompt_logits_tk) ** 2).mean(dim=(0,2)).cpu().numpy()  # [prompt_len,]
+    prompt_token_diff = torch.sum(prompt_logits_pt.argmax(dim=-1) != prompt_logits_tk.argmax(dim=-1), axis=0).cpu().numpy()  # [prompt_len,]
+
+### Decode ###
+decode_logits_max_diff = []
+decode_logits_mse_diff = []
+decode_token_diff = []
+if args.genlen > 0:
+    assert len(logits_list_pt) > 1 and len(logits_list_tk) > 1 and  len(logits_list_pt) ==  len(logits_list_tk)
+    if args.promptlen == 1:
+        decode_st = 0
+    else:
+        decode_st = 2
+    for i in range(decode_st, len(logits_list_pt)):
+        decode_logits_pt = logits_list_pt[i]
+        decode_logits_tk = logits_list_tk[i]
+        decode_logits_max_diff.append(
+            torch.abs(decode_logits_pt - decode_logits_tk).max()  # [B,V].max()
+        )
+        decode_logits_mse_diff.append(
+            ((decode_logits_pt - decode_logits_tk) ** 2).mean()   # [B,V].mean()
+        )
+        decode_token_diff.append(
+            torch.sum(decode_logits_pt.argmax(dim=-1) != decode_logits_tk.argmax(dim=-1))
+        )
+decode_logits_max_diff = torch.tensor(decode_logits_max_diff).cpu().numpy()
+decode_logits_mse_diff = torch.tensor(decode_logits_mse_diff).cpu().numpy()
+decode_token_diff = torch.tensor(decode_token_diff).cpu().numpy()
+
+all_stats = {
+        'prompt_logits_max_diff': prompt_logits_max_diff,
+        'prompt_logits_mse_diff': prompt_logits_mse_diff,
+        'prompt_token_diff': prompt_token_diff,
+        'decode_logits_max_diff': decode_logits_max_diff,
+        'decode_logits_mse_diff': decode_logits_mse_diff,
+        'decode_token_diff': decode_token_diff,
+}
+
+os.makedirs(args.logdir, exist_ok=True)
+torch.save(all_stats, os.path.join(args.logdir, 'all_stats.pth'))

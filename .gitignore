@@ -172,7 +172,6 @@ tags
 benchmark_scripts/
 *.sh
 *.out
-plot*
 test*
 exp
 profile
