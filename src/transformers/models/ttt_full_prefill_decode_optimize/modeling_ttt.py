@@ -132,6 +132,59 @@ def ln_fused_l2_bwd(x, l2_target, gamma, beta, eps=1e-6):
     )
     return z
 
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+def apply_rotary_pos_emb(q, k, cos, sin):
+    """
+    Args:
+        q, k: [B,nh,N,f]
+        cos, sin: [B,N,f]
+        position_ids: [B,N]
+        unsqueeze_dim:
+
+    Returns:
+
+    """
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+class TTTRotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_position_embeddings=16, base=10000, device=None, scaling_factor=1.0):
+        """
+        TTTRotary is equivalent to LlamaLayerLlamaRotaryEmbedding in implementation, except TTT sets max_position_embedding to inner_chunk_size.
+        """
+
+        super().__init__()
+        self.scaling_factor = scaling_factor
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float().to(device) / self.dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    @torch.no_grad()
+    def forward(self, x, position_ids):
+        # x: [bs, num_attention_heads, seq_len, head_size]
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        position_ids_expanded = position_ids[:, None, :].float()
+        # Force float32 since bfloat16 loses precision on long contexts
+        # See https://github.com/huggingface/transformers/pull/29285
+        device_type = x.device.type
+        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
 
 class TttMLP(nn.Module):
     def __init__(self, config):
@@ -295,6 +348,16 @@ class TttBaseModule(nn.Module):
         self.register_buffer("token_idx", token_idx, persistent=False)
         self.learnable_token_idx = nn.Parameter(torch.zeros((1, 1, self.inner_chunk_size, 1)))
 
+        self.rotary_emb = TTTRotaryEmbedding(
+            self.head_dim,
+            max_position_embeddings=self.inner_chunk_size,
+            base=self.config.rope_theta,
+        )
+        if self.config.use_compile:
+            self.apply_rotary_pos_emb = torch.compile(apply_rotary_pos_emb)
+        else:
+            self.apply_rotary_pos_emb = apply_rotary_pos_emb
+
         self.qkv_proj = nn.Linear(self.hidden_size, 3 * self.hidden_size + self.num_heads, bias=False)  # share QK so can add Gate. Gate ilr W is also here
         self.gate_ilr_bias = nn.Parameter(torch.zeros(1, 1, self.num_heads))
         self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
@@ -319,17 +382,9 @@ class TttBaseModule(nn.Module):
         # @xinhao: ln_weight and _bias must be normal tensor instead of nn.Parameter, otherwise will have triton error
         ln_weight_data = nn.LayerNorm(self.head_dim).weight.data
         self.ln_weight = nn.Parameter(torch.tile(ln_weight_data.reshape(1, 1, 1, -1), (1, self.num_heads, 1, 1)))  # [1,h,1,f]
-        # self.ln_weight = torch.tile(ln_weight_data.reshape(1, 1, 1, -1), (1, self.num_heads, 1, 1)).to(self.config.dtype).to('cuda') * 1.
-
         ln_bias_data = nn.LayerNorm(self.head_dim).bias.data
         self.ln_bias = nn.Parameter(torch.tile(ln_bias_data.reshape(1, 1, 1, -1), (1, self.num_heads, 1, 1)))  # [1,h,1,f]
-        # self.ln_bias = torch.tile(ln_bias_data.reshape(1, 1, 1, -1), (1, self.num_heads, 1, 1)).to(self.config.dtype).to('cuda') * 1.
-
         self.out_norm = nn.LayerNorm(self.hidden_size)
-        out_ln_weight_data = self.out_norm.weight.data
-        out_ln_bias_data = self.out_norm.bias.data
-        self.out_ln_weight_data = out_ln_weight_data.to(self.config.dtype).to('cuda')  # [1,F]
-        self.out_ln_bias_data = out_ln_bias_data.to(self.config.dtype).to('cuda')
 
         if self.config.use_compile:
             self.residual_add_post_LN = torch.compile(self._residual_add_post_LN)
@@ -476,7 +531,6 @@ class TttBaseModule(nn.Module):
             inner_chunk_step_offset = 0
             token_idx = self.token_idx + self.learnable_token_idx  # [1,1,CS,1]
         else:
-            # TODO: keeps recompiling when decoding, so cannot torch.compile this function when decode
             inner_chunk_step_offset = cache_params.seqlen_offset % self.inner_chunk_size
             token_idx = self.token_idx[:, :, inner_chunk_step_offset, :] + \
                         self.learnable_token_idx[:, :, inner_chunk_step_offset, :] # [1,1,CS,1] -> [1,1,1]
@@ -493,9 +547,15 @@ class TttBaseModule(nn.Module):
 
         # XC, XB = self.conv_qk(XCB, cache_params, is_prefill)  # [B,N,F] -> conv1: [B,N,F], conv2: [B,N,F]
         XC, XB = self.conv_qk_fused(XCB, cache_params, is_prefill)  # [B,N,F] -> conv1: [B,N,F], conv2: [B,N,F]
+        XC = XC.reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # [B,N,nh,f] -> [B,nh,N,f]
+        XB = XB.reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
-        XC = XC.reshape(B, L, self.num_heads, self.head_dim).permute(0,2,1,3).reshape(-1, L, self.head_dim)  # [B*nh,N,f]
-        XB = XB.reshape(B, L, self.num_heads, self.head_dim).permute(0,2,1,3).reshape(-1, L, self.head_dim)
+        # Apply rotary on XQ, XK
+        cos, sin = self.rotary_emb(XA, position_ids % self.inner_chunk_size)  # [B,N,f]
+        XC, XB = self.apply_rotary_pos_emb(XC, XB, cos, sin)
+        XC = XC.reshape(-1, L, self.head_dim)  # [B,nh,N,f] -> [B*nh,N,f]
+        XB = XB.reshape(-1, L, self.head_dim)
+
         ilr_gated = F.sigmoid(
             (ilr_gated + self.gate_ilr_bias).permute(0,2,1).reshape(-1,L,1)
         )  # ([B,N,nh] + [1,1,nh]) -> [B,nh,N] -> [B*nh,N,1]
@@ -537,11 +597,6 @@ class TttBaseModule(nn.Module):
             cache_params=cache_params,
             is_prefill=is_prefill, is_last_in_chunk=is_last_in_chunk,
         )
-
-        # @xinhao: for QKVO-MLP Only
-        # B, N = hidden_states.shape[:2]
-        # XC = XB = XA = XGate = hidden_states.reshape(B, N, self.num_heads, self.head_dim).permute(0,2,1,3).reshape(-1, N, self.head_dim)
-        # XCW_batch = XA + XB + XC; batch_params_dict = None
 
         if is_prefill:
             XCW_batch = self.gate_out_norm(B, N, XGate, XCW_batch)
@@ -837,8 +892,7 @@ class TttM1BMMModule(TttBaseModule):
         self.b1 = nn.Parameter(torch.ones(size=(self.num_heads, 1, self.head_dim)))
 
         if self.config.use_compile:
-            self.prefill_chunk = torch.compile(m1_prefill_chunk)  # TODO: this compile speeds up from 39k to 49k, but in micro-bench it seems not helpful
-                                                                  # TODO: maybe because micro compiles the whole for loop, which is too large
+            self.prefill_chunk = torch.compile(m1_prefill_chunk)
             # self.prefill_chunk = m1_prefill_chunk
             self.decode_end_chunk = torch.compile(m1_decode_end_chunk)
             self.decode = torch.compile(m1_decode)
@@ -1416,8 +1470,6 @@ class TttM1BMMTKModule(TttBaseModule):
             input_dtype = XA.dtype
             output = torch.empty_like(XA)
 
-            # ln_weight = self.ln_weight.squeeze(0).expand(-1, CS, -1).contiguous()  # TODO
-            # ln_bias = self.ln_bias.squeeze(0).expand(-1, CS, -1).contiguous()
             ln_weight = self.ln_weight.data.squeeze(0).expand(-1, CS, -1).contiguous()
             ln_bias = self.ln_bias.data.squeeze(0).expand(-1, CS, -1).contiguous()
             b1_init = b1_init.expand(-1, -1, CS, -1).contiguous()
@@ -1462,7 +1514,7 @@ class TttM1BMMTKModule(TttBaseModule):
             if is_last_in_chunk:
                 _m1_decode_end_chunk_kernel[grid](W1, W1_grad, b1, b1_grad,
                                                   XA, XB, XC,
-                                                  self.ln_weight.data, self.ln_bias.data,  # TODO
+                                                  self.ln_weight.data, self.ln_bias.data,
                                                   ilr_gated, token_idx, output,
                                                   W1.stride(0), W1.stride(1), W1.stride(2),
                                                   b1.stride(0), b1.stride(1), b1.stride(2),
@@ -1860,7 +1912,7 @@ class TttM2BMMTKModule(TttBaseModule):
             input_dtype = XA.dtype
             output = torch.empty_like(XA)
 
-            ln_weight = self.ln_weight.data.squeeze(0).expand(-1, CS, -1).contiguous()  # TODO
+            ln_weight = self.ln_weight.data.squeeze(0).expand(-1, CS, -1).contiguous()
             ln_bias = self.ln_bias.data.squeeze(0).expand(-1, CS, -1).contiguous()
             b1_init = b1_init.expand(-1, -1, CS, -1).contiguous()
             b2_init = b2_init.expand(-1, -1, CS, -1).contiguous()
