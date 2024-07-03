@@ -293,7 +293,7 @@ class TttBaseModule(nn.Module):
         token_idx = (self.config.inner_net_lr / self.head_dim) / torch.arange(1, self.inner_chunk_size + 1)  # [CS,]
         token_idx = token_idx.reshape(1, 1, -1, 1)  # [1,1,CS,1]
         self.register_buffer("token_idx", token_idx, persistent=False)
-        self.learnable_token_idx = nn.Parameter(torch.zeros((self.inner_chunk_size,)))
+        self.learnable_token_idx = nn.Parameter(torch.zeros((1, 1, self.inner_chunk_size, 1)))
 
         self.qkv_proj = nn.Linear(self.hidden_size, 3 * self.hidden_size + self.num_heads, bias=False)  # share QK so can add Gate. Gate ilr W is also here
         self.gate_ilr_bias = nn.Parameter(torch.zeros(1, 1, self.num_heads))
@@ -474,11 +474,12 @@ class TttBaseModule(nn.Module):
 
         if is_prefill:
             inner_chunk_step_offset = 0
-            token_idx = self.token_idx  # [1,1,CS,1]
+            token_idx = self.token_idx + self.learnable_token_idx  # [1,1,CS,1]
         else:
             # TODO: keeps recompiling when decoding, so cannot torch.compile this function when decode
             inner_chunk_step_offset = cache_params.seqlen_offset % self.inner_chunk_size
-            token_idx = self.token_idx[:, :, inner_chunk_step_offset, :]  # [1,1,CS,1] -> [1,1,1]
+            token_idx = self.token_idx[:, :, inner_chunk_step_offset, :] + \
+                        self.learnable_token_idx[:, :, inner_chunk_step_offset, :] # [1,1,CS,1] -> [1,1,1]
 
         XCBA_gilr = self.qkv_proj(hidden_states)  # [B,N, 3*F + nh]
 
