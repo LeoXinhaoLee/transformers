@@ -24,8 +24,8 @@ from ...pytorch_utils import ALL_LAYERNORM_LAYERS
 from ...utils import ModelOutput, logging
 from .configuration_ttt import TttConfig
 
-# from transformers.models.ttt_full_prefill_decode_optimize.generation import GenerationMixin, TttCache
-from transformers.models.ttt_full_prefill_decode_optimize.generation_logits import GenerationMixin, TttCache
+from transformers.models.ttt_full_prefill_decode_optimize.generation import GenerationMixin, TttCache
+# from transformers.models.ttt_full_prefill_decode_optimize.generation_logits import GenerationMixin, TttCache
 from transformers.models.mamba_ssm.ops.triton.layernorm import RMSNorm, rms_norm_fn
 from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 
@@ -149,17 +149,59 @@ class TttMLP(nn.Module):
         return down_proj
 
 
+class TTTConv(nn.Module):
+    def __init__(self, layer_idx, config):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.hidden_size = config.hidden_size
+        self.conv_kernel = config.conv_kernel
+        self.conv = nn.Conv1d(
+            self.hidden_size,
+            self.hidden_size,
+            bias=True,
+            kernel_size=self.conv_kernel,
+            groups=self.hidden_size,
+            padding=self.conv_kernel - 1,
+        )
+
+    def forward(self, x, is_prefill=False, cache_params=None):
+        B, N, D = x.shape
+
+        conv_weights = self.conv.weight.view(self.conv.weight.size(0), self.conv.weight.size(2))
+
+        if is_prefill:
+            x = x.transpose(-1, -2).contiguous()  # [B,F,N]
+            conv_output = causal_conv1d_fn(
+                x, conv_weights, self.conv.bias, activation=None
+            ).transpose(-1, -2).contiguous()
+            if cache_params is not None:
+                conv_states = F.pad(x, (self.conv_kernel - N, 0))
+                cache_params.params_dict["pre_ttt_conv_states"][self.layer_idx].copy_(conv_states)  # [B,F,KS]
+
+        else:
+            assert cache_params is not None
+            x = x[:, 0, :]  # [B,F]
+            conv_output = causal_conv1d_update(
+                x,
+                cache_params.params_dict['pre_ttt_conv_states'][self.layer_idx],
+                conv_weights,
+                self.conv.bias,
+                None,
+            )
+            conv_output = conv_output.unsqueeze(1)  # [B,N=1,F]
+
+        return conv_output
+
+
 @triton.jit
 def tanh(x):
     # Tanh is just a scaled sigmoid
     return 2 * tl.sigmoid(2 * x) - 1
 
-
 # from xformers impl.
 @triton.jit
 def gelu(x):
     return 0.5 * x * (1 + tanh(0.79788456 * (x + 0.044715 * x * x * x)))
-
 
 @triton.jit
 def diff_gelu_tl(x):
@@ -251,8 +293,10 @@ class TttBaseModule(nn.Module):
         token_idx = (self.config.inner_net_lr / self.head_dim) / torch.arange(1, self.inner_chunk_size + 1)  # [CS,]
         token_idx = token_idx.reshape(1, 1, -1, 1)  # [1,1,CS,1]
         self.register_buffer("token_idx", token_idx, persistent=False)
+        self.learnable_token_idx = nn.Parameter(torch.zeros((self.inner_chunk_size,)))
 
-        self.qkv_proj = nn.Linear(self.hidden_size, 3 * self.hidden_size + self.num_heads, bias=False)  # share QK so can add Gate
+        self.qkv_proj = nn.Linear(self.hidden_size, 3 * self.hidden_size + self.num_heads, bias=False)  # share QK so can add Gate. Gate ilr W is also here
+        self.gate_ilr_bias = nn.Parameter(torch.zeros(1, 1, self.num_heads))
         self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
 
         self.conv_q = nn.Conv1d(
@@ -274,11 +318,12 @@ class TttBaseModule(nn.Module):
 
         # @xinhao: ln_weight and _bias must be normal tensor instead of nn.Parameter, otherwise will have triton error
         ln_weight_data = nn.LayerNorm(self.head_dim).weight.data
-        # self.ln_weight = nn.Parameter(torch.tile(ln_weight_data.reshape(1, 1, 1, -1), (1, self.num_heads, 1, 1)))  # [1,h,1,f]
-        self.ln_weight = torch.tile(ln_weight_data.reshape(1, 1, 1, -1), (1, self.num_heads, 1, 1)).to(self.config.dtype).to('cuda') * 1.
+        self.ln_weight = nn.Parameter(torch.tile(ln_weight_data.reshape(1, 1, 1, -1), (1, self.num_heads, 1, 1)))  # [1,h,1,f]
+        # self.ln_weight = torch.tile(ln_weight_data.reshape(1, 1, 1, -1), (1, self.num_heads, 1, 1)).to(self.config.dtype).to('cuda') * 1.
+
         ln_bias_data = nn.LayerNorm(self.head_dim).bias.data
-        # self.ln_bias = nn.Parameter(torch.tile(ln_bias_data.reshape(1, 1, 1, -1), (1, self.num_heads, 1, 1)))  # [1,h,1,f]
-        self.ln_bias = torch.tile(ln_bias_data.reshape(1, 1, 1, -1), (1, self.num_heads, 1, 1)).to(self.config.dtype).to('cuda') * 1.
+        self.ln_bias = nn.Parameter(torch.tile(ln_bias_data.reshape(1, 1, 1, -1), (1, self.num_heads, 1, 1)))  # [1,h,1,f]
+        # self.ln_bias = torch.tile(ln_bias_data.reshape(1, 1, 1, -1), (1, self.num_heads, 1, 1)).to(self.config.dtype).to('cuda') * 1.
 
         self.out_norm = nn.LayerNorm(self.hidden_size)
         out_ln_weight_data = self.out_norm.weight.data
@@ -314,7 +359,8 @@ class TttBaseModule(nn.Module):
         output = torch.empty_like(XCW_batch)  # [B,N,F]
         grid = (B, 1, 1)
         _fuse_gate_ln_kernel[grid](XGate, XCW_batch, output,
-                                   self.out_ln_weight_data, self.out_ln_bias_data,
+                                   # self.out_ln_weight_data, self.out_ln_bias_data,
+                                   self.out_norm.weight.data, self.out_norm.bias.data,
                                    XCW_batch.stride(0),
                                    self.hidden_size)
         return output
@@ -449,7 +495,9 @@ class TttBaseModule(nn.Module):
 
         XC = XC.reshape(B, L, self.num_heads, self.head_dim).permute(0,2,1,3).reshape(-1, L, self.head_dim)  # [B*nh,N,f]
         XB = XB.reshape(B, L, self.num_heads, self.head_dim).permute(0,2,1,3).reshape(-1, L, self.head_dim)
-        ilr_gated = F.sigmoid(ilr_gated.permute(0,2,1).reshape(-1,L,1))  # [B,N,nh] -> [B,nh,N] -> [B*nh,N,1]
+        ilr_gated = F.sigmoid(
+            (ilr_gated + self.gate_ilr_bias).permute(0,2,1).reshape(-1,L,1)
+        )  # ([B,N,nh] + [1,1,nh]) -> [B,nh,N] -> [B*nh,N,1]
 
         XA = XA.contiguous()
         XB = XB.contiguous()
@@ -835,6 +883,8 @@ class TttM1BMMModule(TttBaseModule):
             )
             XCW_batch = XCW_batch.transpose(1,0).reshape(B_mul_NH, -1, HF).contiguous()  # [B*h,N,f]
 
+            XCW_batch = self.residual_add_post_LN(XC_residual, XCW_batch)
+
         else:
             # @xinhao: decoding from a prompt of length 1 will always have `inner_chunk_size=remainder=1`
             B_mul_NH, N, HF = inputs['XA'].shape  # [B*nh,N=1,f]
@@ -856,7 +906,7 @@ class TttM1BMMModule(TttBaseModule):
                     self.ln_bias,  # [1,nh,1,f]
                 )  # ret: [B*nh,N=1,f]
 
-        # XCW_batch = self.residual_add_post_LN(XC_residual, XCW_batch)
+            # XCW_batch = self.residual_add_post_LN(XC_residual, XCW_batch)
 
         return XCW_batch, None
 
@@ -1365,8 +1415,10 @@ class TttM1BMMTKModule(TttBaseModule):
             input_dtype = XA.dtype
             output = torch.empty_like(XA)
 
-            ln_weight = self.ln_weight.squeeze(0).expand(-1, CS, -1).contiguous()
-            ln_bias = self.ln_bias.squeeze(0).expand(-1, CS, -1).contiguous()
+            # ln_weight = self.ln_weight.squeeze(0).expand(-1, CS, -1).contiguous()  # TODO
+            # ln_bias = self.ln_bias.squeeze(0).expand(-1, CS, -1).contiguous()
+            ln_weight = self.ln_weight.data.squeeze(0).expand(-1, CS, -1).contiguous()
+            ln_bias = self.ln_bias.data.squeeze(0).expand(-1, CS, -1).contiguous()
             b1_init = b1_init.expand(-1, -1, CS, -1).contiguous()
             cumsum_matrix = torch.tril(torch.ones(CS, CS, dtype=input_dtype, device=input_device))
             make_last_b_matrix = torch.zeros(CS, CS, dtype=input_dtype, device=input_device)
@@ -1409,12 +1461,12 @@ class TttM1BMMTKModule(TttBaseModule):
             if is_last_in_chunk:
                 _m1_decode_end_chunk_kernel[grid](W1, W1_grad, b1, b1_grad,
                                                   XA, XB, XC,
-                                                  self.ln_weight, self.ln_bias,
+                                                  self.ln_weight.data, self.ln_bias.data,  # TODO
                                                   ilr_gated, token_idx, output,
                                                   W1.stride(0), W1.stride(1), W1.stride(2),
                                                   b1.stride(0), b1.stride(1), b1.stride(2),
                                                   XA.stride(0), XA.stride(1), XA.stride(2),
-                                                  self.ln_weight.stride(1), self.ln_weight.stride(2),
+                                                  self.ln_weight.data.stride(1), self.ln_weight.data.stride(2),
                                                   ilr_gated.stride(0), ilr_gated.stride(1),
                                                   CS, HF)
             else:
@@ -1422,12 +1474,12 @@ class TttM1BMMTKModule(TttBaseModule):
                 # @xinhao: Either (1) .contiguous() in get_inner_input(), or (2) use differnt strides at triton kernel
                 _m1_decode_kernel[grid](W1, W1_grad, b1, b1_grad,
                                         XA, XB, XC,
-                                        self.ln_weight, self.ln_bias,
+                                        self.ln_weight.data, self.ln_bias.data,
                                         ilr_gated, token_idx, output,
                                         W1.stride(0), W1.stride(1), W1.stride(2),
                                         b1.stride(0), b1.stride(1), b1.stride(2),
                                         XA.stride(0), XA.stride(1), XA.stride(2),
-                                        self.ln_weight.stride(1), self.ln_weight.stride(2),
+                                        self.ln_weight.data.stride(1), self.ln_weight.data.stride(2),
                                         ilr_gated.stride(0), ilr_gated.stride(1),
                                         CS, HF)
 
@@ -1538,16 +1590,16 @@ def _m2_decode_kernel(__W1, __W1_grad, __b1, __b1_grad,
     ln_weight = tl.load(_ln_weight)
     ln_bias = tl.load(_ln_bias)
 
-    Z1 = tl.sum(tl.trans(XB) * W1, axis=0)[None,:] + b1  # [1,f] @ [f,4f] + [1,4f]
-    X2 = gelu(Z1)
-    Z2 = tl.sum(tl.trans(X2) * W2, axis=0)[None,:] + b2  # [1,4f] @ [4f,f] + [1,f]
+    Z1 = tl.sum(tl.trans(XB) * W1, axis=0)[None, :] + b1  # [1,f] @ [f,4f] + [1,4f]
+    X2 = gelu(Z1).to(O_dtype)
+    Z2 = tl.sum(tl.trans(X2) * W2, axis=0)[None, :] + b2  # [1,4f] @ [4f,f] + [1,f]
 
     l2_target = XA - XB
 
-    mu = tl.sum(Z2, 1) / HF
-    var = tl.sum((Z2 - mu) * (Z2 - mu), 1) / HF
-    std = tl.sqrt(var + 1e-6)
-    Z2_hat = (Z2 - mu) / std  # [1,f]
+    mu = (tl.sum(Z2, 1) / HF).to(O_dtype)
+    var = (tl.sum((Z2 - mu) * (Z2 - mu), 1) / HF).to(O_dtype)
+    std = tl.sqrt(var + 1e-6).to(O_dtype)
+    Z2_hat = ((Z2 - mu) / std).to(O_dtype)  # [1,f]
     LN_out = ln_weight * Z2_hat + ln_bias  # [1,f] * [K=1,f] + [1,f]
     dl_dLN_out = LN_out - l2_target  # [1,f]
     dl_dZ2_hat = dl_dLN_out * ln_weight  # [1,f]
@@ -1556,10 +1608,9 @@ def _m2_decode_kernel(__W1, __W1_grad, __b1, __b1_grad,
     dl_dZ2_term_2 = tl.sum(dl_dZ2_hat, 1)
     dl_dZ2_term_3 = Z2_hat * tl.sum(dl_dZ2_hat * Z2_hat, 1)
     dl_dZ2_sum = dl_dZ2_term_1 - dl_dZ2_term_2 - dl_dZ2_term_3
-    dl_dZ2 = dl_dZ2_sum / (std * HF * 100)
-    dl_dZ2 = dl_dZ2 * 100.
+    dl_dZ2 = (dl_dZ2_sum / (std * HF)).to(O_dtype)
 
-    dl_dZ1 = tl.sum(tl.trans(dl_dZ2) * tl.trans(W2), axis=0)[None,:] * diff_gelu_tl(Z1)  # [1,f] @ [4f,f].t
+    dl_dZ1 = tl.sum(tl.trans(dl_dZ2) * tl.trans(W2), axis=0)[None, :] * diff_gelu_tl(Z1).to(O_dtype)  # [1,f] @ [4f,f].t
 
     ilr_mul_dl_dZ2 = ilr_gated * dl_dZ2  # [K=1,1] * [K=1,f]
     ilr_mul_dl_dZ1 = ilr_gated * dl_dZ1  # [K=1,1] * [K=1,f]
@@ -1571,9 +1622,9 @@ def _m2_decode_kernel(__W1, __W1_grad, __b1, __b1_grad,
     tl.store(_b1_grad, b1_grad.to(W_dtype))
     W1_bar = W1 - token_idx * W1_grad
     b1_bar = b1 - token_idx * b1_grad
-    Z1_bar = tl.sum(tl.trans(XC) * W1_bar, axis=0)[None,:] + b1_bar
+    Z1_bar = tl.sum(tl.trans(XC) * W1_bar, axis=0)[None, :] + b1_bar
 
-    X2_bar = gelu(Z1_bar)
+    X2_bar = gelu(Z1_bar).to(O_dtype)
 
     ##
     W2_grad += tl.trans(X2) * ilr_mul_dl_dZ2
@@ -1585,10 +1636,10 @@ def _m2_decode_kernel(__W1, __W1_grad, __b1, __b1_grad,
     Z2_bar = tl.sum(tl.trans(X2_bar) * W2_bar, axis=0)[None, :] + b2_bar
 
     ## residual + postln
-    mu_bar = tl.sum(Z2_bar, 1) / HF
-    var_bar = tl.sum((Z2_bar - mu_bar) * (Z2_bar - mu_bar), 1) / HF
-    std_bar = tl.sqrt(var_bar + 1e-6)
-    Z2_bar_hat = (Z2_bar - mu_bar) / std_bar  # [1,f]
+    mu_bar = (tl.sum(Z2_bar, 1) / HF).to(O_dtype)
+    var_bar = (tl.sum((Z2_bar - mu_bar) * (Z2_bar - mu_bar), 1) / HF).to(O_dtype)
+    std_bar = tl.sqrt(var_bar + 1e-6).to(O_dtype)
+    Z2_bar_hat = ((Z2_bar - mu_bar) / std_bar).to(O_dtype)  # [1,f]
     LN_out_bar = ln_weight * Z2_bar_hat + ln_bias  # [1,f] * [K=1,f] + [1,f]
     Z2_bar = XC + LN_out_bar
 
@@ -1693,16 +1744,16 @@ def _m2_decode_end_chunk_kernel(__W1, __W1_grad, __b1, __b1_grad,
     ln_weight = tl.load(_ln_weight)
     ln_bias = tl.load(_ln_bias)
 
-    Z1 = tl.sum(tl.trans(XB) * W1, axis=0)[None,:] + b1  # [1,f] @ [f,4f] + [1,4f]
-    X2 = gelu(Z1)
-    Z2 = tl.sum(tl.trans(X2) * W2, axis=0)[None,:] + b2  # [1,4f] @ [4f,f] + [1,f]
+    Z1 = tl.sum(tl.trans(XB) * W1, axis=0)[None, :] + b1  # [1,f] @ [f,4f] + [1,4f]
+    X2 = gelu(Z1).to(O_dtype)
+    Z2 = tl.sum(tl.trans(X2) * W2, axis=0)[None, :] + b2  # [1,4f] @ [4f,f] + [1,f]
 
     l2_target = XA - XB
 
-    mu = tl.sum(Z2, 1) / HF
-    var = tl.sum((Z2 - mu) * (Z2 - mu), 1) / HF
-    std = tl.sqrt(var + 1e-6)
-    Z2_hat = (Z2 - mu) / std  # [1,f]
+    mu = (tl.sum(Z2, 1) / HF).to(O_dtype)
+    var = (tl.sum((Z2 - mu) * (Z2 - mu), 1) / HF).to(O_dtype)
+    std = tl.sqrt(var + 1e-6).to(O_dtype)
+    Z2_hat = ((Z2 - mu) / std).to(O_dtype)  # [1,f]
     LN_out = ln_weight * Z2_hat + ln_bias  # [1,f] * [K=1,f] + [1,f]
     dl_dLN_out = LN_out - l2_target  # [1,f]
     dl_dZ2_hat = dl_dLN_out * ln_weight  # [1,f]
@@ -1711,10 +1762,9 @@ def _m2_decode_end_chunk_kernel(__W1, __W1_grad, __b1, __b1_grad,
     dl_dZ2_term_2 = tl.sum(dl_dZ2_hat, 1)
     dl_dZ2_term_3 = Z2_hat * tl.sum(dl_dZ2_hat * Z2_hat, 1)
     dl_dZ2_sum = dl_dZ2_term_1 - dl_dZ2_term_2 - dl_dZ2_term_3
-    dl_dZ2 = dl_dZ2_sum / (std * HF * 100)
-    dl_dZ2 = dl_dZ2 * 100.
+    dl_dZ2 = (dl_dZ2_sum / (std * HF)).to(O_dtype)
 
-    dl_dZ1 = tl.sum(tl.trans(dl_dZ2) * tl.trans(W2), axis=0)[None,:] * diff_gelu_tl(Z1)  # [1,f] @ [4f,f].t
+    dl_dZ1 = tl.sum(tl.trans(dl_dZ2) * tl.trans(W2), axis=0)[None, :] * diff_gelu_tl(Z1).to(O_dtype)  # [1,f] @ [4f,f].t
 
     ilr_mul_dl_dZ2 = ilr_gated * dl_dZ2  # [K=1,1] * [K=1,f]
     ilr_mul_dl_dZ1 = ilr_gated * dl_dZ1  # [K=1,1] * [K=1,f]
@@ -1728,9 +1778,9 @@ def _m2_decode_end_chunk_kernel(__W1, __W1_grad, __b1, __b1_grad,
     b1_bar = b1 - token_idx * b1_grad
     tl.store(_W1, W1_bar.to(W_dtype))
     tl.store(_b1, b1_bar.to(W_dtype))
-    Z1_bar = tl.sum(tl.trans(XC) * W1_bar, axis=0)[None,:] + b1_bar
+    Z1_bar = tl.sum(tl.trans(XC) * W1_bar, axis=0)[None, :] + b1_bar
 
-    X2_bar = gelu(Z1_bar)
+    X2_bar = gelu(Z1_bar).to(O_dtype)
 
     ##
     W2_grad += tl.trans(X2) * ilr_mul_dl_dZ2
@@ -1744,10 +1794,10 @@ def _m2_decode_end_chunk_kernel(__W1, __W1_grad, __b1, __b1_grad,
     Z2_bar = tl.sum(tl.trans(X2_bar) * W2_bar, axis=0)[None, :] + b2_bar
 
     ## residual + postln
-    mu_bar = tl.sum(Z2_bar, 1) / HF
-    var_bar = tl.sum((Z2_bar - mu_bar) * (Z2_bar - mu_bar), 1) / HF
-    std_bar = tl.sqrt(var_bar + 1e-6)
-    Z2_bar_hat = (Z2_bar - mu_bar) / std_bar  # [1,f]
+    mu_bar = (tl.sum(Z2_bar, 1) / HF).to(O_dtype)
+    var_bar = (tl.sum((Z2_bar - mu_bar) * (Z2_bar - mu_bar), 1) / HF).to(O_dtype)
+    std_bar = tl.sqrt(var_bar + 1e-6).to(O_dtype)
+    Z2_bar_hat = ((Z2_bar - mu_bar) / std_bar).to(O_dtype)  # [1,f]
     LN_out_bar = ln_weight * Z2_bar_hat + ln_bias  # [1,f] * [K=1,f] + [1,f]
     Z2_bar = XC + LN_out_bar
 
@@ -1809,8 +1859,8 @@ class TttM2BMMTKModule(TttBaseModule):
             input_dtype = XA.dtype
             output = torch.empty_like(XA)
 
-            ln_weight = self.ln_weight.squeeze(0).expand(-1, CS, -1).contiguous()
-            ln_bias = self.ln_bias.squeeze(0).expand(-1, CS, -1).contiguous()
+            ln_weight = self.ln_weight.data.squeeze(0).expand(-1, CS, -1).contiguous()  # TODO
+            ln_bias = self.ln_bias.data.squeeze(0).expand(-1, CS, -1).contiguous()
             b1_init = b1_init.expand(-1, -1, CS, -1).contiguous()
             b2_init = b2_init.expand(-1, -1, CS, -1).contiguous()
             cumsum_matrix = torch.tril(torch.ones(CS, CS, dtype=input_dtype, device=input_device))
@@ -1868,28 +1918,28 @@ class TttM2BMMTKModule(TttBaseModule):
                 _m2_decode_end_chunk_kernel[grid](W1, W1_grad, b1, b1_grad,
                                                   W2, W2_grad, b2, b2_grad,
                                                   XA, XB, XC,
-                                                  self.ln_weight, self.ln_bias,
+                                                  self.ln_weight.data, self.ln_bias.data,
                                                   ilr_gated, token_idx, output,
                                                   W1.stride(0), W1.stride(1), W1.stride(2),
                                                   b1.stride(0), b1.stride(1), b1.stride(2),
                                                   W2.stride(0), W2.stride(1), W2.stride(2),
                                                   b2.stride(0), b2.stride(1), b2.stride(2),
                                                   XA.stride(0), XA.stride(1), XA.stride(2),
-                                                  self.ln_weight.stride(1), self.ln_weight.stride(2),
+                                                  self.ln_weight.data.stride(1), self.ln_weight.data.stride(2),
                                                   ilr_gated.stride(0), ilr_gated.stride(1),
                                                   CS, HF, HF_prime)
             else:
                 _m2_decode_kernel[grid](W1, W1_grad, b1, b1_grad,
                                         W2, W2_grad, b2, b2_grad,
                                         XA, XB, XC,
-                                        self.ln_weight, self.ln_bias,
+                                        self.ln_weight.data, self.ln_bias.data,
                                         ilr_gated, token_idx, output,
                                         W1.stride(0), W1.stride(1), W1.stride(2),
                                         b1.stride(0), b1.stride(1), b1.stride(2),
                                         W2.stride(0), W2.stride(1), W2.stride(2),
                                         b2.stride(0), b2.stride(1), b2.stride(2),
                                         XA.stride(0), XA.stride(1), XA.stride(2),
-                                        self.ln_weight.stride(1), self.ln_weight.stride(2),
+                                        self.ln_weight.data.stride(1), self.ln_weight.data.stride(2),
                                         ilr_gated.stride(0), ilr_gated.stride(1),
                                         CS, HF, HF_prime)
 
@@ -1926,6 +1976,11 @@ class TttDecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(hidden_size=self.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(hidden_size=self.hidden_size, eps=config.rms_norm_eps)
 
+        self.conv_before_ttt = config.conv_before_ttt
+        if self.conv_before_ttt:
+            self.conv_layernorm = RMSNorm(hidden_size=self.hidden_size, eps=config.rms_norm_eps)
+            self.conv = TTTConv(layer_idx, config)
+
         self.layer_idx = layer_idx
 
         if config.use_compile:
@@ -1950,9 +2005,29 @@ class TttDecoderLayer(nn.Module):
         is_prefill: Optional[bool] = None,
         is_last_in_chunk: Optional[bool] = None,
     ):
+        if self.conv_before_ttt:
+            if not self.fused_add_norm:
+                residual = (hidden_states + residual) if residual is not None else hidden_states
+                hidden_states = self.conv_layernorm(residual.to(dtype=self.conv_layernorm.weight.dtype))
+                if self.residual_in_fp32:
+                    residual = residual.to(torch.float32)
+            else:
+                fused_add_norm_fn = rms_norm_fn
+                hidden_states, residual = fused_add_norm_fn(
+                    hidden_states,
+                    self.conv_layernorm.weight,
+                    self.conv_layernorm.bias,
+                    residual=residual,
+                    prenorm=True,
+                    residual_in_fp32=self.residual_in_fp32,
+                    eps=self.conv_layernorm.eps,
+                )
+            hidden_states = self.conv(residual.to(dtype=self.conv.conv.weight.dtype),
+                                      is_prefill=is_prefill,
+                                      cache_params=cache_params)
+
         # residual = hidden_states
         # hidden_states = self.input_layernorm(hidden_states)
-
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states
             hidden_states = self.input_layernorm(residual.to(dtype=self.input_layernorm.weight.dtype))
@@ -2305,8 +2380,8 @@ class TttForCausalLM(TttPreTrainedModel):
             is_last_in_chunk=is_last_in_chunk,
         )
 
-        hidden_states = outputs[0]
-        # hidden_states = outputs[0][:,-1:,:]  # [BS,N,F] -> [BS,1,F] to avoid OOM when prefilling
+        # hidden_states = outputs[0]  # TODO: for matching logits
+        hidden_states = outputs[0][:,-1:,:]  # [BS,N,F] -> [BS,1,F] to avoid OOM when prefilling
         if self.config.pretraining_tp > 1:
             lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
             logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]

@@ -43,6 +43,11 @@ class TttCache:
                 size=(self.max_batch_size, self.config.hidden_size, self.config.conv_kernel),
                 dtype=self.dtype, device=weight.device
             )
+            if self.config.conv_before_ttt:
+                self.params_dict[f"pre_ttt_conv_states"][layer_idx] = torch.zeros(
+                    size=(self.max_batch_size, self.config.hidden_size, self.config.conv_kernel),
+                    dtype=self.dtype, device=weight.device
+                )
 
     def reset(self, max_seqlen, max_batch_size, model, i=0):
         self.max_seqlen = max_seqlen
@@ -56,6 +61,8 @@ class TttCache:
                 self.params_dict[f"{name}_states"][layer_idx].copy_(tiled_weight  + i * 0.1)  # @xinhao: debug cg update
                 self.params_dict[f"{name}_grad"][layer_idx].zero_()
             self.params_dict[f"conv_states"][layer_idx].zero_()
+            if self.config.conv_before_ttt:
+                self.params_dict[f"pre_ttt_conv_states"][layer_idx].zero_()
 
 
 # https://github.com/NVIDIA/Megatron-LM/blob/0bb597b42c53355a567aba2a1357cc34b9d99ddd/megatron/text_generation/sampling.py

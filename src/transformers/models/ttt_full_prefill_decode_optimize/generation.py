@@ -43,6 +43,11 @@ class TttCache:
                 size=(self.max_batch_size, self.config.hidden_size, self.config.conv_kernel),
                 dtype=self.dtype, device=weight.device
             )
+            if self.config.conv_before_ttt:
+                self.params_dict[f"pre_ttt_conv_states"][layer_idx] = torch.zeros(
+                    size=(self.max_batch_size, self.config.hidden_size, self.config.conv_kernel),
+                    dtype=self.dtype, device=weight.device
+                )
 
     def reset(self, max_seqlen, max_batch_size, model, i=0):
         self.max_seqlen = max_seqlen
@@ -56,6 +61,8 @@ class TttCache:
                 self.params_dict[f"{name}_states"][layer_idx].copy_(tiled_weight  + i * 0.1)  # @xinhao: debug cg update
                 self.params_dict[f"{name}_grad"][layer_idx].zero_()
             self.params_dict[f"conv_states"][layer_idx].zero_()
+            if self.config.conv_before_ttt:
+                self.params_dict[f"pre_ttt_conv_states"][layer_idx].zero_()
 
 
 # https://github.com/NVIDIA/Megatron-LM/blob/0bb597b42c53355a567aba2a1357cc34b9d99ddd/megatron/text_generation/sampling.py
@@ -186,7 +193,8 @@ def decode(
 
 
     def get_logits(input_ids, inference_params):
-        decoding = inference_params.seqlen_offset > 0  # after prompt
+        # decoding = inference_params.seqlen_offset > 0  # after prompt
+        decoding = inference_params.seqlen_offset > 0 or input_ids.shape[1] == 1  # TODO: @xinhao: prompt=1 use decode mode directly as a hack
 
         if not cg or not decoding:
             if not decoding:
@@ -201,7 +209,7 @@ def decode(
                 ).logits[:, -1, :]  # [BS,prompt_len,vocab] -> [BS,1,vocab] -> [BS,vocab]
             else:
                 ## decoding, but doesn't use cg (should only be used for profiling)
-                is_last_in_chunk = ((input_ids.shape[1] + 1) % inference_params.inner_chunk_size == 0)
+                is_last_in_chunk = ((inference_params.seqlen_offset + 1) % inference_params.inner_chunk_size == 0)
                 # is_last_in_chunk = False
                 is_prefill = False
                 logits = model(
@@ -249,8 +257,8 @@ def decode(
         start.record()
 
     scores, sequences = [], [input_ids]
-    if input_ids.shape[1] == 1:
-        inference_params.seqlen_offset = 1  # TODO: @xinhao: prompt=1 use decode mode directly as a hack
+    # if input_ids.shape[1] == 1:
+    #     inference_params.seqlen_offset = 1  # TODO: @xinhao: prompt=1 use decode mode directly as a hack
 
     while not should_stop(sequences[-1], inference_params):
         # @xinhao: avoid appending logits, which will OOM as generation length gets longer

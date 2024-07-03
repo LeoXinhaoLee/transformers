@@ -38,6 +38,7 @@ ttt_config_pt.use_compile = args.use_compile
 ttt_config_pt.dtype = dtype
 ttt_config_pt.fused_add_norm = True
 ttt_config_pt.residual_in_fp32 = True
+ttt_config_pt.conv_before_ttt = True
 
 ttt_config_tk = copy.deepcopy(ttt_config_pt)
 ttt_config_tk.inner_net = args.inner_net + '_tk'
@@ -47,6 +48,7 @@ print('Inner Net: ', args.inner_net)
 torch.random.manual_seed(0)
 model_pt = TttForCausalLM(ttt_config_pt).to(device=device, dtype=dtype)
 model_pt.eval()
+# print(f"Number of parameters (PT) 1 TTT Block: {sum(p.numel() for p in model_pt.model.layers[0].self_attn.parameters() if p.requires_grad)}")
 print(f"Number of parameters (PT): {sum(p.numel() for p in model_pt.parameters() if p.requires_grad)}")
 
 torch.random.manual_seed(0)
