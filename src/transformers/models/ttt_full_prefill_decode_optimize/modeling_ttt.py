@@ -447,9 +447,6 @@ class TttBaseModule(nn.Module):
         # XC, XB = self.conv_qk(XCB, cache_params, is_prefill)  # [B,N,F] -> conv1: [B,N,F], conv2: [B,N,F]
         XC, XB = self.conv_qk_fused(XCB, cache_params, is_prefill)  # [B,N,F] -> conv1: [B,N,F], conv2: [B,N,F]
 
-        # @xinhao: test no inner-loop
-        # XC = XB = XCB
-
         XC = XC.reshape(B, L, self.num_heads, self.head_dim).permute(0,2,1,3).reshape(-1, L, self.head_dim)  # [B*nh,N,f]
         XB = XB.reshape(B, L, self.num_heads, self.head_dim).permute(0,2,1,3).reshape(-1, L, self.head_dim)
         ilr_gated = F.sigmoid(ilr_gated.permute(0,2,1).reshape(-1,L,1))  # [B,N,nh] -> [B,nh,N] -> [B*nh,N,1]
@@ -607,55 +604,178 @@ def m1_prefill_chunk(states, inputs, i, ln_weight, ln_bias, Attn_b):
 
 
 def m1_decode_end_chunk(states, inputs, ln_weight, ln_bias):
-    W1_init = states['W1_states']  # [B*nh,f,f]
-    b1_init = states['b1_states']
+    # W1_init = states['W1_states']  # [B*nh,f,f]
+    # b1_init = states['b1_states']
+    # W1_grad = states['W1_grad']
+    # b1_grad = states['b1_grad']
+    #
+    # XA_chunk, XB_chunk, \
+    # XC_chunk, token_idx, ilr_gated = inputs['XA'], inputs['XB'], inputs['XC'], \
+    #                                  inputs['token_idx'], inputs['ilr_gated']  # [B*nh,N=1,f], [1,1,1], [B*nh,N=1,1]
+    #
+    # Z1 = XB_chunk @ W1_init + b1_init  # [B*nh,K=1,f] @ [B*nh,f,f] + [B*nh,1,f] -> [B*nh,K=1,f]
+    # l2_target = XA_chunk - XB_chunk
+    # grad_l_wrt_Z1 = ln_fused_l2_bwd(Z1, l2_target, ln_weight, ln_bias)  # [B*nh,K=1,f]
+    #
+    # grad_l_wrt_Z1 = ilr_gated * grad_l_wrt_Z1  # [B*nh,K=1,f]
+    #
+    # W1_grad.add_(XB_chunk.transpose(-1, -2) @ grad_l_wrt_Z1)  # [B*nh,1,f].t @ [B*nh,1,f] + [B*nh,f,f]
+    # b1_grad.add_(grad_l_wrt_Z1)
+    #
+    # W1_init.sub_(token_idx * W1_grad)  # [B*nh,f,f] - [1,N=1,1] * [B*nh,f,f]
+    # b1_init.sub_(token_idx * b1_grad)  # [B*nh,1,f] - [1,N=1,1] * [B*nh,1,f]
+    # Z1_bar = XC_chunk @ W1_init + b1_init  # [B*nh,K=1,f] @ ([B*nh,f,f] - [B*nh,1,1] * [B*nh,f,f])
+    # W1_grad.zero_()
+    # b1_grad.zero_()
+
+    W1 = states['W1_states']  # [B*nh,f,f]
+    b1 = states['b1_states']
     W1_grad = states['W1_grad']
     b1_grad = states['b1_grad']
 
-    XA_chunk, XB_chunk, \
-    XC_chunk, token_idx, ilr_gated = inputs['XA'], inputs['XB'], inputs['XC'], \
-                                     inputs['token_idx'], inputs['ilr_gated']  # [B*nh,N=1,f], [1,1,1], [B*nh,N=1,1]
+    XA, XB, XC, \
+    token_idx, ilr_gated = inputs['XA'], inputs['XB'], inputs['XC'], \
+                           inputs['token_idx'], inputs['ilr_gated']  # [B*nh,N=1,f], [1,1,1], [B*nh,N=1,1]
+    B_mul_NH, K, HF = XA.shape
+    NH = ln_weight.shape[1]
 
-    Z1 = XB_chunk @ W1_init + b1_init  # [B*nh,K=1,f] @ [B*nh,f,f] + [B*nh,1,f] -> [B*nh,K=1,f]
-    l2_target = XA_chunk - XB_chunk
-    grad_l_wrt_Z1 = ln_fused_l2_bwd(Z1, l2_target, ln_weight, ln_bias)  # [B*nh,K=1,f]
+    Z1 = XB @ W1 + b1  # [B*nh,K=1,f] @ [B*nh,f,f] + [B*nh,1,f] -> [B*nh,K=1,f]
+    l2_target = XA - XB
 
-    grad_l_wrt_Z1 = ilr_gated * grad_l_wrt_Z1  # [B*nh,K=1,f]
+    mu = Z1.mean(dim=-1, keepdim=True)  # [B*nh,K=1,f] -> [B*nh,K=1,1]
+    var = Z1.var(dim=-1, keepdim=True, unbiased=False)
+    std = torch.sqrt(var + 1e-6)
+    Z1_hat = (Z1 - mu) / std  # [B*nh,K,f]
 
-    W1_grad.add_(XB_chunk.transpose(-1, -2) @ grad_l_wrt_Z1)  # [B*nh,1,f].t @ [B*nh,1,f] + [B*nh,f,f]
-    b1_grad.add_(grad_l_wrt_Z1)
+    # Scale and shift
+    LN_out = ln_weight * Z1_hat.reshape(-1, NH, K, HF) + ln_bias  # [1,nh,1,f] * [B,nh,K=1,f] + [1,nh,1,f]
 
-    W1_init.sub_(token_idx * W1_grad)  # [B*nh,f,f] - [1,N=1,1] * [B*nh,f,f]
-    b1_init.sub_(token_idx * b1_grad)  # [B*nh,1,f] - [1,N=1,1] * [B*nh,1,f]
-    Z1_bar = XC_chunk @ W1_init + b1_init  # [B*nh,K=1,f] @ ([B*nh,f,f] - [B*nh,1,1] * [B*nh,f,f])
+    dl_dLN_out = LN_out - l2_target.reshape(-1, NH, K, HF)  # [B,nh,K,f]
+
+    dl_dZ1_hat = (dl_dLN_out * ln_weight).reshape(B_mul_NH, K, HF)  # [B*nh,K,f]
+
+    # dl_dZ1 = (HF * dl_dZ1_hat -  # [B*nh,K,f]
+    #           dl_dZ1_hat.sum(dim=-1, keepdim=True) -  # [B*nh,K,1]
+    #           Z1_hat * (dl_dZ1_hat * Z1_hat).sum(dim=-1, keepdim=True)  # [B*nh,K,f] * [B*nh,K,1]
+    #           ) / (std * HF)
+
+    dl_dZ1_term_1 = HF * dl_dZ1_hat
+    dl_dZ1_term_2 = dl_dZ1_hat.sum(dim=-1, keepdim=True)
+    dl_dZ1_term_3 = Z1_hat * (dl_dZ1_hat * Z1_hat).sum(dim=-1, keepdim=True)
+    dl_dZ1_sum = dl_dZ1_term_1 - dl_dZ1_term_2 - dl_dZ1_term_3
+    dl_dZ1 = dl_dZ1_sum / (std * HF)
+
+    ilr_mul_dl_dZ1 = ilr_gated * dl_dZ1  # [B*nh,K=1,1] * [B*nh,K=1,f]
+
+    W1_grad.add_(XB.transpose(-1, -2) @ ilr_mul_dl_dZ1)  # [B*nh,K=1,f].t @ [B*nh,K=1,f] + [B*nh,f,f]
+    b1_grad.add_(ilr_mul_dl_dZ1)
+
+    W1.sub_(token_idx * W1_grad)  # [B*nh,f,f] - [1,N=1,1] * [B*nh,f,f]
+    b1.sub_(token_idx * b1_grad)  # [B*nh,1,f] - [1,N=1,1] * [B*nh,1,f]
+    Z1_bar = XC @ W1 + b1  # [B*nh,K=1,f] @ [B*nh,f,f]
+
     W1_grad.zero_()
     b1_grad.zero_()
+
+    # residual + postln
+    mu_bar = Z1_bar.mean(dim=-1, keepdim=True)  # [B*nh,K=1,f] -> [B*nh,K=1,1]
+    var_bar = Z1_bar.var(dim=-1, keepdim=True, unbiased=False)
+    std_bar = torch.sqrt(var_bar + 1e-6)
+    Z1_bar_hat = (Z1_bar - mu_bar) / std_bar  # [B*nh,K,f]
+    LN_out_bar = ln_weight * Z1_bar_hat.reshape(-1, NH, K, HF) + ln_bias
+    LN_out_bar = LN_out_bar.reshape(-1, K, HF)
+    Z1_bar = XC + LN_out_bar
 
     return Z1_bar
 
 
 def m1_decode(states, inputs, ln_weight, ln_bias):
-    W1_init = states['W1_states']  # [B*nh,f,f]
-    b1_init = states['b1_states']
+    """
+    Args:
+        states: W: [B*nh,f,f], b: [B*nh,1,f]
+        inputs: X: [B*nh,1,f], token_idx: [1,1,1], ilr_gated: [1024, 1, 1]
+        ln_weight: [1,nh,1,f]
+        ln_bias: [1,nh,1,f]
+
+    Returns:
+
+    """
+    # W1_init = states['W1_states']  # [B*nh,f,f]
+    # b1_init = states['b1_states']
+    # W1_grad = states['W1_grad']
+    # b1_grad = states['b1_grad']
+    #
+    # XA_chunk, XB_chunk, \
+    # XC_chunk, token_idx, ilr_gated = inputs['XA'], inputs['XB'], inputs['XC'], \
+    #                                  inputs['token_idx'], inputs['ilr_gated']  # [B*nh,N=1,f], [1,1,1], [B*nh,N=1,1]
+    #
+    # Z1 = XB_chunk @ W1_init + b1_init  # [B*nh,K=1,f] @ [B*nh,f,f] + [B*nh,1,f] -> [B*nh,K=1,f]
+    # l2_target = XA_chunk - XB_chunk    # [B*nh,K=1,f]
+    # grad_l_wrt_Z1 = ln_fused_l2_bwd(Z1, l2_target, ln_weight, ln_bias)  # [B*nh,K=1,f]
+    #
+    # grad_l_wrt_Z1 = ilr_gated * grad_l_wrt_Z1  # [B*nh,1,1] * [B*nh,K=1,f]
+    #
+    # W1_grad.add_(XB_chunk.transpose(-1, -2) @ grad_l_wrt_Z1)  # [B*nh,1,f].t @ [B*nh,1,f] + [B*nh,f,f]
+    # b1_grad.add_(grad_l_wrt_Z1)
+    #
+    # W1_last = W1_init - (token_idx * W1_grad)  # [B*nh,f,f] - [1,N=1,1] * [B*nh,f,f]
+    # b1_last = b1_init - (token_idx * b1_grad)  # [B*nh,1,f] - [1,N=1,1] * [B*nh,1,f]
+    # Z1_bar = XC_chunk @ W1_last + b1_last      # [B*nh,K=1,f] @ [B*nh,f,f]
+
+    W1 = states['W1_states']  # [B*nh,f,f]
+    b1 = states['b1_states']
     W1_grad = states['W1_grad']
     b1_grad = states['b1_grad']
 
-    XA_chunk, XB_chunk, \
-    XC_chunk, token_idx, ilr_gated = inputs['XA'], inputs['XB'], inputs['XC'], \
-                                     inputs['token_idx'], inputs['ilr_gated']  # [B*nh,N=1,f], [1,1,1], [B*nh,N=1,1]
+    XA, XB, XC,\
+    token_idx, ilr_gated = inputs['XA'], inputs['XB'], inputs['XC'], \
+                           inputs['token_idx'], inputs['ilr_gated']  # [B*nh,N=1,f], [1,1,1], [B*nh,N=1,1]
+    B_mul_NH, K, HF = XA.shape
+    NH = ln_weight.shape[1]
 
-    Z1 = XB_chunk @ W1_init + b1_init  # [B*nh,K=1,f] @ [B*nh,f,f] + [B*nh,1,f] -> [B*nh,K=1,f]
-    l2_target = XA_chunk - XB_chunk
-    grad_l_wrt_Z1 = ln_fused_l2_bwd(Z1, l2_target, ln_weight, ln_bias)  # [B*nh,K=1,f]
+    Z1 = XB @ W1 + b1  # [B*nh,K=1,f] @ [B*nh,f,f] + [B*nh,1,f] -> [B*nh,K=1,f]
+    l2_target = XA - XB
 
-    grad_l_wrt_Z1 = ilr_gated * grad_l_wrt_Z1  # [B*nh,K=1,f]
+    mu = Z1.mean(dim=-1, keepdim=True)  # [B*nh,K=1,f] -> [B*nh,K=1,1]
+    var = Z1.var(dim=-1, keepdim=True, unbiased=False)
+    std = torch.sqrt(var + 1e-6)
+    Z1_hat = (Z1 - mu) / std  # [B*nh,K,f]
 
-    W1_grad.add_(XB_chunk.transpose(-1, -2) @ grad_l_wrt_Z1)  # [B*nh,1,f].t @ [B*nh,1,f] + [B*nh,f,f]
-    b1_grad.add_(grad_l_wrt_Z1)
+    # Scale and shift
+    LN_out = ln_weight * Z1_hat.reshape(-1, NH, K, HF) + ln_bias  # [1,nh,1,f] * [B,nh,K=1,f] + [1,nh,1,f]
 
-    W1_last = W1_init - (token_idx * W1_grad)  # [B*nh,f,f] - [1,N=1,1] * [B*nh,f,f]
-    b1_last = b1_init - (token_idx * b1_grad)  # [B*nh,1,f] - [1,N=1,1] * [B*nh,1,f]
-    Z1_bar = XC_chunk @ W1_last + b1_last      # [B*nh,K=1,f] @ [B*nh,f,f]
+    dl_dLN_out = LN_out - l2_target.reshape(-1, NH, K, HF)  # [B,nh,K,f]
+
+    dl_dZ1_hat = (dl_dLN_out * ln_weight).reshape(B_mul_NH, K, HF)  # [B*nh,K,f]
+
+    # dl_dZ1 = (HF * dl_dZ1_hat -  # [B*nh,K,f]
+    #           dl_dZ1_hat.sum(dim=-1, keepdim=True) -  # [B*nh,K,1]
+    #           Z1_hat * (dl_dZ1_hat * Z1_hat).sum(dim=-1, keepdim=True)  # [B*nh,K,f] * [B*nh,K,1]
+    #           ) / (std * HF)
+
+    dl_dZ1_term_1 = HF * dl_dZ1_hat
+    dl_dZ1_term_2 = dl_dZ1_hat.sum(dim=-1, keepdim=True)
+    dl_dZ1_term_3 = Z1_hat * (dl_dZ1_hat * Z1_hat).sum(dim=-1, keepdim=True)
+    dl_dZ1_sum = dl_dZ1_term_1 - dl_dZ1_term_2 - dl_dZ1_term_3
+    dl_dZ1 = dl_dZ1_sum / (std * HF)
+
+    ilr_mul_dl_dZ1 = ilr_gated * dl_dZ1  # [B*nh,K=1,1] * [B*nh,K=1,f]
+
+    W1_grad.add_(XB.transpose(-1, -2) @ ilr_mul_dl_dZ1)  # [B*nh,K=1,f].t @ [B*nh,K=1,f] + [B*nh,f,f]
+    b1_grad.add_(ilr_mul_dl_dZ1)
+
+    W1_bar = W1 - (token_idx * W1_grad)  # [B*nh,f,f] - [1,N=1,1] * [B*nh,f,f]
+    b1_bar = b1 - (token_idx * b1_grad)  # [B*nh,1,f] - [1,N=1,1] * [B*nh,1,f]
+    Z1_bar = XC @ W1_bar + b1_bar  # [B*nh,K=1,f] @ [B*nh,f,f]
+
+    # residual + postln
+    mu_bar = Z1_bar.mean(dim=-1, keepdim=True)  # [B*nh,K=1,f] -> [B*nh,K=1,1]
+    var_bar = Z1_bar.var(dim=-1, keepdim=True, unbiased=False)
+    std_bar = torch.sqrt(var_bar + 1e-6)
+    Z1_bar_hat = (Z1_bar - mu_bar) / std_bar  # [B*nh,K,f]
+    LN_out_bar = ln_weight * Z1_bar_hat.reshape(-1, NH, K, HF) + ln_bias
+    LN_out_bar = LN_out_bar.reshape(-1, K, HF)
+    Z1_bar = XC + LN_out_bar
 
     return Z1_bar
 
@@ -724,19 +844,19 @@ class TttM1BMMModule(TttBaseModule):
             if is_last_in_chunk:
                 XCW_batch = self.decode_end_chunk(
                     states,  # [B*nh,f,f], cloned from W1, safe for in-place op
-                    inputs,  # [B*nh,f]
-                    self.ln_weight,  # [nh,1,f]
-                    self.ln_bias, # [nh,1,f]
+                    inputs,  # [B*nh,N=1,f]
+                    self.ln_weight,  # [1,nh,1,f]
+                    self.ln_bias, # [1,nh,1,f]
                 )  # ret: [B*nh,N=1,f]
             else:
                 XCW_batch = self.decode(
                     states,  # [B*nh,f,f], cloned from W1, safe for in-place op
-                    inputs,  # [B*nh,f]
-                    self.ln_weight,  # [nh,1,f]
-                    self.ln_bias,  # [nh,1,f]
+                    inputs,  # [B*nh,N=1,f]
+                    self.ln_weight,  # [1,nh,1,f]
+                    self.ln_bias,  # [1,nh,1,f]
                 )  # ret: [B*nh,N=1,f]
 
-        XCW_batch = self.residual_add_post_LN(XC_residual, XCW_batch)
+        # XCW_batch = self.residual_add_post_LN(XC_residual, XCW_batch)
 
         return XCW_batch, None
 
@@ -950,24 +1070,24 @@ class TttM2BMMModule(TttBaseModule):
 ####### M1 Triton Decode Module #######
 
 ####### Decode #######
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_stages=1, num_warps=8),
-        triton.Config({}, num_stages=1, num_warps=4),
-        triton.Config({}, num_stages=1, num_warps=2),
-        triton.Config({}, num_stages=2, num_warps=8),
-        triton.Config({}, num_stages=2, num_warps=4),
-        triton.Config({}, num_stages=2, num_warps=2),
-        triton.Config({}, num_stages=3, num_warps=8),
-        triton.Config({}, num_stages=3, num_warps=4),
-        triton.Config({}, num_stages=3, num_warps=2),
-        triton.Config({}, num_stages=4, num_warps=8),
-        triton.Config({}, num_stages=4, num_warps=4),
-        triton.Config({}, num_stages=4, num_warps=2),
-    ],
-    key=['HF'],
-    restore_value=['__W1', '__b1', '__W1_grad', '__b1_grad']
-)
+# @triton.autotune(
+#     configs=[
+#         triton.Config({}, num_stages=1, num_warps=8),
+#         triton.Config({}, num_stages=1, num_warps=4),
+#         triton.Config({}, num_stages=1, num_warps=2),
+#         triton.Config({}, num_stages=2, num_warps=8),
+#         triton.Config({}, num_stages=2, num_warps=4),
+#         triton.Config({}, num_stages=2, num_warps=2),
+#         triton.Config({}, num_stages=3, num_warps=8),
+#         triton.Config({}, num_stages=3, num_warps=4),
+#         triton.Config({}, num_stages=3, num_warps=2),
+#         triton.Config({}, num_stages=4, num_warps=8),
+#         triton.Config({}, num_stages=4, num_warps=4),
+#         triton.Config({}, num_stages=4, num_warps=2),
+#     ],
+#     key=['HF'],
+#     restore_value=['__W1', '__b1', '__W1_grad', '__b1_grad']
+# )
 @triton.jit
 def _m1_decode_kernel(__W1, __W1_grad, __b1, __b1_grad,
                       __XA, __XB, __XC,
@@ -1030,14 +1150,13 @@ def _m1_decode_kernel(__W1, __W1_grad, __b1, __b1_grad,
     ln_weight = tl.load(_ln_weight)
     ln_bias = tl.load(_ln_bias)
 
-    Z1 = tl.sum(tl.trans(XB) * W1, axis=0)[None, :] + b1  # [1,f] @ [f,f] + [1,f]
+    Z1 = tl.sum(tl.trans(XB) * W1, axis=0)[None, :] + b1  # [1,f] @ [f,f] + [1,f]: fp16
     l2_target = XA - XB
 
-    mu = tl.sum(Z1, 1) / HF
-    var = tl.sum((Z1 - mu) * (Z1 - mu), 1) / HF
-
-    std = tl.sqrt(var + 1e-6)
-    Z1_hat = (Z1 - mu) / std  # [1,f]
+    mu = (tl.sum(Z1, 1) / HF).to(O_dtype)  # fp16 -> fp32 after division, need cast back
+    var = (tl.sum((Z1 - mu) * (Z1 - mu), 1) / HF).to(O_dtype)
+    std = tl.sqrt(var + 1e-6).to(O_dtype)  # fp16 -> fp32 after adding 1e-6, sqrt requires input fp32/fp64
+    Z1_hat = ((Z1 - mu) / std).to(O_dtype)  # [1,f]: fp16 div fp16 -> fp32
 
     # Scale and shift
     LN_out = ln_weight * Z1_hat + ln_bias  # [1,f] * [K=1,f] + [1,f]
@@ -1046,18 +1165,18 @@ def _m1_decode_kernel(__W1, __W1_grad, __b1, __b1_grad,
 
     dl_dZ1_hat = dl_dLN_out * ln_weight  # [1,f]
 
-    dl_dZ1_term_1 = HF * dl_dZ1_hat
+    dl_dZ1_term_1 = HF * dl_dZ1_hat  # int * fp16 -> fp16
     dl_dZ1_term_2 = tl.sum(dl_dZ1_hat, 1)
     dl_dZ1_term_3 = Z1_hat * tl.sum(dl_dZ1_hat * Z1_hat, 1)
-    dl_dZ1_sum = dl_dZ1_term_1 + dl_dZ1_term_2 + dl_dZ1_term_3
-    dl_dZ1 = dl_dZ1_sum / (std * HF * 100)
-    dl_dZ1 = dl_dZ1 * 100.
+    dl_dZ1_sum = dl_dZ1_term_1 - dl_dZ1_term_2 - dl_dZ1_term_3
+    dl_dZ1 = (dl_dZ1_sum / (std * HF)).to(O_dtype)
 
     ilr_mul_dl_dZ1 = ilr_gated * dl_dZ1  # [K=1,1] * [K=1,f]
 
     ##
     W1_grad += tl.trans(XB) * ilr_mul_dl_dZ1
     b1_grad += ilr_mul_dl_dZ1
+
     tl.store(_W1_grad, W1_grad.to(W_dtype))
     tl.store(_b1_grad, b1_grad.to(W_dtype))
 
@@ -1066,34 +1185,34 @@ def _m1_decode_kernel(__W1, __W1_grad, __b1, __b1_grad,
 
     Z1_bar = tl.sum(tl.trans(XC) * W1_bar, axis=0)[None, :] + b1_bar
 
-    ## Residual + Post LN
-    mu_bar = tl.sum(Z1_bar, 1) / HF
-    var_bar = tl.sum((Z1_bar - mu_bar) * (Z1_bar - mu_bar), 1) / HF
-    std_bar = tl.sqrt(var_bar + 1e-6)
-    Z1_bar_hat = (Z1_bar - mu_bar) / std_bar  # [1,f]
+    ## residual + postln
+    mu_bar = (tl.sum(Z1_bar, 1) / HF).to(O_dtype)
+    var_bar = (tl.sum((Z1_bar - mu_bar) * (Z1_bar - mu_bar), 1) / HF).to(O_dtype)
+    std_bar = tl.sqrt(var_bar + 1e-6).to(O_dtype)
+    Z1_bar_hat = ((Z1_bar - mu_bar) / std_bar).to(O_dtype)  # [1,f]
     LN_out_bar = ln_weight * Z1_bar_hat + ln_bias  # [1,f] * [K=1,f] + [1,f]
     Z1_bar = XC + LN_out_bar
 
     tl.store(_Out, Z1_bar.to(O_dtype))
 
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_stages=1, num_warps=8),
-        triton.Config({}, num_stages=1, num_warps=4),
-        triton.Config({}, num_stages=1, num_warps=2),
-        triton.Config({}, num_stages=2, num_warps=8),
-        triton.Config({}, num_stages=2, num_warps=4),
-        triton.Config({}, num_stages=2, num_warps=2),
-        triton.Config({}, num_stages=3, num_warps=8),
-        triton.Config({}, num_stages=3, num_warps=4),
-        triton.Config({}, num_stages=3, num_warps=2),
-        triton.Config({}, num_stages=4, num_warps=8),
-        triton.Config({}, num_stages=4, num_warps=4),
-        triton.Config({}, num_stages=4, num_warps=2),
-    ],
-    key=['HF'],
-    restore_value=['__W1', '__b1', '__W1_grad', '__b1_grad']
-)
+# @triton.autotune(
+#     configs=[
+#         triton.Config({}, num_stages=1, num_warps=8),
+#         triton.Config({}, num_stages=1, num_warps=4),
+#         triton.Config({}, num_stages=1, num_warps=2),
+#         triton.Config({}, num_stages=2, num_warps=8),
+#         triton.Config({}, num_stages=2, num_warps=4),
+#         triton.Config({}, num_stages=2, num_warps=2),
+#         triton.Config({}, num_stages=3, num_warps=8),
+#         triton.Config({}, num_stages=3, num_warps=4),
+#         triton.Config({}, num_stages=3, num_warps=2),
+#         triton.Config({}, num_stages=4, num_warps=8),
+#         triton.Config({}, num_stages=4, num_warps=4),
+#         triton.Config({}, num_stages=4, num_warps=2),
+#     ],
+#     key=['HF'],
+#     restore_value=['__W1', '__b1', '__W1_grad', '__b1_grad']
+# )
 @triton.jit
 def _m1_decode_end_chunk_kernel(__W1, __W1_grad, __b1, __b1_grad,
                                 __XA, __XB, __XC,
@@ -1156,14 +1275,13 @@ def _m1_decode_end_chunk_kernel(__W1, __W1_grad, __b1, __b1_grad,
     ln_weight = tl.load(_ln_weight)
     ln_bias = tl.load(_ln_bias)
 
-    Z1 = tl.sum(tl.trans(XB) * W1, axis=0)[None, :] + b1  # [1,f] @ [f,f] + [1,f]
+    Z1 = tl.sum(tl.trans(XB) * W1, axis=0)[None, :] + b1  # [1,f] @ [f,f] + [1,f]: fp16
     l2_target = XA - XB
 
-    mu = tl.sum(Z1, 1) / HF
-    var = tl.sum((Z1 - mu) * (Z1 - mu), 1) / HF
-
-    std = tl.sqrt(var + 1e-6)
-    Z1_hat = (Z1 - mu) / std  # [1,f]
+    mu = (tl.sum(Z1, 1) / HF).to(O_dtype)  # fp16 -> fp32 after division, need cast back
+    var = (tl.sum((Z1 - mu) * (Z1 - mu), 1) / HF).to(O_dtype)
+    std = tl.sqrt(var + 1e-6).to(O_dtype)  # fp16 -> fp32 after adding 1e-6, sqrt requires input fp32/fp64
+    Z1_hat = ((Z1 - mu) / std).to(O_dtype)  # [1,f]: fp16 div fp16 -> fp32
 
     # Scale and shift
     LN_out = ln_weight * Z1_hat + ln_bias  # [1,f] * [K=1,f] + [1,f]
@@ -1172,33 +1290,34 @@ def _m1_decode_end_chunk_kernel(__W1, __W1_grad, __b1, __b1_grad,
 
     dl_dZ1_hat = dl_dLN_out * ln_weight  # [1,f]
 
-    dl_dZ1_term_1 = HF * dl_dZ1_hat
+    dl_dZ1_term_1 = HF * dl_dZ1_hat  # int * fp16 -> fp16
     dl_dZ1_term_2 = tl.sum(dl_dZ1_hat, 1)
     dl_dZ1_term_3 = Z1_hat * tl.sum(dl_dZ1_hat * Z1_hat, 1)
-    dl_dZ1_sum = dl_dZ1_term_1 + dl_dZ1_term_2 + dl_dZ1_term_3
-    dl_dZ1 = dl_dZ1_sum / (std * HF * 100)
-    dl_dZ1 = dl_dZ1 * 100.
+    dl_dZ1_sum = dl_dZ1_term_1 - dl_dZ1_term_2 - dl_dZ1_term_3
+    dl_dZ1 = (dl_dZ1_sum / (std * HF)).to(O_dtype)
 
     ilr_mul_dl_dZ1 = ilr_gated * dl_dZ1  # [K=1,1] * [K=1,f]
 
     ##
     W1_grad += tl.trans(XB) * ilr_mul_dl_dZ1
     b1_grad += ilr_mul_dl_dZ1
+
     tl.store(_W1_grad, tl.zeros_like(W1_grad).to(W_dtype))
     tl.store(_b1_grad, tl.zeros_like(b1_grad).to(W_dtype))
 
     W1_bar = W1 - token_idx * W1_grad
     b1_bar = b1 - token_idx * b1_grad
+
     tl.store(_W1, W1_bar.to(W_dtype))
     tl.store(_b1, b1_bar.to(W_dtype))
 
     Z1_bar = tl.sum(tl.trans(XC) * W1_bar, axis=0)[None, :] + b1_bar
 
-    ## Residual + Post LN
-    mu_bar = tl.sum(Z1_bar, 1) / HF
-    var_bar = tl.sum((Z1_bar - mu_bar) * (Z1_bar - mu_bar), 1) / HF
-    std_bar = tl.sqrt(var_bar + 1e-6)
-    Z1_bar_hat = (Z1_bar - mu_bar) / std_bar  # [1,f]
+    ## residual + postln
+    mu_bar = (tl.sum(Z1_bar, 1) / HF).to(O_dtype)
+    var_bar = (tl.sum((Z1_bar - mu_bar) * (Z1_bar - mu_bar), 1) / HF).to(O_dtype)
+    std_bar = tl.sqrt(var_bar + 1e-6).to(O_dtype)
+    Z1_bar_hat = ((Z1_bar - mu_bar) / std_bar).to(O_dtype)  # [1,f]
     LN_out_bar = ln_weight * Z1_bar_hat + ln_bias  # [1,f] * [K=1,f] + [1,f]
     Z1_bar = XC + LN_out_bar
 

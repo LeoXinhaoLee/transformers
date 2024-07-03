@@ -101,17 +101,20 @@ sequence_tk, logits_list_tk = out_tk.sequences, out_tk.logits  # [BS,prompt_len+
 
 ### Prefill ###
 prompt_logits_max_diff = []
+prompt_logits_median_diff = []
 prompt_logits_mse_diff = []
 prompt_token_diff = []
 if args.promptlen > 1:
     prompt_logits_pt = logits_list_pt[0]  # [BS, prompt_len, V]
     prompt_logits_tk = logits_list_tk[0]
     prompt_logits_max_diff = torch.abs(prompt_logits_pt - prompt_logits_tk).max(dim=2)[0].max(dim=0)[0].cpu().numpy()  # [prompt_len,]
+    prompt_logits_median_diff = torch.abs(prompt_logits_pt - prompt_logits_tk).median(dim=2)[0].median(dim=0)[0].cpu().numpy()  # [prompt_len,]
     prompt_logits_mse_diff = ((prompt_logits_pt - prompt_logits_tk) ** 2).mean(dim=(0,2)).cpu().numpy()  # [prompt_len,]
     prompt_token_diff = torch.sum(prompt_logits_pt.argmax(dim=-1) != prompt_logits_tk.argmax(dim=-1), axis=0).cpu().numpy()  # [prompt_len,]
 
 ### Decode ###
 decode_logits_max_diff = []
+decode_logits_median_diff = []
 decode_logits_mse_diff = []
 decode_token_diff = []
 if args.genlen > 0:
@@ -126,6 +129,9 @@ if args.genlen > 0:
         decode_logits_max_diff.append(
             torch.abs(decode_logits_pt - decode_logits_tk).max()  # [B,V].max()
         )
+        decode_logits_median_diff.append(
+            torch.abs(decode_logits_pt - decode_logits_tk).median()  # [B,V].max()
+        )
         decode_logits_mse_diff.append(
             ((decode_logits_pt - decode_logits_tk) ** 2).mean()   # [B,V].mean()
         )
@@ -133,17 +139,19 @@ if args.genlen > 0:
             torch.sum(decode_logits_pt.argmax(dim=-1) != decode_logits_tk.argmax(dim=-1))
         )
 decode_logits_max_diff = torch.tensor(decode_logits_max_diff).cpu().numpy()
+decode_logits_median_diff = torch.tensor(decode_logits_median_diff).cpu().numpy()
 decode_logits_mse_diff = torch.tensor(decode_logits_mse_diff).cpu().numpy()
 decode_token_diff = torch.tensor(decode_token_diff).cpu().numpy()
 
 all_stats = {
-        'prompt_logits_max_diff': prompt_logits_max_diff,
-        'prompt_logits_mse_diff': prompt_logits_mse_diff,
-        'prompt_token_diff': prompt_token_diff,
-        'decode_logits_max_diff': decode_logits_max_diff,
-        'decode_logits_mse_diff': decode_logits_mse_diff,
-        'decode_token_diff': decode_token_diff,
+    'prompt_logits_max_diff': prompt_logits_max_diff,
+    'prompt_logits_median_diff': prompt_logits_median_diff,
+    'prompt_logits_mse_diff': prompt_logits_mse_diff,
+    'prompt_token_diff': prompt_token_diff,
+    'decode_logits_max_diff': decode_logits_max_diff,
+    'decode_logits_median_diff': decode_logits_median_diff,
+    'decode_logits_mse_diff': decode_logits_mse_diff,
+    'decode_token_diff': decode_token_diff,
 }
-
 os.makedirs(args.logdir, exist_ok=True)
 torch.save(all_stats, os.path.join(args.logdir, 'all_stats.pth'))

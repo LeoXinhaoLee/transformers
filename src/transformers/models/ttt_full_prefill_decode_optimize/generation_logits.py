@@ -186,7 +186,8 @@ def decode(
 
 
     def get_logits(input_ids, inference_params):
-        decoding = inference_params.seqlen_offset > 0  # after prompt
+        # decoding = inference_params.seqlen_offset > 0  # after prompt
+        decoding = inference_params.seqlen_offset > 0 or input_ids.shape[1] == 1  # TODO: @xinhao: prompt=1 use decode mode directly as a hack
 
         if not cg or not decoding:
             if not decoding:
@@ -201,8 +202,7 @@ def decode(
                 ).logits   # .logits[:, -1, :]  # [BS,prompt_len,vocab] -> [BS,1,vocab] -> [BS,vocab]
             else:
                 ## decoding, but doesn't use cg (should only be used for profiling)
-                is_last_in_chunk = ((input_ids.shape[1] + 1) % inference_params.inner_chunk_size == 0)
-                # is_last_in_chunk = False
+                is_last_in_chunk = ((inference_params.seqlen_offset + 1) % inference_params.inner_chunk_size == 0)
                 is_prefill = False
                 logits = model(
                     input_ids,
@@ -215,7 +215,6 @@ def decode(
             # after prompt: continue generating
             is_prefill = False
             is_last_in_chunk = ((inference_params.seqlen_offset + 1) % inference_params.inner_chunk_size == 0)
-            # is_last_in_chunk = False
             logits = model._decoding_cache.run(
                 input_ids, is_prefill, is_last_in_chunk
             ).squeeze(dim=1)  # [BS,decode_len,vocab_size]
@@ -250,14 +249,13 @@ def decode(
 
     sequences = [input_ids]
     logits_list = []
-    if input_ids.shape[1] == 1:
-        inference_params.seqlen_offset = 1  # TODO: @xinhao: prompt=1 use decode mode directly as a hack
 
     while not should_stop(sequences[-1], inference_params):
         # @xinhao: avoid appending logits, which will OOM as generation length gets longer
         logits = get_logits(sequences[-1], inference_params)  # [BS, V]
 
-        if inference_params.seqlen_offset == 0:
+        if inference_params.seqlen_offset == 0 and input_ids.shape[1] > 1:
+            ## prefilling from a prompt > 1
             logits_list.append(logits)  # [BS, prompt_len, V]
             logits = logits[:, -1, :] * 1.   # [BS,V]
 
