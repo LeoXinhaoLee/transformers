@@ -260,6 +260,7 @@ def decode(
     while not should_stop(sequences[-1], inference_params):
         # @xinhao: avoid appending logits, which will OOM as generation length gets longer
         logits = get_logits(sequences[-1], inference_params)  # [BS, V]
+        logits = F.softmax(logits, dim=-1)
 
         if inference_params.seqlen_offset == 0 and input_ids.shape[1] > 1:
             ## prefilling from a prompt > 1

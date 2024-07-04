@@ -13,8 +13,8 @@ import logging
 import torch
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, PretrainedConfig
-from transformers.models.ttt.configuration_ttt import TTT_STANDARD_CONFIGS, TttConfig  # 125m and 1b config
-from transformers.models.ttt_full_prefill_decode_optimize.modeling_ttt import TttForCausalLM
+from transformers.models.ttt_clean.configuration_ttt import TTT_STANDARD_CONFIGS, TTTConfig  # 125m and 1b config
+from transformers.models.ttt_clean.modeling_ttt import TTTForCausalLM
 
 parser = argparse.ArgumentParser(description="Generation benchmarking")
 parser.add_argument("--logdir", type=str, default="./exp/clean")
@@ -32,7 +32,7 @@ dtype = torch.float16
 
 ttt_size = '1b'
 
-ttt_config_pt = TttConfig(**TTT_STANDARD_CONFIGS[ttt_size], vocab_size=32000)
+ttt_config_pt = TTTConfig(**TTT_STANDARD_CONFIGS[ttt_size], vocab_size=32000)
 ttt_config_pt.inner_net = args.inner_net
 ttt_config_pt.use_compile = args.use_compile
 ttt_config_pt.dtype = dtype
@@ -46,13 +46,12 @@ ttt_config_tk.inner_net = args.inner_net + '_tk'
 print('Inner Net: ', args.inner_net)
 
 torch.random.manual_seed(0)
-model_pt = TttForCausalLM(ttt_config_pt).to(device=device, dtype=dtype)
+model_pt = TTTForCausalLM(ttt_config_pt).to(device=device, dtype=dtype)
 model_pt.eval()
-# print(f"Number of parameters (PT) 1 TTT Block: {sum(p.numel() for p in model_pt.model.layers[0].self_attn.parameters() if p.requires_grad)}")
 print(f"Number of parameters (PT): {sum(p.numel() for p in model_pt.parameters() if p.requires_grad)}")
 
 torch.random.manual_seed(0)
-model_tk = TttForCausalLM(ttt_config_tk).to(device=device, dtype=dtype)
+model_tk = TTTForCausalLM(ttt_config_tk).to(device=device, dtype=dtype)
 model_tk.eval()
 print(f"Number of parameters (TK): {sum(p.numel() for p in model_tk.parameters() if p.requires_grad)}")
 
@@ -96,63 +95,56 @@ print('In Len: ', len(input_ids[0]))
 del out_pt, out_tk
 
 out_pt = fn_pt()
-sequence_pt, logits_list_pt = out_pt.sequences, out_pt.logits  # [BS,prompt_len+1+gen_len], [[BS,prompt_len,V], [BS,V], [BS,V], ...]
+sequence_pt, probs_list_pt = out_pt.sequences, out_pt.logits  # [BS,prompt_len+1+gen_len], [[BS,prompt_len,V], [BS,V], [BS,V], ...]
 
 out_tk = fn_tk()
-sequence_tk, logits_list_tk = out_tk.sequences, out_tk.logits  # [BS,prompt_len+1+gen_len], [[BS,prompt_len,V], [BS,V], [BS,V], ...]
+sequence_tk, probs_list_tk = out_tk.sequences, out_tk.logits  # [BS,prompt_len+1+gen_len], [[BS,prompt_len,V], [BS,V], [BS,V], ...]
 
 ### Prefill ###
-prompt_logits_max_diff = []
-prompt_logits_median_diff = []
-prompt_logits_mse_diff = []
+prompt_probs_avg_max_diff = []
+prompt_probs_avg_mean_diff = []
 prompt_token_diff = []
 if args.promptlen > 1:
-    prompt_logits_pt = logits_list_pt[0]  # [BS, prompt_len, V]
-    prompt_logits_tk = logits_list_tk[0]
-    prompt_logits_max_diff = torch.abs(prompt_logits_pt - prompt_logits_tk).max(dim=2)[0].max(dim=0)[0].cpu().numpy()  # [prompt_len,]
-    prompt_logits_median_diff = torch.abs(prompt_logits_pt - prompt_logits_tk).median(dim=2)[0].median(dim=0)[0].cpu().numpy()  # [prompt_len,]
-    prompt_logits_mse_diff = ((prompt_logits_pt - prompt_logits_tk) ** 2).mean(dim=(0,2)).cpu().numpy()  # [prompt_len,]
-    prompt_token_diff = torch.sum(prompt_logits_pt.argmax(dim=-1) != prompt_logits_tk.argmax(dim=-1), axis=0).cpu().numpy()  # [prompt_len,]
+    prompt_probs_pt = probs_list_pt[0]  # [BS, prompt_len, V]
+    prompt_probs_tk = probs_list_tk[0]
+    prompt_probs_avg_max_diff = torch.abs(prompt_probs_pt - prompt_probs_tk).max(dim=2)[0].mean(dim=0).cpu().numpy()  # [prompt_len,]
+    prompt_probs_avg_mean_diff = torch.abs(prompt_probs_pt - prompt_probs_tk).mean(dim=(0,2)).cpu().numpy()  # [prompt_len,]
+    prompt_token_diff = torch.sum(prompt_probs_pt.argmax(dim=-1) != prompt_probs_tk.argmax(dim=-1), axis=0).cpu().numpy()  # [prompt_len,]
 
 ### Decode ###
-decode_logits_max_diff = []
-decode_logits_median_diff = []
-decode_logits_mse_diff = []
+decode_probs_avg_max_diff = []
+decode_probs_avg_mean_diff = []
 decode_token_diff = []
 if args.genlen > 0:
-    assert len(logits_list_pt) > 1 and len(logits_list_tk) > 1 and  len(logits_list_pt) ==  len(logits_list_tk)
+    assert len(probs_list_pt) > 1 and len(probs_list_tk) > 1 and  len(probs_list_pt) ==  len(probs_list_tk)
     if args.promptlen == 1:
+        # no prefill, all resulting tokens are decoded
         decode_st = 0
     else:
+        # 1st: prompt; 2nd: 1st generated token, produced by prefill but not decode
         decode_st = 2
-    for i in range(decode_st, len(logits_list_pt)):
-        decode_logits_pt = logits_list_pt[i]
-        decode_logits_tk = logits_list_tk[i]
-        decode_logits_max_diff.append(
-            torch.abs(decode_logits_pt - decode_logits_tk).max()  # [B,V].max()
+    for i in range(decode_st, len(probs_list_pt)):
+        decode_probs_pt = probs_list_pt[i]
+        decode_probs_tk = probs_list_tk[i]
+        decode_probs_avg_max_diff.append(
+            torch.abs(decode_probs_pt - decode_probs_tk).max(dim=1)[0].mean()
         )
-        decode_logits_median_diff.append(
-            torch.abs(decode_logits_pt - decode_logits_tk).median()  # [B,V].max()
-        )
-        decode_logits_mse_diff.append(
-            ((decode_logits_pt - decode_logits_tk) ** 2).mean()   # [B,V].mean()
+        decode_probs_avg_mean_diff.append(
+            torch.abs(decode_probs_pt - decode_probs_tk).mean()
         )
         decode_token_diff.append(
-            torch.sum(decode_logits_pt.argmax(dim=-1) != decode_logits_tk.argmax(dim=-1))
+            torch.sum(decode_probs_pt.argmax(dim=-1) != decode_probs_tk.argmax(dim=-1))
         )
-decode_logits_max_diff = torch.tensor(decode_logits_max_diff).cpu().numpy()
-decode_logits_median_diff = torch.tensor(decode_logits_median_diff).cpu().numpy()
-decode_logits_mse_diff = torch.tensor(decode_logits_mse_diff).cpu().numpy()
+decode_probs_avg_max_diff = torch.tensor(decode_probs_avg_max_diff).cpu().numpy()
+decode_probs_avg_mean_diff = torch.tensor(decode_probs_avg_mean_diff).cpu().numpy()
 decode_token_diff = torch.tensor(decode_token_diff).cpu().numpy()
 
 all_stats = {
-    'prompt_logits_max_diff': prompt_logits_max_diff,
-    'prompt_logits_median_diff': prompt_logits_median_diff,
-    'prompt_logits_mse_diff': prompt_logits_mse_diff,
+    'prompt_probs_avg_max_diff': prompt_probs_avg_max_diff,
+    'prompt_probs_avg_mean_diff': prompt_probs_avg_mean_diff,
     'prompt_token_diff': prompt_token_diff,
-    'decode_logits_max_diff': decode_logits_max_diff,
-    'decode_logits_median_diff': decode_logits_median_diff,
-    'decode_logits_mse_diff': decode_logits_mse_diff,
+    'decode_probs_avg_max_diff': decode_probs_avg_max_diff,
+    'decode_probs_avg_mean_diff': decode_probs_avg_mean_diff,
     'decode_token_diff': decode_token_diff,
 }
 os.makedirs(args.logdir, exist_ok=True)

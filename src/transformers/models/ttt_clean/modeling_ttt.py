@@ -8,8 +8,8 @@ from torch import nn
 import torch.nn.functional as F
 
 from transformers.models.ttt_clean.configuration_ttt import TTTConfig
-from transformers.models.ttt_clean.generation import GenerationMixin, TTTCache
-# from transformers.models.ttt_clean.generation_logits import GenerationMixin, TTTCache
+# from transformers.models.ttt_clean.generation import GenerationMixin, TTTCache
+from transformers.models.ttt_clean.generation_logits import GenerationMixin, TTTCache
 
 from transformers.models.mamba_ssm.ops.triton.layernorm import RMSNorm, rms_norm_fn
 from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
@@ -777,7 +777,7 @@ class TTTM1BMMModule(TTTBaseModule):
 
         XQW_batch = self.residual_add_post_LN(XQ_residual, XQW_batch)
 
-        return XQW_batch, None
+        return XQW_batch
 
 ##########################################
 
@@ -1499,8 +1499,8 @@ class TTTForCausalLM(TTTPreTrainedModel):
             is_last_in_chunk=is_last_in_chunk,
         )
 
-        # hidden_states = outputs.last_hidden_state  # TODO: for matching logits
-        hidden_states = outputs.last_hidden_state[:,-1:,:]  # [BS,N,F] -> [BS,1,F] to avoid OOM when prefilling
+        hidden_states = outputs.last_hidden_state  # TODO: for matching logits
+        # hidden_states = outputs.last_hidden_state[:,-1:,:]  # [BS,N,F] -> [BS,1,F] to avoid OOM when prefilling
         logits = self.lm_head(hidden_states)
 
         return TTTCausalLMOutput(
@@ -1508,15 +1508,3 @@ class TTTForCausalLM(TTTPreTrainedModel):
             cache_params=outputs.cache_params,
         )
 
-
-if __name__ == "__main__":
-    from .configuration_ttt import TTT_STANDARD_CONFIGS
-    # 125M
-    ttt_config = TTTConfig(**TTT_STANDARD_CONFIGS["125m"])
-    ttt_model = TTTForCausalLM(ttt_config)
-    print(ttt_model(torch.ones((1, 2048), dtype=torch.long)))
-    
-    # 1.3B
-    ttt_config = TTTConfig(**TTT_STANDARD_CONFIGS["1b"])
-    ttt_model = TTTForCausalLM(ttt_config)
-    print(ttt_model(torch.ones((1, 2048), dtype=torch.long)))
