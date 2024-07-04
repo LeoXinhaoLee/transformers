@@ -34,6 +34,7 @@ TTT_STANDARD_CONFIGS = {
         "num_attention_heads": 32,
         "rms_norm_eps": 1e-6,
         "tie_word_embeddings": True,
+        'conv_before_ttt': True,
     },
     "125m": {
         "hidden_size": 768,
@@ -42,6 +43,7 @@ TTT_STANDARD_CONFIGS = {
         "num_attention_heads": 12,
         "rms_norm_eps": 1e-6,
         "tie_word_embeddings": True,
+        'conv_before_ttt': True,
     },
 }
 

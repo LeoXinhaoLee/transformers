@@ -300,9 +300,11 @@ class TTTBaseModule(nn.Module):
         self.out_norm = nn.LayerNorm(self.hidden_size)
 
         if self.config.use_compile:
+            self.get_QKV_ilr = torch.compile(self._get_QKV_ilr)
             self.residual_add_post_LN = torch.compile(self._residual_add_post_LN)
             self.gate_out_norm = torch.compile(self._gate_out_norm)
         else:
+            self.get_QKV_ilr = self._get_QKV_ilr
             self.residual_add_post_LN = self._residual_add_post_LN
             self.gate_out_norm = self._gate_out_norm
 
@@ -339,8 +341,8 @@ class TTTBaseModule(nn.Module):
     ):
         '''
         Args:
-            XQK: (1) prefill: [B,N,F]; (2) decode: [B,1,F];
-            cache_params: [B,3,F]
+            XQK: (1) prefill: [B,N,F]; (2) decode: [B,N=1,F];
+            cache_params: [B,KS,F]
 
         Returns:
             XQ: [B,N,F]
@@ -379,8 +381,8 @@ class TTTBaseModule(nn.Module):
     ):
         '''
         Args:
-            XQK: (1) prefill: [B,N,F]; (2) decode: [B,1,F];
-            cache_params: [B,3,F]
+            XQK: (1) prefill: [B,N,F]; (2) decode: [B,N=1,F];
+            cache_params: [B,KS,F]
 
         Returns:
             XQ: [B,N,F]
@@ -424,6 +426,27 @@ class TTTBaseModule(nn.Module):
 
         return XQ, XK
 
+    def _get_QKV_ilr(self, hidden_states):
+        B, L, D = hidden_states.shape
+
+        XQKV_gilr = self.qkv_proj(hidden_states)  # [B,N, 3*F + nh]
+
+        XQKV, ilr_gated = torch.split(XQKV_gilr, split_size_or_sections=[3 * D, self.num_heads], dim=-1)
+
+        ilr_gated = F.sigmoid(
+            (ilr_gated + self.gate_ilr_bias).permute(0, 2, 1).reshape(-1, L, 1)
+        )  # ([B,N,nh] + [1,1,nh]) -> [B,nh,N] -> [B*nh,N,1]
+
+        XQK, XGate_XV = torch.split(XQKV, split_size_or_sections=[self.hidden_size, 2 * self.hidden_size], dim=-1)
+
+        XGate, XV = torch.split(
+            XGate_XV.reshape(B, L,
+                             self.num_heads, 2 * self.head_dim).permute(0, 2, 1, 3).reshape(-1, L, 2 * self.head_dim),
+            split_size_or_sections=self.head_dim, dim=-1
+        )  # [B*nh,N=1,f] x2
+
+        return XQK, XV, XGate, ilr_gated
+
     def get_inner_loop_inputs(
         self,
         hidden_states: torch.Tensor,
@@ -441,15 +464,7 @@ class TTTBaseModule(nn.Module):
             token_idx = self.token_idx[:, :, inner_chunk_step_offset, :] + \
                         self.learnable_token_idx[:, :, inner_chunk_step_offset, :] # [1,1,CS,1] -> [1,1,1]
 
-        XQKV_gilr = self.qkv_proj(hidden_states)  # [B,N, 3*F + nh]
-
-        XQKV, ilr_gated = torch.split(XQKV_gilr, split_size_or_sections=[3*D, self.num_heads], dim=-1)
-
-        XQK, XGate_XV = torch.split(XQKV, split_size_or_sections=[self.hidden_size, 2 * self.hidden_size], dim=-1)
-        XGate, XV = torch.split(
-            XGate_XV.reshape(B, L, self.num_heads, 2 * self.head_dim).permute(0,2,1,3).reshape(-1, L, 2 * self.head_dim),
-            split_size_or_sections=self.head_dim, dim=-1
-        )  # [B*nh,N=1,f] x2
+        XQK, XV, XGate, ilr_gated = self.get_QKV_ilr(hidden_states)
 
         # XQ, XK = self.conv_qk(XQK, cache_params, is_prefill)  # [B,N,F] -> conv1: [B,N,F], conv2: [B,N,F]
         XQ, XK = self.conv_qk_fused(XQK, cache_params, is_prefill)  # [B,N,F] -> conv1: [B,N,F], conv2: [B,N,F]
@@ -461,10 +476,6 @@ class TTTBaseModule(nn.Module):
         XQ, XK = self.apply_rotary_pos_emb(XQ, XK, cos, sin)
         XQ = XQ.reshape(-1, L, self.head_dim)  # [B,nh,N,f] -> [B*nh,N,f]
         XK = XK.reshape(-1, L, self.head_dim)
-
-        ilr_gated = F.sigmoid(
-            (ilr_gated + self.gate_ilr_bias).permute(0,2,1).reshape(-1,L,1)
-        )  # ([B,N,nh] + [1,1,nh]) -> [B,nh,N] -> [B*nh,N,1]
 
         XV = XV.contiguous()
         XK = XK.contiguous()
@@ -522,10 +533,7 @@ class TTTBaseModule(nn.Module):
         )
         B_mul_NH, N, HF = XV.shape
         B = B_mul_NH // self.num_heads
-        if is_prefill:
-            inputs = {'XQ': XQ, 'XK': XK, 'XV': XV, 'ilr_gated': ilr_gated}
-        else:
-            inputs = {'XQ': XQ, 'XK': XK, 'XV': XV, 'token_idx': token_idx, 'ilr_gated': ilr_gated}
+        inputs = {'XQ': XQ, 'XK': XK, 'XV': XV, 'token_idx': token_idx, 'ilr_gated': ilr_gated}
 
         XQW_batch = self.process_inner_loop(
             inputs,
@@ -555,14 +563,14 @@ def m1_prefill_chunk(states, inputs, i, ln_weight, ln_bias, Attn_b):
 
     Z1 = XK_chunk @ W1_init + b1_init  # [B*nh,K,f] @ [B*nh,f,f] -> [B*nh,K,f]
     l2_target = XV_chunk - XK_chunk
-    grad_l_wrt_Z1 = ln_fused_l2_bwd(Z1, l2_target, ln_weight, ln_bias)  # [B*nh,K=1,f]: torch.compile makes it a lot faster
+    dl_dZ1 = ln_fused_l2_bwd(Z1, l2_target, ln_weight, ln_bias)  # [B*nh,K=1,f]: torch.compile makes it a lot faster
 
-    b1_bar = b1_init - (coeff_chunk * Attn_b) @ grad_l_wrt_Z1
+    b1_bar = b1_init - (coeff_chunk * Attn_b) @ dl_dZ1
 
     Attn1 = torch.tril(XQ_chunk @ XK_chunk.transpose(-1, -2))  # [B*nh,K,K]
-    Z1_bar = XQ_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1 + b1_bar  # [B*nh,K,f] @ [B*nh,f,f] - ([B*nh,K,1] * [B*nh,K,K]) @ [B*nh,K,f]
+    Z1_bar = XQ_chunk @ W1_init - (coeff_chunk * Attn1) @ dl_dZ1 + b1_bar  # [B*nh,K,f] @ [B*nh,f,f] - ([B*nh,K,1] * [B*nh,K,K]) @ [B*nh,K,f]
 
-    W1_init.sub_((coeff_chunk_last * XK_chunk.transpose(-1, -2)) @ grad_l_wrt_Z1)  # in-place update: [B*nh,f,f] - ([B*nh,1,K] * [B*nh,K,f].t) @ [B*nh,K,f]
+    W1_init.sub_((coeff_chunk_last * XK_chunk.transpose(-1, -2)) @ dl_dZ1)  # in-place update: [B*nh,f,f] - ([B*nh,1,K] * [B*nh,K,f].t) @ [B*nh,K,f]
     b1_init.copy_(b1_bar[:,-1:])
 
     return Z1_bar
@@ -613,13 +621,13 @@ def m1_decode_end_chunk(states, inputs, ln_weight, ln_bias):
     b1_grad.zero_()
 
     # residual + postln
-    mu_bar = Z1_bar.mean(dim=-1, keepdim=True)  # [B*nh,K=1,f] -> [B*nh,K=1,1]
-    var_bar = Z1_bar.var(dim=-1, keepdim=True, unbiased=False)
-    std_bar = torch.sqrt(var_bar + 1e-6)
-    Z1_bar_hat = (Z1_bar - mu_bar) / std_bar  # [B*nh,K,f]
-    LN_out_bar = ln_weight * Z1_bar_hat.reshape(-1, NH, K, HF) + ln_bias
-    LN_out_bar = LN_out_bar.reshape(-1, K, HF)
-    Z1_bar = XQ + LN_out_bar
+    # mu_bar = Z1_bar.mean(dim=-1, keepdim=True)  # [B*nh,K=1,f] -> [B*nh,K=1,1]
+    # var_bar = Z1_bar.var(dim=-1, keepdim=True, unbiased=False)
+    # std_bar = torch.sqrt(var_bar + 1e-6)
+    # Z1_bar_hat = (Z1_bar - mu_bar) / std_bar  # [B*nh,K,f]
+    # LN_out_bar = ln_weight * Z1_bar_hat.reshape(-1, NH, K, HF) + ln_bias
+    # LN_out_bar = LN_out_bar.reshape(-1, K, HF)
+    # Z1_bar = XQ + LN_out_bar
 
     return Z1_bar
 
@@ -639,7 +647,7 @@ def m1_decode(states, inputs, ln_weight, ln_bias):
     W1_grad = states['W1_grad']
     b1_grad = states['b1_grad']
 
-    XV, XK, XQ,\
+    XV, XK, XQ, \
     token_idx, ilr_gated = inputs['XV'], inputs['XK'], inputs['XQ'], \
                            inputs['token_idx'], inputs['ilr_gated']  # [B*nh,N=1,f], [1,1,1], [B*nh,N=1,1]
     B_mul_NH, K, HF = XV.shape
@@ -676,13 +684,13 @@ def m1_decode(states, inputs, ln_weight, ln_bias):
     Z1_bar = XQ @ W1_bar + b1_bar  # [B*nh,K=1,f] @ [B*nh,f,f]
 
     # residual + postln
-    mu_bar = Z1_bar.mean(dim=-1, keepdim=True)  # [B*nh,K=1,f] -> [B*nh,K=1,1]
-    var_bar = Z1_bar.var(dim=-1, keepdim=True, unbiased=False)
-    std_bar = torch.sqrt(var_bar + 1e-6)
-    Z1_bar_hat = (Z1_bar - mu_bar) / std_bar  # [B*nh,K,f]
-    LN_out_bar = ln_weight * Z1_bar_hat.reshape(-1, NH, K, HF) + ln_bias
-    LN_out_bar = LN_out_bar.reshape(-1, K, HF)
-    Z1_bar = XQ + LN_out_bar
+    # mu_bar = Z1_bar.mean(dim=-1, keepdim=True)  # [B*nh,K=1,f] -> [B*nh,K=1,1]
+    # var_bar = Z1_bar.var(dim=-1, keepdim=True, unbiased=False)
+    # std_bar = torch.sqrt(var_bar + 1e-6)
+    # Z1_bar_hat = (Z1_bar - mu_bar) / std_bar  # [B*nh,K,f]
+    # LN_out_bar = ln_weight * Z1_bar_hat.reshape(-1, NH, K, HF) + ln_bias
+    # LN_out_bar = LN_out_bar.reshape(-1, K, HF)
+    # Z1_bar = XQ + LN_out_bar
 
     return Z1_bar
 
@@ -721,10 +729,11 @@ class TTTM1BMMModule(TTTBaseModule):
         if is_prefill:
             B_mul_NH, N, HF = inputs['XV'].shape  # [B*nh,N,f]
             NC = N // self.inner_chunk_size
+            token_idx = inputs.pop('token_idx')
             inputs = tree_map(lambda x: x.reshape(B_mul_NH, NC, self.inner_chunk_size, -1).transpose(1,0).contiguous(),
                               inputs)  # [B*nh,N,f] -> [B*nh,NC,CS,f] -> [NC,B*nh,CS,f]
             ilr_gated = inputs.pop('ilr_gated').transpose(-1,-2)  # [NC,B*nh,1,CS]
-            inputs['coeff'] = self.token_idx * ilr_gated  # [1,1,CS,1] * [NC,B*nh,1,CS] -> [NC,B*nh,CS,CS]
+            inputs['coeff'] = token_idx * ilr_gated  # [1,1,CS,1] * [NC,B*nh,1,CS] -> [NC,B*nh,CS,CS]
             inputs['coeff_last'] = inputs['coeff'][...,-1:,:]  # pre-sclice: [NC,B*nh,1,CS]
 
             Attn_b = torch.tril(torch.ones(self.inner_chunk_size, self.inner_chunk_size,
@@ -743,7 +752,7 @@ class TTTM1BMMModule(TTTBaseModule):
             )
             XQW_batch = XQW_batch.transpose(1,0).reshape(B_mul_NH, -1, HF).contiguous()  # [B*h,N,f]
 
-            XQW_batch = self.residual_add_post_LN(XQ_residual, XQW_batch)
+            # XQW_batch = self.residual_add_post_LN(XQ_residual, XQW_batch)
 
         else:
             # @xinhao: decoding from a prompt of length 1 will always have `inner_chunk_size=remainder=1`
@@ -766,7 +775,7 @@ class TTTM1BMMModule(TTTBaseModule):
                     self.ln_bias,  # [1,nh,1,f]
                 )  # ret: [B*nh,N=1,f]
 
-            # XQW_batch = self.residual_add_post_LN(XQ_residual, XQW_batch)
+        XQW_batch = self.residual_add_post_LN(XQ_residual, XQW_batch)
 
         return XQW_batch, None
 
@@ -788,22 +797,22 @@ def m2_prefill_chunk(states, inputs, i, ln_weight, ln_bias, Attn_b):
     Z2 = X2 @ W2_init + b2_init
 
     l2_target = XV_chunk - XK_chunk
-    grad_l_wrt_Z2 = ln_fused_l2_bwd(Z2, l2_target, ln_weight, ln_bias)  # [B*nh,K=1,f]
-    grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2_init.transpose(-1, -2) * diff_gelu(Z1)
+    dl_dZ2 = ln_fused_l2_bwd(Z2, l2_target, ln_weight, ln_bias)  # [B*nh,K=1,f]
+    dl_dZ1 = dl_dZ2 @ W2_init.transpose(-1, -2) * diff_gelu(Z1)
 
-    b1_bar = b1_init - (coeff_chunk * Attn_b) @ grad_l_wrt_Z1  # [B*nh,1,4f] - ([B*nh,K,K] * [K,K]) @ [B*nh,K,4f]
+    b1_bar = b1_init - (coeff_chunk * Attn_b) @ dl_dZ1  # [B*nh,1,4f] - ([B*nh,K,K] * [K,K]) @ [B*nh,K,4f]
     Attn1 = torch.tril(XQ_chunk @ XK_chunk.transpose(-1, -2))  # [B*nh,K,K]
-    Z1_bar = XQ_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1 + b1_bar  # [B*nh,K,f] @ [B*nh,f,4f] - ([K,K] * [B*nh,K,K]) @ [B*nh,K,4f] + [B*nh,K,4f]
+    Z1_bar = XQ_chunk @ W1_init - (coeff_chunk * Attn1) @ dl_dZ1 + b1_bar  # [B*nh,K,f] @ [B*nh,f,4f] - ([K,K] * [B*nh,K,K]) @ [B*nh,K,4f] + [B*nh,K,4f]
 
     X2_bar = F.gelu(Z1_bar, approximate='tanh')
 
-    b2_bar = b2_init - (coeff_chunk * Attn_b) @ grad_l_wrt_Z2  # [B*nh,1,4f] - ([B*nh,K,K] * [K,K]) @ [B*nh,K,4f]
+    b2_bar = b2_init - (coeff_chunk * Attn_b) @ dl_dZ2  # [B*nh,1,4f] - ([B*nh,K,K] * [K,K]) @ [B*nh,K,4f]
     Attn2 = torch.tril(X2_bar @ X2.transpose(-1, -2))  # [B*nh,K,K]
-    Z2_bar = X2_bar @ W2_init - (coeff_chunk * Attn2) @ grad_l_wrt_Z2 + b2_bar
+    Z2_bar = X2_bar @ W2_init - (coeff_chunk * Attn2) @ dl_dZ2 + b2_bar
 
-    W1_init.sub_((coeff_chunk_last * XK_chunk.transpose(-1, -2)) @ grad_l_wrt_Z1)  # in-place update: [B*nh,f,4f] - ([B*nh,1,K] * [B*nh,K,f].t) @ [B*nh,K,4f]
+    W1_init.sub_((coeff_chunk_last * XK_chunk.transpose(-1, -2)) @ dl_dZ1)  # in-place update: [B*nh,f,4f] - ([B*nh,1,K] * [B*nh,K,f].t) @ [B*nh,K,4f]
     b1_init.copy_(b1_bar[:,-1:])
-    W2_init.sub_((coeff_chunk_last * X2.transpose(-1, -2)) @ grad_l_wrt_Z2)  # in-place update: [B*nh,4f,f] - ([B*nh,1,K] * [B*nh,K,4f].t) @ [B*nh,K,f]
+    W2_init.sub_((coeff_chunk_last * X2.transpose(-1, -2)) @ dl_dZ2)  # in-place update: [B*nh,4f,f] - ([B*nh,1,K] * [B*nh,K,4f].t) @ [B*nh,K,f]
     b2_init.copy_(b2_bar[:, -1:])
 
     return Z2_bar
@@ -827,19 +836,21 @@ def m2_decode_end_chunk(states, inputs, ln_weight, ln_bias):
     Z2 = X2 @ W2_init + b2_init
 
     l2_target = XV_chunk - XK_chunk
-    grad_l_wrt_Z2 = ilr_gated * ln_fused_l2_bwd(Z2, l2_target, ln_weight, ln_bias)  # [B*nh,K=1,f]
-    grad_l_wrt_Z1 = ilr_gated * (grad_l_wrt_Z2 @ W2_init.transpose(-1, -2) * diff_gelu(Z1))  # [B*nh,K=1,4f]
+    dl_dZ2 = ln_fused_l2_bwd(Z2, l2_target, ln_weight, ln_bias)  # [B*nh,K=1,f]
+    ilr_mul_dl_dZ2 = ilr_gated * dl_dZ2
+    dl_dZ1 = dl_dZ2 @ W2_init.transpose(-1, -2) * diff_gelu(Z1)  # [B*nh,K=1,4f]
+    ilr_mul_dl_dZ1 = ilr_gated * dl_dZ1
 
-    W1_grad.add_(XK_chunk.transpose(-1, -2) @ grad_l_wrt_Z1)  # [B*nh,1,f].t @ [B*nh,1,4f]
-    b1_grad.add_(grad_l_wrt_Z1)
+    W1_grad.add_(XK_chunk.transpose(-1, -2) @ ilr_mul_dl_dZ1)  # [B*nh,1,f].t @ [B*nh,1,4f]
+    b1_grad.add_(ilr_mul_dl_dZ1)
     W1_init.sub_(token_idx * W1_grad)
     b1_init.sub_(token_idx * b1_grad)
     Z1_bar = XQ_chunk @ W1_init + b1_init  # [B*nh,K=1,f] @ ([B*nh,f,f] - [B*nh,1,1] * [B*nh,f,f])
 
     X2_bar = F.gelu(Z1_bar, approximate='tanh')
 
-    W2_grad.add_(X2.transpose(-1, -2) @ grad_l_wrt_Z2)  # [B*nh,K,4f].t @ [B*nh,K,f]
-    b2_grad.add_(grad_l_wrt_Z2)
+    W2_grad.add_(X2.transpose(-1, -2) @ ilr_mul_dl_dZ2)  # [B*nh,K,4f].t @ [B*nh,K,f]
+    b2_grad.add_(ilr_mul_dl_dZ2)
     W2_init.sub_(token_idx * W2_grad)
     b2_init.sub_(token_idx * b2_grad)
     Z2_bar = X2_bar @ W2_init + b2_init  # [B*nh,K=1,f]
@@ -870,19 +881,21 @@ def m2_decode(states, inputs, ln_weight, ln_bias):
     Z2 = X2 @ W2_init + b2_init
 
     l2_target = XV_chunk - XK_chunk
-    grad_l_wrt_Z2 = ilr_gated * ln_fused_l2_bwd(Z2, l2_target, ln_weight, ln_bias)  # [B*nh,K=1,f]
-    grad_l_wrt_Z1 = ilr_gated * (grad_l_wrt_Z2 @ W2_init.transpose(-1, -2) * diff_gelu(Z1))  # [B*nh,K=1,4f]
+    dl_dZ2 = ln_fused_l2_bwd(Z2, l2_target, ln_weight, ln_bias)  # [B*nh,K=1,f]
+    ilr_mul_dl_dZ2 = ilr_gated * dl_dZ2
+    dl_dZ1 = dl_dZ2 @ W2_init.transpose(-1, -2) * diff_gelu(Z1)  # [B*nh,K=1,4f]
+    ilr_mul_dl_dZ1 = ilr_gated * dl_dZ1
 
-    W1_grad.add_(XK_chunk.transpose(-1, -2) @ grad_l_wrt_Z1)  # [B*nh,1,f].t @ [B*nh,1,4f]
-    b1_grad.add_(grad_l_wrt_Z1)
+    W1_grad.add_(XK_chunk.transpose(-1, -2) @ ilr_mul_dl_dZ1)  # [B*nh,1,f].t @ [B*nh,1,4f]
+    b1_grad.add_(ilr_mul_dl_dZ1)
     W1_last = W1_init - token_idx * W1_grad
     b1_last = b1_init - token_idx * b1_grad
     Z1_bar = XQ_chunk @ W1_last + b1_last  # [B*nh,K=1,f] @ ([B*nh,f,f] - [B*nh,1,1] * [B*nh,f,f])
 
     X2_bar = F.gelu(Z1_bar, approximate='tanh')
 
-    W2_grad.add_(X2.transpose(-1, -2) @ grad_l_wrt_Z2)  # [B*nh,K,4f].t @ [B*nh,K,f]
-    b2_grad.add_(grad_l_wrt_Z2)
+    W2_grad.add_(X2.transpose(-1, -2) @ ilr_mul_dl_dZ2)  # [B*nh,K,4f].t @ [B*nh,K,f]
+    b2_grad.add_(ilr_mul_dl_dZ2)
     W2_last = W2_init - token_idx * W2_grad
     b2_last = b2_init - token_idx * b2_grad
     Z2_bar = X2_bar @ W2_last + b2_last  # [B*nh,K=1,f]
@@ -930,10 +943,11 @@ class TTTM2BMMModule(TTTBaseModule):
         if is_prefill:
             B_mul_NH, N, HF = inputs['XV'].shape  # [B*nh,N,f]
             NC = N // self.inner_chunk_size
+            token_idx = inputs.pop('token_idx')
             inputs = tree_map(lambda x: x.reshape(B_mul_NH, NC, self.inner_chunk_size, -1).transpose(1, 0).contiguous(),
                               inputs)  # [B*nh,N,f] -> [B*nh,NC,CS,f] -> [NC,B*nh,CS,f]
             ilr_gated = inputs.pop('ilr_gated').transpose(-1, -2)  # [NC,B*nh,1,CS]
-            inputs['coeff'] = self.token_idx * ilr_gated  # [1,1,CS,1] * [NC,B*nh,1,CS] -> [NC,B*nh,CS,CS]
+            inputs['coeff'] = token_idx * ilr_gated  # [1,1,CS,1] * [NC,B*nh,1,CS] -> [NC,B*nh,CS,CS]
             inputs['coeff_last'] = inputs['coeff'][..., -1:, :]  # pre-sclice: [NC,B*nh,1,CS]
 
             Attn_b = torch.tril(torch.ones(self.inner_chunk_size, self.inner_chunk_size,
@@ -985,14 +999,6 @@ class TTTM1BMMTKModule(TTTBaseModule):
         self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim, self.head_dim)))
         self.b1 = nn.Parameter(torch.ones(size=(self.num_heads, 1, self.head_dim)))
 
-        if self.config.use_compile:
-            # Use PyTorch for decode now
-            self.decode_end_chunk = torch.compile(m1_decode_end_chunk)
-            self.decode = torch.compile(m1_decode)
-        else:
-            self.decode_end_chunk = m1_decode_end_chunk
-            self.decode = m1_decode
-
     def process_inner_loop(
         self,
         inputs,
@@ -1011,10 +1017,11 @@ class TTTM1BMMTKModule(TTTBaseModule):
 
             CS = self.inner_chunk_size
             NC = N // CS
+            token_idx = inputs.pop('token_idx')
             inputs = tree_map(lambda x: x.reshape(B, NH, NC, CS, -1).contiguous(), inputs)  # [B*nh,N,f/1] -> [B,nh,nc,cs,f/1]
             ilr_gated = inputs.pop('ilr_gated').transpose(-1, -2)  # [B,nh,nc,1,cs]
 
-            inputs['coeff'] = self.token_idx[None,:] * ilr_gated  # [1,1,1,cs,1] * [B,nh,nc,1,cs] -> [B,nh,nc,CS,CS]
+            inputs['coeff'] = token_idx[None,:] * ilr_gated  # [1,1,1,cs,1] * [B,nh,nc,1,cs] -> [B,nh,nc,CS,CS]
 
             XV, XK, XQ, coeff = inputs['XV'], inputs['XK'], inputs['XQ'], inputs['coeff']  # [B,nh,nc,cs,f/1]
             input_device = XV.device
@@ -1068,8 +1075,6 @@ class TTTM1BMMTKModule(TTTBaseModule):
                                                   ilr_gated.stride(0), ilr_gated.stride(1),
                                                   CS, HF)
             else:
-                # @xinhao: XK and XQ have the same stride, but different from XV's due to different way of getting XKC and XV
-                # @xinhao: Either (1) .contiguous() in get_inner_input(), or (2) use differnt strides at triton kernel
                 _m1_decode_kernel[grid](W1, W1_grad, b1, b1_grad,
                                         XV, XK, XQ,
                                         self.ln_weight.data, self.ln_bias.data,
@@ -1099,13 +1104,6 @@ class TTTM2BMMTKModule(TTTBaseModule):
         self.W2 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, 4 * self.head_dim, self.head_dim)))
         self.b2 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, 1, self.head_dim)))
 
-        if self.config.use_compile:
-            self.decode_end_chunk = torch.compile(m2_decode_end_chunk)
-            self.decode = torch.compile(m2_decode)
-        else:
-            self.decode_end_chunk = m2_decode_end_chunk
-            self.decode = m2_decode
-
     def process_inner_loop(
         self,
         inputs,
@@ -1128,9 +1126,10 @@ class TTTM2BMMTKModule(TTTBaseModule):
 
             CS = self.inner_chunk_size
             NC = N // CS
+            token_idx = inputs.pop('token_idx')
             inputs = tree_map(lambda x: x.reshape(B, NH, NC, CS, -1).contiguous(), inputs)  # [B*nh,N,f/1] -> [B,nh,nc,cs,f/1]
             ilr_gated = inputs.pop('ilr_gated').transpose(-1, -2)  # [B,nh,nc,1,cs]
-            inputs['coeff'] = self.token_idx[None, :] * ilr_gated  # [1,1,1,cs,1] * [B,nh,nc,1,cs] -> [B,nh,nc,CS,CS]
+            inputs['coeff'] = token_idx[None, :] * ilr_gated  # [1,1,1,cs,1] * [B,nh,nc,1,cs] -> [B,nh,nc,CS,CS]
 
             XV, XK, XQ, coeff = inputs['XV'], inputs['XK'], inputs['XQ'], inputs['coeff']  # [B,nh,nc,cs,f/1]
             input_device = XV.device
@@ -1288,9 +1287,11 @@ class TTTDecoderLayer(nn.Module):
                     residual_in_fp32=self.residual_in_fp32,
                     eps=self.conv_layernorm.eps,
                 )
-            hidden_states = self.conv(residual.to(dtype=self.conv.conv.weight.dtype),
-                                      is_prefill=is_prefill,
-                                      cache_params=cache_params)
+            hidden_states = self.conv(
+                residual.to(dtype=self.conv.conv.weight.dtype),
+                is_prefill=is_prefill,
+                cache_params=cache_params
+            )
 
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states
@@ -1308,7 +1309,6 @@ class TTTDecoderLayer(nn.Module):
                 residual_in_fp32=self.residual_in_fp32,
                 eps=self.input_layernorm.eps,
             )
-
         # TTT
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
@@ -1335,7 +1335,6 @@ class TTTDecoderLayer(nn.Module):
                 residual_in_fp32=self.residual_in_fp32,
                 eps=self.post_attention_layernorm.eps,
             )
-
         # Fully Connected
         hidden_states = self.mlp_forward(hidden_states)
 
