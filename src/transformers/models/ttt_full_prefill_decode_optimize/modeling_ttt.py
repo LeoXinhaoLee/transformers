@@ -56,12 +56,10 @@ def tree_map(fn, inputs):
         out = fn(inputs)
     return out
 
-
 def diff_gelu(x):
     tanh_out = torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x))
     ff = 0.5 * x * ((1 - tanh_out * tanh_out) * (0.79788456 + 0.1070322243 * x * x)) + 0.5 * (1 + tanh_out)
     return ff
-
 
 def ln_fwd(x, gamma, beta, eps=1e-6):
     """
@@ -91,7 +89,6 @@ def ln_fwd(x, gamma, beta, eps=1e-6):
     y = gamma * x_hat + beta
     y = y.reshape(-1, N, HF)
     return y
-
 
 def ln_fused_l2_bwd(x, l2_target, gamma, beta, eps=1e-6):
     """

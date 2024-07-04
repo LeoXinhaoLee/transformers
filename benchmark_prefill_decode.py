@@ -37,9 +37,9 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, Pretra
 from transformers import LlamaForCausalLM, LlamaConfig
 
 from transformers.models.mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel  # copy from mamba repo, modify generation to avoid OOM
-from transformers.models.ttt.configuration_ttt import TTT_STANDARD_CONFIGS, TttConfig  # 125m and 1b config
 
-from transformers.models.ttt_full_prefill_decode_optimize.modeling_ttt import TttForCausalLM
+from transformers.models.ttt_clean.configuration_ttt import TTT_STANDARD_CONFIGS, TTTConfig
+from transformers.models.ttt_clean import TTTForCausalLM
 
 parser = argparse.ArgumentParser(description="Generation benchmarking")
 parser.add_argument("--logdir", type=str, default="./exp/clean")
@@ -51,8 +51,6 @@ parser.add_argument("--genlen", type=int, default=128)
 parser.add_argument("--batch", type=int, default=1)
 parser.add_argument("--attn_impl", type=str, default='flash_attention_2', choices=['eager', 'flash_attention_2'])
 parser.add_argument("--inner_net", type=str, default='mlp_2_dual', choices=['mlp_1_dual', 'mlp_2_dual',
-                                                                            'mlp_2_dual_whole_loop',
-                                                                            'mlp_1_dual_triton', 'mlp_2_dual_triton',
                                                                             'mlp_1_dual_tk', 'mlp_2_dual_tk',])
 parser.add_argument("--use_compile", action='store_true')
 parser.add_argument("--no_cg", action='store_true')    # @xinhao: currently only implemented for Mamba and TTT
@@ -123,7 +121,7 @@ elif is_ttt:
     elif ttt_size not in TTT_STANDARD_CONFIGS.keys():
         raise NotImplementedError(f"TTT Config {args.model_name} Not Implemented!")
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
-    ttt_config = TttConfig(**TTT_STANDARD_CONFIGS[ttt_size], vocab_size=32000)
+    ttt_config = TTTConfig(**TTT_STANDARD_CONFIGS[ttt_size], vocab_size=32000)
     ttt_config.inner_net = args.inner_net
     ttt_config.use_compile = args.use_compile
     ttt_config.dtype = dtype
@@ -132,7 +130,7 @@ elif is_ttt:
     ttt_config.residual_in_fp32 = True
     if args.model_name.split('-')[-1] == 'profile':
         ttt_config.num_hidden_layers = 1
-    model = TttForCausalLM(ttt_config).to(device=device, dtype=dtype)
+    model = TTTForCausalLM(ttt_config).to(device=device, dtype=dtype)
 else:
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")  # meta-llama/Llama-2-7b
     config = LlamaConfig.from_json_file('./llama_config/config.json')  # 1B llama config, vocab size=32000
