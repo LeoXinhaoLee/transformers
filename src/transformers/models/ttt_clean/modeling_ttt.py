@@ -16,15 +16,9 @@ from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 
 from transformers.models.ttt_clean.triton_kernel.fused_gate_outln import _fuse_gate_ln_kernel
 
-from transformers.models.ttt_clean.triton_kernel.ttt_linear_decode import (
-    _m1_decode_kernel,
-    _m1_decode_end_chunk_kernel
-)
+import transformers.models.ttt_clean.triton_kernel.ttt_linear_decode as triton_ttt_linear_decode
 
-from transformers.models.ttt_clean.triton_kernel.ttt_mlp_decode import (
-    _m2_decode_kernel,
-    _m2_decode_end_chunk_kernel
-)
+import transformers.models.ttt_clean.triton_kernel.ttt_mlp_decode as triton_ttt_mlp_decode
 
 try:
     import tk_m1_prefill
@@ -153,10 +147,10 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     return q_embed, k_embed
 
 
-class TTTRotaryEmbedding(nn.Module):
+class RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_position_embeddings=16, base=10000, device=None, scaling_factor=1.0):
         """
-        TTTRotary is equivalent to LlamaLayerLlamaRotaryEmbedding in implementation, except TTT sets max_position_embedding to inner_chunk_size.
+        TTTRotary is equivalent to LlamaLayerLlamaRotaryEmbedding in implementation, except TTT sets max_position_embedding to mini_batch_size.
         """
 
         super().__init__()
@@ -184,7 +178,7 @@ class TTTRotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
-class TTTMLP(nn.Module):
+class SwiGLUMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -200,7 +194,8 @@ class TTTMLP(nn.Module):
         return down_proj
 
 
-class TTTConv(nn.Module):
+class ConvModule(nn.Module):
+    
     def __init__(self, layer_idx, config):
         super().__init__()
         self.layer_idx = layer_idx
@@ -244,7 +239,7 @@ class TTTConv(nn.Module):
         return conv_output
 
 
-class TTTBaseModule(nn.Module):
+class TTTBase(nn.Module):
 
     def __init__(self, config: TTTConfig, layer_idx: Optional[int] = None):
         super().__init__()
@@ -260,17 +255,17 @@ class TTTBaseModule(nn.Module):
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.hidden_size // self.num_heads
-        self.inner_chunk_size = config.inner_net_chunk_size
+        self.mini_batch_size = config.mini_batch_size
         self.conv_kernel = config.conv_kernel
         
-        token_idx = (self.config.inner_net_lr / self.head_dim) / torch.arange(1, self.inner_chunk_size + 1)  # [CS,]
+        token_idx = (self.config.inner_net_lr / self.head_dim) / torch.arange(1, self.mini_batch_size + 1)  # [CS,]
         token_idx = token_idx.reshape(1, 1, -1, 1)  # [1,1,CS,1]
         self.register_buffer("token_idx", token_idx, persistent=False)
-        self.learnable_token_idx = nn.Parameter(torch.zeros((1, 1, self.inner_chunk_size, 1)))
+        self.learnable_token_idx = nn.Parameter(torch.zeros((1, 1, self.mini_batch_size, 1)))
 
-        self.rotary_emb = TTTRotaryEmbedding(
+        self.rotary_emb = RotaryEmbedding(
             self.head_dim,
-            max_position_embeddings=self.inner_chunk_size,
+            max_position_embeddings=self.mini_batch_size,
             base=self.config.rope_theta,
         )
         if self.config.use_compile:
@@ -338,46 +333,6 @@ class TTTBaseModule(nn.Module):
                                    XQW_batch.stride(0),
                                    self.hidden_size)
         return output
-
-    def conv_qk(
-        self,
-        XQK,
-        cache_params: Optional[TTTCache] = None,
-        is_prefill = False,
-    ):
-        '''
-        Args:
-            XQK: (1) prefill: [B,N,F]; (2) decode: [B,N=1,F];
-            cache_params: [B,KS,F]
-
-        Returns:
-            XQ: [B,N,F]
-            XK: [B,N,F]
-            in-place update cache_params
-        '''
-        B, N, D = XQK.shape
-        XQK = XQK.transpose(-1, -2)  # [B,F,N]
-        if is_prefill:
-            XQ = self.conv_q(XQK)[..., :N].transpose(-1, -2)
-            XK = self.conv_k(XQK)[..., :N].transpose(-1, -2)
-            if cache_params is not None:
-                conv_states = F.pad(XQK, (self.conv_kernel - N, 0))
-                cache_params.params_dict["conv_states"][self.layer_idx].copy_(conv_states)  # [B,F,KS]
-        else:
-            if cache_params is not None:
-                conv_states = cache_params.params_dict["conv_states"][self.layer_idx]
-                conv_states = torch.roll(conv_states, shifts=-1, dims=-1)
-                conv_states[:, :, -1] = XQK[:, :, 0]  # [B,F,KS]
-                cache_params.params_dict["conv_states"][self.layer_idx].copy_(conv_states)
-            else:
-                conv_states = nn.functional.pad(XQK, (self.conv_kernel - N, 0))  # [B,F,KS]
-
-            XQ = torch.sum(conv_states * self.conv_q.weight[:, 0, :], dim=-1) + self.conv_q.bias  # ([B,F,KS] * [F,1,KS][:,0,:]).sum(-1) -> [B,F] + [F,]
-            XK = torch.sum(conv_states * self.conv_k.weight[:, 0, :], dim=-1) + self.conv_k.bias
-            XQ = XQ.unsqueeze(1)  # [B,N=1,F]
-            XK = XK.unsqueeze(1)
-
-        return XQ, XK
 
     def conv_qk_fused(
         self,
@@ -461,24 +416,23 @@ class TTTBaseModule(nn.Module):
         is_prefill: bool = False,
     ):
         B, L, D = hidden_states.shape
-        # @xinhao: decoding from a prompt of length 1 will always have `inner_chunk_size=remainder=1`
+        # @xinhao: decoding from a prompt of length 1 will always have `mini_batch_size=remainder=1`
         if is_prefill:
             inner_chunk_step_offset = 0
             token_idx = self.token_idx + self.learnable_token_idx  # [1,1,CS,1]
         else:
-            inner_chunk_step_offset = cache_params.seqlen_offset % self.inner_chunk_size
+            inner_chunk_step_offset = cache_params.seqlen_offset % self.mini_batch_size
             token_idx = self.token_idx[:, :, inner_chunk_step_offset, :] + \
                         self.learnable_token_idx[:, :, inner_chunk_step_offset, :] # [1,1,CS,1] -> [1,1,1]
 
         XQK, XV, XGate, ilr_gated = self.get_QKV_ilr(hidden_states)
 
-        # XQ, XK = self.conv_qk(XQK, cache_params, is_prefill)  # [B,N,F] -> conv1: [B,N,F], conv2: [B,N,F]
         XQ, XK = self.conv_qk_fused(XQK, cache_params, is_prefill)  # [B,N,F] -> conv1: [B,N,F], conv2: [B,N,F]
         XQ = XQ.reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # [B,N,nh,f] -> [B,nh,N,f]
         XK = XK.reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
         # Apply rotary on XQ, XK
-        cos, sin = self.rotary_emb(XV, position_ids % self.inner_chunk_size)  # [B,N,f]
+        cos, sin = self.rotary_emb(XV, position_ids % self.mini_batch_size)  # [B,N,f]
         XQ, XK = self.apply_rotary_pos_emb(XQ, XK, cos, sin)
         XQ = XQ.reshape(-1, L, self.head_dim)  # [B,nh,N,f] -> [B*nh,N,f]
         XK = XK.reshape(-1, L, self.head_dim)
@@ -491,11 +445,11 @@ class TTTBaseModule(nn.Module):
 
         return XQ, XK, XV, token_idx, ilr_gated, XGate
 
-    def process_inner_loop(
+    def TTT_process(
         self,
         inputs,
         is_prefill,
-        is_last_in_chunk,
+        is_last_in_mini_batch,
         cache_params=None
     ):
         """
@@ -525,11 +479,11 @@ class TTTBaseModule(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         cache_params: Optional[TTTCache] = None,
         is_prefill: Optional[bool] = None,
-        is_last_in_chunk: Optional[bool] = None,
+        is_last_in_mini_batch: Optional[bool] = None,
     ):
         L = hidden_states.shape[1]
         # Simplification in benchmark: prefill length is a multiple of chunk size
-        assert (is_prefill and L % self.inner_chunk_size == 0) or ((not is_prefill) and L == 1)
+        assert (is_prefill and L % self.mini_batch_size == 0) or ((not is_prefill) and L == 1)
 
         XQ, XK, XV, token_idx, ilr_gated, XGate = self.get_inner_loop_inputs(
             hidden_states,
@@ -545,7 +499,7 @@ class TTTBaseModule(nn.Module):
             inputs,
             cache_params=cache_params,
             is_prefill=is_prefill,
-            is_last_in_chunk=is_last_in_chunk,
+            is_last_in_mini_batch=is_last_in_mini_batch,
         )
 
         if is_prefill:
@@ -560,7 +514,7 @@ class TTTBaseModule(nn.Module):
 
 ####### M1 Decode Module #######
 # With LN
-def m1_prefill_chunk(states, inputs, i, ln_weight, ln_bias, Attn_b):
+def ttt_linear_prefill_mini_batch(states, inputs, i, ln_weight, ln_bias, Attn_b):
     W1_init = states['W1_states']
     b1_init = states['b1_states']
     XV_chunk, XK_chunk, XQ_chunk, \
@@ -581,7 +535,7 @@ def m1_prefill_chunk(states, inputs, i, ln_weight, ln_bias, Attn_b):
 
     return Z1_bar
 
-def m1_decode_end_chunk(states, inputs, ln_weight, ln_bias):
+def ttt_linear_decode_last_token_in_mini_batch(states, inputs, ln_weight, ln_bias):
     W1 = states['W1_states']  # [B*nh,f,f]
     b1 = states['b1_states']
     W1_grad = states['W1_grad']
@@ -637,7 +591,7 @@ def m1_decode_end_chunk(states, inputs, ln_weight, ln_bias):
 
     return Z1_bar
 
-def m1_decode(states, inputs, ln_weight, ln_bias):
+def ttt_linear_decode_token(states, inputs, ln_weight, ln_bias):
     """
     Args:
         states: W: [B*nh,f,f], b: [B*nh,1,f]
@@ -701,7 +655,7 @@ def m1_decode(states, inputs, ln_weight, ln_bias):
     return Z1_bar
 
 
-class TTTM1BMMModule(TTTBaseModule):
+class TTTLinear(TTTBase):
 
     def __init__(self, config: TTTConfig, layer_idx: Optional[int] = None):
         super().__init__(config, layer_idx)
@@ -709,19 +663,19 @@ class TTTM1BMMModule(TTTBaseModule):
         self.b1 = nn.Parameter(torch.ones(size=(self.num_heads, 1, self.head_dim)))
 
         if self.config.use_compile:
-            self.prefill_chunk = torch.compile(m1_prefill_chunk)
-            self.decode_end_chunk = torch.compile(m1_decode_end_chunk)
-            self.decode = torch.compile(m1_decode)
+            self.prefill_mini_batch = torch.compile(ttt_linear_prefill_mini_batch)
+            self.decode_last_token_in_mini_batch = torch.compile(ttt_linear_decode_last_token_in_mini_batch)
+            self.decode_token = torch.compile(ttt_linear_decode_token)
         else:
-            self.prefill_chunk = m1_prefill_chunk
-            self.decode_end_chunk = m1_decode_end_chunk
-            self.decode = m1_decode
+            self.prefill_mini_batch = ttt_linear_prefill_mini_batch
+            self.decode_last_token_in_mini_batch = ttt_linear_decode_last_token_in_mini_batch
+            self.decode_token = ttt_linear_decode_token
 
-    def process_inner_loop(
+    def TTT_process(
         self,
         inputs,
         is_prefill=False,
-        is_last_in_chunk=False,
+        is_last_in_mini_batch=False,
         cache_params=None
     ):
         states = {
@@ -734,47 +688,45 @@ class TTTM1BMMModule(TTTBaseModule):
 
         if is_prefill:
             B_mul_NH, N, HF = inputs['XV'].shape  # [B*nh,N,f]
-            NC = N // self.inner_chunk_size
+            NC = N // self.mini_batch_size
             token_idx = inputs.pop('token_idx')
-            inputs = tree_map(lambda x: x.reshape(B_mul_NH, NC, self.inner_chunk_size, -1).transpose(1,0).contiguous(),
+            inputs = tree_map(lambda x: x.reshape(B_mul_NH, NC, self.mini_batch_size, -1).transpose(1,0).contiguous(),
                               inputs)  # [B*nh,N,f] -> [B*nh,NC,CS,f] -> [NC,B*nh,CS,f]
             ilr_gated = inputs.pop('ilr_gated').transpose(-1,-2)  # [NC,B*nh,1,CS]
             inputs['coeff'] = token_idx * ilr_gated  # [1,1,CS,1] * [NC,B*nh,1,CS] -> [NC,B*nh,CS,CS]
             inputs['coeff_last'] = inputs['coeff'][...,-1:,:]  # pre-sclice: [NC,B*nh,1,CS]
 
-            Attn_b = torch.tril(torch.ones(self.inner_chunk_size, self.inner_chunk_size,
+            Attn_b = torch.tril(torch.ones(self.mini_batch_size, self.mini_batch_size,
                                            dtype=ilr_gated.dtype, device=ilr_gated.device))  # [CS,CS]
 
-            def for_loop(states, inputs):
+            def prefill_sequence(states, inputs):
                 output_tensor = torch.empty_like(inputs['XV'])
                 for i in range(NC):
-                    Z1_bar = self.prefill_chunk(states, inputs, i, self.ln_weight, self.ln_bias, Attn_b)
+                    Z1_bar = self.prefill_mini_batch(states, inputs, i, self.ln_weight, self.ln_bias, Attn_b)
                     output_tensor[i] = Z1_bar
                 return output_tensor  # [NC, B*nh, K, f]
 
-            XQW_batch = for_loop(
+            XQW_batch = prefill_sequence(
                 states,  # [B*nh,f,f]
                 inputs,  # [NC,B*nh,CS,f]
             )
             XQW_batch = XQW_batch.transpose(1,0).reshape(B_mul_NH, -1, HF).contiguous()  # [B*h,N,f]
 
-            # XQW_batch = self.residual_add_post_LN(XQ_residual, XQW_batch)
-
         else:
-            # @xinhao: decoding from a prompt of length 1 will always have `inner_chunk_size=remainder=1`
+            # @xinhao: decoding from a prompt of length 1 will always have `mini_batch_size=remainder=1`
             B_mul_NH, N, HF = inputs['XV'].shape  # [B*nh,N=1,f]
             # inputs['ilr_gated']: [B*nh,N=1,1]
             # inputs['token_idx']: [1,1,1]
 
-            if is_last_in_chunk:
-                XQW_batch = self.decode_end_chunk(
+            if is_last_in_mini_batch:
+                XQW_batch = self.decode_last_token_in_mini_batch(
                     states,  # [B*nh,f,f], cloned from W1, safe for in-place op
                     inputs,  # [B*nh,N=1,f]
                     self.ln_weight,  # [1,nh,1,f]
                     self.ln_bias, # [1,nh,1,f]
                 )  # ret: [B*nh,N=1,f]
             else:
-                XQW_batch = self.decode(
+                XQW_batch = self.decode_token(
                     states,  # [B*nh,f,f], cloned from W1, safe for in-place op
                     inputs,  # [B*nh,N=1,f]
                     self.ln_weight,  # [1,nh,1,f]
@@ -789,7 +741,7 @@ class TTTM1BMMModule(TTTBaseModule):
 
 
 ####### M2 Decode Module #######
-def m2_prefill_chunk(states, inputs, i, ln_weight, ln_bias, Attn_b):
+def ttt_mlp_prefill_mini_batch(states, inputs, i, ln_weight, ln_bias, Attn_b):
     W1_init = states['W1_states']
     b1_init = states['b1_states']
     W2_init = states['W2_states']
@@ -822,7 +774,7 @@ def m2_prefill_chunk(states, inputs, i, ln_weight, ln_bias, Attn_b):
 
     return Z2_bar
 
-def m2_decode_end_chunk(states, inputs, ln_weight, ln_bias):
+def ttt_mlp_decode_last_token_in_mini_batch(states, inputs, ln_weight, ln_bias):
     W1_init = states['W1_states']
     W1_grad = states['W1_grad']
     b1_init = states['b1_states']
@@ -866,7 +818,7 @@ def m2_decode_end_chunk(states, inputs, ln_weight, ln_bias):
 
     return Z2_bar
 
-def m2_decode(states, inputs, ln_weight, ln_bias):
+def ttt_mlp_decode_token(states, inputs, ln_weight, ln_bias):
     W1_init = states['W1_states']
     W1_grad = states['W1_grad']
     b1_init = states['b1_states']
@@ -906,7 +858,7 @@ def m2_decode(states, inputs, ln_weight, ln_bias):
     return Z2_bar
 
 
-class TTTM2BMMModule(TTTBaseModule):
+class TTTMLP(TTTBase):
 
     def __init__(self, config: TTTConfig, layer_idx: Optional[int] = None):
         super().__init__(config, layer_idx)
@@ -916,19 +868,19 @@ class TTTM2BMMModule(TTTBaseModule):
         self.b2 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, 1, self.head_dim)))
 
         if self.config.use_compile:
-            self.prefill_chunk = torch.compile(m2_prefill_chunk)
-            self.decode_end_chunk = torch.compile(m2_decode_end_chunk)
-            self.decode = torch.compile(m2_decode)
+            self.prefill_mini_batch = torch.compile(ttt_mlp_prefill_mini_batch)
+            self.decode_last_token_in_mini_batch = torch.compile(ttt_mlp_decode_last_token_in_mini_batch)
+            self.decode_token = torch.compile(ttt_mlp_decode_token)
         else:
-            self.prefill_chunk = m2_prefill_chunk
-            self.decode_end_chunk = m2_decode_end_chunk
-            self.decode = m2_decode
+            self.prefill_mini_batch = ttt_mlp_prefill_mini_batch
+            self.decode_last_token_in_mini_batch = ttt_mlp_decode_last_token_in_mini_batch
+            self.decode_token = ttt_mlp_decode_token
 
     def process_inner_loop(
         self,
         inputs,
         is_prefill=False,
-        is_last_in_chunk=False,
+        is_last_in_mini_batch=False,
         cache_params=None
     ):
         states = {
@@ -945,44 +897,43 @@ class TTTM2BMMModule(TTTBaseModule):
 
         if is_prefill:
             B_mul_NH, N, HF = inputs['XV'].shape  # [B*nh,N,f]
-            NC = N // self.inner_chunk_size
+            NC = N // self.mini_batch_size
             token_idx = inputs.pop('token_idx')
-            inputs = tree_map(lambda x: x.reshape(B_mul_NH, NC, self.inner_chunk_size, -1).transpose(1, 0).contiguous(),
+            inputs = tree_map(lambda x: x.reshape(B_mul_NH, NC, self.mini_batch_size, -1).transpose(1, 0).contiguous(),
                               inputs)  # [B*nh,N,f] -> [B*nh,NC,CS,f] -> [NC,B*nh,CS,f]
             ilr_gated = inputs.pop('ilr_gated').transpose(-1, -2)  # [NC,B*nh,1,CS]
             inputs['coeff'] = token_idx * ilr_gated  # [1,1,CS,1] * [NC,B*nh,1,CS] -> [NC,B*nh,CS,CS]
             inputs['coeff_last'] = inputs['coeff'][..., -1:, :]  # pre-sclice: [NC,B*nh,1,CS]
 
-            Attn_b = torch.tril(torch.ones(self.inner_chunk_size, self.inner_chunk_size,
+            Attn_b = torch.tril(torch.ones(self.mini_batch_size, self.mini_batch_size,
                                            dtype=ilr_gated.dtype, device=ilr_gated.device))  # [CS,CS]
 
-            def for_loop(states, inputs):
+            def prefill_sequence(states, inputs):
                 output_tensor = torch.empty_like(inputs['XV'])
                 for i in range(NC):
-                    Z2_bar = self.prefill_chunk(states, inputs, i,
-                                                self.ln_weight, self.ln_bias, Attn_b)
+                    Z2_bar = self.prefill_mini_batch(states, inputs, i, self.ln_weight, self.ln_bias, Attn_b)
                     output_tensor[i] = Z2_bar
                 return output_tensor  # [NC, B*nh, K, f]
 
-            XQW_batch = for_loop(
+            XQW_batch = prefill_sequence(
                 states,  # [B*nh,f,f]
                 inputs,  # [NC,B*nh,CS,f]
             )
             XQW_batch = XQW_batch.transpose(1, 0).reshape(B_mul_NH, -1, HF).contiguous()  # [B*h,N,f]
 
         else:
-            # @xinhao: decoding from a prompt of length 1 will always have `inner_chunk_size=remainder=1`
+            # @xinhao: decoding from a prompt of length 1 will always have `mini_batch_size=remainder=1`
             B_mul_NH, N, HF = inputs['XV'].shape  # [B*nh,N=1,f]
 
-            if is_last_in_chunk:
-                XQW_batch = self.decode_end_chunk(
+            if is_last_in_mini_batch:
+                XQW_batch = self.decode_last_token_in_mini_batch(
                     states,  # [B*nh,f,f]
                     inputs,  # [B*nh,f]
                     self.ln_weight,  # [nh,1,f]
                     self.ln_bias,  # [nh,1,f]
                 )  # ret: [B*nh,N=1,f]
             else:
-                XQW_batch = self.decode(
+                XQW_batch = self.decode_token(
                     states,  # [B*nh,f,f]
                     inputs,  # [B*nh,f]
                     self.ln_weight,  # [nh,1,f]
@@ -995,7 +946,7 @@ class TTTM2BMMModule(TTTBaseModule):
 
 ##########################################
 
-class TTTM1BMMTKModule(TTTBaseModule):
+class TTTLinearFast(TTTBase):
 
     def __init__(self, config: TTTConfig, layer_idx: Optional[int] = None):
         super().__init__(config, layer_idx)
@@ -1006,7 +957,7 @@ class TTTM1BMMTKModule(TTTBaseModule):
         self,
         inputs,
         is_prefill=False,
-        is_last_in_chunk=False,
+        is_last_in_mini_batch=False,
         cache_params=None
     ):
 
@@ -1018,7 +969,7 @@ class TTTM1BMMTKModule(TTTBaseModule):
             W1_init = cache_params.params_dict["W1_states"][self.layer_idx].reshape(B, NH, HF, HF)
             b1_init = cache_params.params_dict["b1_states"][self.layer_idx].reshape(B, NH, 1, HF)
 
-            CS = self.inner_chunk_size
+            CS = self.mini_batch_size
             NC = N // CS
             token_idx = inputs.pop('token_idx')
             inputs = tree_map(lambda x: x.reshape(B, NH, NC, CS, -1).contiguous(), inputs)  # [B*nh,N,f/1] -> [B,nh,nc,cs,f/1]
@@ -1058,7 +1009,7 @@ class TTTM1BMMTKModule(TTTBaseModule):
 
             token_idx = inputs.pop('token_idx')  # [1,1,1]
 
-            # @xinhao: decoding from a prompt of length 1 will always have `inner_chunk_size=remainder=1`
+            # @xinhao: decoding from a prompt of length 1 will always have `mini_batch_size=remainder=1`
             inputs = tree_map(lambda x: x.reshape(B, NH, N, -1), inputs)  # [B*nh,N=1,f], [B*nh,N=1,1] -> [BS,nh,N=1,f/1]
             XV, XK, XQ, ilr_gated = inputs['XV'], inputs['XK'], inputs['XQ'], inputs['ilr_gated']  # [B,nh,N=1,f/1]
 
@@ -1066,28 +1017,32 @@ class TTTM1BMMTKModule(TTTBaseModule):
             grid = (B, NH, 1)
             CS = 1
 
-            if is_last_in_chunk:
-                _m1_decode_end_chunk_kernel[grid](W1, W1_grad, b1, b1_grad,
-                                                  XV, XK, XQ,
-                                                  self.ln_weight.data, self.ln_bias.data,
-                                                  ilr_gated, token_idx, output,
-                                                  W1.stride(0), W1.stride(1), W1.stride(2),
-                                                  b1.stride(0), b1.stride(1), b1.stride(2),
-                                                  XV.stride(0), XV.stride(1), XV.stride(2),
-                                                  self.ln_weight.data.stride(1), self.ln_weight.data.stride(2),
-                                                  ilr_gated.stride(0), ilr_gated.stride(1),
-                                                  CS, HF)
+            if is_last_in_mini_batch:
+                triton_ttt_linear_decode._decode_last_token_in_mini_batch_ker[grid](
+                    W1, W1_grad, b1, b1_grad,
+                    XV, XK, XQ,
+                    self.ln_weight.data, self.ln_bias.data,
+                    ilr_gated, token_idx, output,
+                    W1.stride(0), W1.stride(1), W1.stride(2),
+                    b1.stride(0), b1.stride(1), b1.stride(2),
+                    XV.stride(0), XV.stride(1), XV.stride(2),
+                    self.ln_weight.data.stride(1), self.ln_weight.data.stride(2),
+                    ilr_gated.stride(0), ilr_gated.stride(1),
+                    CS, HF
+                )
             else:
-                _m1_decode_kernel[grid](W1, W1_grad, b1, b1_grad,
-                                        XV, XK, XQ,
-                                        self.ln_weight.data, self.ln_bias.data,
-                                        ilr_gated, token_idx, output,
-                                        W1.stride(0), W1.stride(1), W1.stride(2),
-                                        b1.stride(0), b1.stride(1), b1.stride(2),
-                                        XV.stride(0), XV.stride(1), XV.stride(2),
-                                        self.ln_weight.data.stride(1), self.ln_weight.data.stride(2),
-                                        ilr_gated.stride(0), ilr_gated.stride(1),
-                                        CS, HF)
+                triton_ttt_linear_decode._decode_token_ker[grid](
+                    W1, W1_grad, b1, b1_grad,
+                    XV, XK, XQ,
+                    self.ln_weight.data, self.ln_bias.data,
+                    ilr_gated, token_idx, output,
+                    W1.stride(0), W1.stride(1), W1.stride(2),
+                    b1.stride(0), b1.stride(1), b1.stride(2),
+                    XV.stride(0), XV.stride(1), XV.stride(2),
+                    self.ln_weight.data.stride(1), self.ln_weight.data.stride(2),
+                    ilr_gated.stride(0), ilr_gated.stride(1),
+                    CS, HF
+                )
 
             output = output.reshape(B_mul_NH, N, HF)
 
@@ -1098,7 +1053,7 @@ class TTTM1BMMTKModule(TTTBaseModule):
 
 ####### M2 Triton Decode Module #######
 
-class TTTM2BMMTKModule(TTTBaseModule):
+class TTTMLPFast(TTTBase):
 
     def __init__(self, config: TTTConfig, layer_idx: Optional[int] = None):
         super().__init__(config, layer_idx)
@@ -1111,7 +1066,7 @@ class TTTM2BMMTKModule(TTTBaseModule):
         self,
         inputs,
         is_prefill=False,
-        is_last_in_chunk=False,
+        is_last_in_mini_batch=False,
         cache_params=None
     ):
 
@@ -1127,7 +1082,7 @@ class TTTM2BMMTKModule(TTTBaseModule):
             W2_init = cache_params.params_dict["W2_states"][self.layer_idx].reshape(B, NH, HF_prime, HF)
             b2_init = cache_params.params_dict["b2_states"][self.layer_idx].reshape(B, NH, 1, HF)
 
-            CS = self.inner_chunk_size
+            CS = self.mini_batch_size
             NC = N // CS
             token_idx = inputs.pop('token_idx')
             inputs = tree_map(lambda x: x.reshape(B, NH, NC, CS, -1).contiguous(), inputs)  # [B*nh,N,f/1] -> [B,nh,nc,cs,f/1]
@@ -1180,7 +1135,7 @@ class TTTM2BMMTKModule(TTTBaseModule):
 
             token_idx = inputs.pop('token_idx')  # [1,1,1]
 
-            # @xinhao: decoding from a prompt of length 1 will always have `inner_chunk_size=remainder=1`
+            # @xinhao: decoding from a prompt of length 1 will always have `mini_batch_size=remainder=1`
             inputs = tree_map(lambda x: x.reshape(B, NH, N, -1), inputs)  # [B*nh,N=1,f], [B*nh,N=1,1] -> [BS,nh,N=1,f/1]
             XV, XK, XQ, ilr_gated = inputs['XV'], inputs['XK'], inputs['XQ'], inputs['ilr_gated']  # [B,nh,N=1,f/1]
 
@@ -1188,34 +1143,38 @@ class TTTM2BMMTKModule(TTTBaseModule):
             grid = (B, NH, 1)
             CS = 1
 
-            if is_last_in_chunk:
-                _m2_decode_end_chunk_kernel[grid](W1, W1_grad, b1, b1_grad,
-                                                  W2, W2_grad, b2, b2_grad,
-                                                  XV, XK, XQ,
-                                                  self.ln_weight.data, self.ln_bias.data,
-                                                  ilr_gated, token_idx, output,
-                                                  W1.stride(0), W1.stride(1), W1.stride(2),
-                                                  b1.stride(0), b1.stride(1), b1.stride(2),
-                                                  W2.stride(0), W2.stride(1), W2.stride(2),
-                                                  b2.stride(0), b2.stride(1), b2.stride(2),
-                                                  XV.stride(0), XV.stride(1), XV.stride(2),
-                                                  self.ln_weight.data.stride(1), self.ln_weight.data.stride(2),
-                                                  ilr_gated.stride(0), ilr_gated.stride(1),
-                                                  CS, HF, HF_prime)
+            if is_last_in_mini_batch:
+                triton_ttt_mlp_decode._decode_last_token_in_mini_batch_ker[grid](
+                    W1, W1_grad, b1, b1_grad,
+                    W2, W2_grad, b2, b2_grad,
+                    XV, XK, XQ,
+                    self.ln_weight.data, self.ln_bias.data,
+                    ilr_gated, token_idx, output,
+                    W1.stride(0), W1.stride(1), W1.stride(2),
+                    b1.stride(0), b1.stride(1), b1.stride(2),
+                    W2.stride(0), W2.stride(1), W2.stride(2),
+                    b2.stride(0), b2.stride(1), b2.stride(2),
+                    XV.stride(0), XV.stride(1), XV.stride(2),
+                    self.ln_weight.data.stride(1), self.ln_weight.data.stride(2),
+                    ilr_gated.stride(0), ilr_gated.stride(1),
+                    CS, HF, HF_prime
+                )
             else:
-                _m2_decode_kernel[grid](W1, W1_grad, b1, b1_grad,
-                                        W2, W2_grad, b2, b2_grad,
-                                        XV, XK, XQ,
-                                        self.ln_weight.data, self.ln_bias.data,
-                                        ilr_gated, token_idx, output,
-                                        W1.stride(0), W1.stride(1), W1.stride(2),
-                                        b1.stride(0), b1.stride(1), b1.stride(2),
-                                        W2.stride(0), W2.stride(1), W2.stride(2),
-                                        b2.stride(0), b2.stride(1), b2.stride(2),
-                                        XV.stride(0), XV.stride(1), XV.stride(2),
-                                        self.ln_weight.data.stride(1), self.ln_weight.data.stride(2),
-                                        ilr_gated.stride(0), ilr_gated.stride(1),
-                                        CS, HF, HF_prime)
+                triton_ttt_mlp_decode._decode_token_ker[grid](
+                    W1, W1_grad, b1, b1_grad,
+                    W2, W2_grad, b2, b2_grad,
+                    XV, XK, XQ,
+                    self.ln_weight.data, self.ln_bias.data,
+                    ilr_gated, token_idx, output,
+                    W1.stride(0), W1.stride(1), W1.stride(2),
+                    b1.stride(0), b1.stride(1), b1.stride(2),
+                    W2.stride(0), W2.stride(1), W2.stride(2),
+                    b2.stride(0), b2.stride(1), b2.stride(2),
+                    XV.stride(0), XV.stride(1), XV.stride(2),
+                    self.ln_weight.data.stride(1), self.ln_weight.data.stride(2),
+                    ilr_gated.stride(0), ilr_gated.stride(1),
+                    CS, HF, HF_prime
+                )
 
             output = output.reshape(B_mul_NH, N, HF)
 
@@ -1239,20 +1198,20 @@ class TTTDecoderLayer(nn.Module):
         self.conv_before_ttt = config.conv_before_ttt
         if self.conv_before_ttt:
             self.conv_layernorm = RMSNorm(hidden_size=self.hidden_size, eps=config.rms_norm_eps)
-            self.conv = TTTConv(layer_idx, config)
+            self.conv = ConvModule(layer_idx, config)
 
-        if config.inner_net == 'mlp_1_dual':
-            self.self_attn = TTTM1BMMModule(config=config, layer_idx=layer_idx)
-        elif config.inner_net == 'mlp_1_dual_tk':
-            self.self_attn = TTTM1BMMTKModule(config=config, layer_idx=layer_idx)
-        elif config.inner_net == 'mlp_2_dual':
-            self.self_attn = TTTM2BMMModule(config=config, layer_idx=layer_idx)
-        elif config.inner_net == 'mlp_2_dual_tk':
-            self.self_attn = TTTM2BMMTKModule(config=config, layer_idx=layer_idx)
+        if config.inner_net == 'ttt_linear':
+            self.self_attn = TTTLinear(config=config, layer_idx=layer_idx)
+        elif config.inner_net == 'ttt_linear_fast':
+            self.self_attn = TTTLinearFast(config=config, layer_idx=layer_idx)
+        elif config.inner_net == 'ttt_mlp':
+            self.self_attn = TTTMLP(config=config, layer_idx=layer_idx)
+        elif config.inner_net == 'ttt_mlp_fast':
+            self.self_attn = TTTMLPFast(config=config, layer_idx=layer_idx)
         else:
             raise NotImplementedError(f"Inner {config.inner_net} Not Implemented!")
 
-        self.mlp = TTTMLP(config)
+        self.mlp = SwiGLUMLP(config)
 
         if config.use_compile:
             self.mlp_forward = torch.compile(self._mlp_forward)
@@ -1271,7 +1230,7 @@ class TTTDecoderLayer(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         cache_params: Optional[TTTCache] = None,
         is_prefill: Optional[bool] = None,
-        is_last_in_chunk: Optional[bool] = None,
+        is_last_in_mini_batch: Optional[bool] = None,
     ):
         if self.conv_before_ttt:
             if not self.fused_add_norm:
@@ -1319,7 +1278,7 @@ class TTTDecoderLayer(nn.Module):
             position_ids=position_ids,
             cache_params=cache_params,
             is_prefill=is_prefill,
-            is_last_in_chunk=is_last_in_chunk,
+            is_last_in_mini_batch=is_last_in_mini_batch,
         )
 
         if not self.fused_add_norm:
@@ -1356,25 +1315,7 @@ class TTTCausalLMOutput:
     cache_params: Optional[TTTCache] = None
 
 
-class TTTPreTrainedModel(nn.Module, GenerationMixin):
-    config_class = TTTConfig
-    base_model_prefix = "model"
-    supports_gradient_checkpointing = True
-    _no_split_modules = ["TTTDecoderLayer"]
-
-    def _init_weights(self, module):
-        std = self.config.initializer_range
-        if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
-
-
-class TTTModel(TTTPreTrainedModel):
+class TTTModel(nn.Module, GenerationMixin):
 
     def __init__(self, config: TTTConfig):
         super().__init__()
@@ -1382,7 +1323,7 @@ class TTTModel(TTTPreTrainedModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
-        self.inner_net_chunk_size = config.inner_net_chunk_size
+        self.mini_batch_size = config.mini_batch_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
@@ -1404,7 +1345,7 @@ class TTTModel(TTTPreTrainedModel):
         return_dict: Optional[bool] = None,
         use_cache: Optional[bool] = None,
         is_prefill: Optional[bool] = None,
-        is_last_in_chunk: Optional[bool] = None,
+        is_last_in_mini_batch: Optional[bool] = None,
     ) -> Union[Tuple, TTTOutput]:
 
         if inputs_embeds is None:
@@ -1428,7 +1369,7 @@ class TTTModel(TTTPreTrainedModel):
                 position_ids=position_ids,
                 cache_params=cache_params,
                 is_prefill=is_prefill,
-                is_last_in_chunk=is_last_in_chunk,
+                is_last_in_mini_batch=is_last_in_mini_batch,
             )
 
         if not self.fused_add_norm:
@@ -1453,8 +1394,7 @@ class TTTModel(TTTPreTrainedModel):
         )
 
 
-class TTTForCausalLM(TTTPreTrainedModel):
-    # _tied_weights_keys = ["lm_head.weight"]
+class TTTForCausalLM(nn.Module, GenerationMixin):
 
     def __init__(self, config):
         super().__init__()
@@ -1480,7 +1420,7 @@ class TTTForCausalLM(TTTPreTrainedModel):
         return_dict: Optional[bool] = None,
         use_cache: Optional[bool] = None,
         is_prefill: Optional[bool] = None,
-        is_last_in_chunk: Optional[bool] = None,
+        is_last_in_mini_batch: Optional[bool] = None,
         *,
         output_attentions: Optional[bool] = None,
     ) -> Union[Tuple, TTTCausalLMOutput]:
@@ -1495,7 +1435,7 @@ class TTTForCausalLM(TTTPreTrainedModel):
             return_dict=return_dict,
             use_cache=use_cache,
             is_prefill=is_prefill,
-            is_last_in_chunk=is_last_in_chunk,
+            is_last_in_mini_batch=is_last_in_mini_batch,
         )
 
         hidden_states = outputs.last_hidden_state[:,-1:,:]  # [BS,N,F] -> [BS,1,F]: only need to classify the last token

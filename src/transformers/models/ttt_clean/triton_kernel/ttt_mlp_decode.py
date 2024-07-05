@@ -24,19 +24,21 @@ from transformers.models.ttt_clean.triton_kernel.activations import gelu_tl, dif
                    '__W2', '__b2', '__W2_grad', '__b2_grad']
 )
 @triton.jit
-def _m2_decode_kernel(__W1, __W1_grad, __b1, __b1_grad,
-                      __W2, __W2_grad, __b2, __b2_grad,
-                      __XV, __XK, __XQ,
-                      __ln_weight, __ln_bias,
-                      __ilr_gated, __token_idx, __Out,
-                      stride_w1_batch, stride_w1_head, stride_w1_fin,
-                      stride_b1_batch, stride_b1_head, stride_b1_f,
-                      stride_w2_batch, stride_w2_head, stride_w2_fin,
-                      stride_b2_batch, stride_b2_head, stride_b2_f,
-                      stride_x_batch, stride_x_head, stride_x_n,
-                      stride_ln_head, stride_ln_f,
-                      stride_ilr_batch, stride_ilr_head,
-                      CS: tl.constexpr, HF: tl.constexpr, HF_prime: tl.constexpr):
+def _decode_token_ker(
+    __W1, __W1_grad, __b1, __b1_grad,
+    __W2, __W2_grad, __b2, __b2_grad,
+    __XV, __XK, __XQ,
+    __ln_weight, __ln_bias,
+    __ilr_gated, __token_idx, __Out,
+    stride_w1_batch, stride_w1_head, stride_w1_fin,
+    stride_b1_batch, stride_b1_head, stride_b1_f,
+    stride_w2_batch, stride_w2_head, stride_w2_fin,
+    stride_b2_batch, stride_b2_head, stride_b2_f,
+    stride_x_batch, stride_x_head, stride_x_n,
+    stride_ln_head, stride_ln_f,
+    stride_ilr_batch, stride_ilr_head,
+    CS: tl.constexpr, HF: tl.constexpr, HF_prime: tl.constexpr
+):
     batch = tl.program_id(0)
     head = tl.program_id(1)
 
@@ -178,19 +180,21 @@ def _m2_decode_kernel(__W1, __W1_grad, __b1, __b1_grad,
                    '__W2', '__b2', '__W2_grad', '__b2_grad']
 )
 @triton.jit
-def _m2_decode_end_chunk_kernel(__W1, __W1_grad, __b1, __b1_grad,
-                                __W2, __W2_grad, __b2, __b2_grad,
-                                __XV, __XK, __XQ,
-                                __ln_weight, __ln_bias,
-                                __ilr_gated, __token_idx, __Out,
-                                stride_w1_batch, stride_w1_head, stride_w1_fin,
-                                stride_b1_batch, stride_b1_head, stride_b1_f,
-                                stride_w2_batch, stride_w2_head, stride_w2_fin,
-                                stride_b2_batch, stride_b2_head, stride_b2_f,
-                                stride_x_batch, stride_x_head, stride_x_n,
-                                stride_ln_head, stride_ln_f,
-                                stride_ilr_batch, stride_ilr_head,
-                                CS: tl.constexpr, HF: tl.constexpr, HF_prime: tl.constexpr):
+def _decode_last_token_in_mini_batch_ker(
+    __W1, __W1_grad, __b1, __b1_grad,
+    __W2, __W2_grad, __b2, __b2_grad,
+    __XV, __XK, __XQ,
+    __ln_weight, __ln_bias,
+    __ilr_gated, __token_idx, __Out,
+    stride_w1_batch, stride_w1_head, stride_w1_fin,
+    stride_b1_batch, stride_b1_head, stride_b1_f,
+    stride_w2_batch, stride_w2_head, stride_w2_fin,
+    stride_b2_batch, stride_b2_head, stride_b2_f,
+    stride_x_batch, stride_x_head, stride_x_n,
+    stride_ln_head, stride_ln_f,
+    stride_ilr_batch, stride_ilr_head,
+    CS: tl.constexpr, HF: tl.constexpr, HF_prime: tl.constexpr
+):
     batch = tl.program_id(0)
     head = tl.program_id(1)
 

@@ -156,7 +156,7 @@ class TTTConfig(PretrainedConfig):
         share_qk=False,
         inner_net_type='m1',
         inner_net_lr=1.0,
-        inner_net_chunk_size=16,
+        mini_batch_size=16,
         use_vjp=True,
         use_post_ln=False,
         inner_net_on_residual=False,
@@ -186,7 +186,7 @@ class TTTConfig(PretrainedConfig):
         self.share_qk = share_qk
         self.inner_net_type = inner_net_type
         self.inner_net_lr = inner_net_lr
-        self.inner_net_chunk_size = inner_net_chunk_size
+        self.mini_batch_size = mini_batch_size
 
         self.use_vjp = use_vjp
         self.use_post_ln = use_post_ln

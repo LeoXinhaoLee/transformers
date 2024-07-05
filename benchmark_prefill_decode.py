@@ -50,8 +50,8 @@ parser.add_argument("--promptlen", type=int, default=1)
 parser.add_argument("--genlen", type=int, default=128)
 parser.add_argument("--batch", type=int, default=1)
 parser.add_argument("--attn_impl", type=str, default='flash_attention_2', choices=['eager', 'flash_attention_2'])
-parser.add_argument("--inner_net", type=str, default='mlp_2_dual', choices=['mlp_1_dual', 'mlp_2_dual',
-                                                                            'mlp_1_dual_tk', 'mlp_2_dual_tk'])
+parser.add_argument("--inner_net", type=str, default='mlp_2_dual', choices=['ttt_linear', 'ttt_mlp',
+                                                                            'ttt_linear_fast', 'ttt_mlp_fast'])
 parser.add_argument("--use_compile", action='store_true')
 parser.add_argument("--no_cg", action='store_true')    # @xinhao: currently only implemented for Mamba and TTT
 parser.add_argument("--profile", action='store_true')  # @xinhao: pytorch profiler, different from nsys in micro-benchmark

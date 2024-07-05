@@ -157,7 +157,7 @@ def decode(
         if not hasattr(model, "_decoding_cache"):
             model._decoding_cache = None
 
-        ## Capture is_last_in_chunk = False
+        ## Capture is_last_in_mini_batch = False
         model._decoding_cache = update_graph_cache(
             model,
             model._decoding_cache,
@@ -166,14 +166,14 @@ def decode(
             max_length,
             tensor_parallel=tensor_parallel,
             is_prefill=False,
-            is_last_in_chunk=False,
+            is_last_in_mini_batch=False,
         )
 
         inference_params = model._decoding_cache.inference_params
 
         inference_params.reset(max_length, batch_size, model, i)  # TODO: must reset keep the shape of inference_params?
 
-        ## Capture is_last_in_chunk = True
+        ## Capture is_last_in_mini_batch = True
         model._decoding_cache = update_graph_cache(
             model,
             model._decoding_cache,
@@ -182,7 +182,7 @@ def decode(
             max_length,
             tensor_parallel=tensor_parallel,
             is_prefill=False,
-            is_last_in_chunk=True,
+            is_last_in_mini_batch=True,
         )
         inference_params = model._decoding_cache.inference_params
         inference_params.reset(max_length, batch_size, model)  # TODO: must reset keep the shape of inference_params?
@@ -199,31 +199,31 @@ def decode(
         if not cg or not decoding:
             if not decoding:
                 ## prefilling never uses cg
-                is_last_in_chunk = True  # TODO: assume prompt is always a multiple of CS
+                is_last_in_mini_batch = True  # TODO: assume prompt is always a multiple of CS
                 is_prefill = True
                 logits = model(
                     input_ids,
                     is_prefill=is_prefill,
-                    is_last_in_chunk=is_last_in_chunk,
+                    is_last_in_mini_batch=is_last_in_mini_batch,
                     cache_params=inference_params,
                 ).logits   # .logits[:, -1, :]  # [BS,prompt_len,vocab] -> [BS,1,vocab] -> [BS,vocab]
             else:
                 ## decoding, but doesn't use cg (should only be used for profiling)
-                is_last_in_chunk = ((inference_params.seqlen_offset + 1) % inference_params.inner_chunk_size == 0)
+                is_last_in_mini_batch = ((inference_params.seqlen_offset + 1) % inference_params.inner_chunk_size == 0)
                 is_prefill = False
                 logits = model(
                     input_ids,
                     is_prefill=is_prefill,
-                    is_last_in_chunk=is_last_in_chunk,
+                    is_last_in_mini_batch=is_last_in_mini_batch,
                     cache_params=inference_params,
                 ).logits.squeeze(dim=1)  # [BS,1,vocab] -> [BS,vocab]
         else:
             ## cg and decoding
             # after prompt: continue generating
             is_prefill = False
-            is_last_in_chunk = ((inference_params.seqlen_offset + 1) % inference_params.inner_chunk_size == 0)
+            is_last_in_mini_batch = ((inference_params.seqlen_offset + 1) % inference_params.inner_chunk_size == 0)
             logits = model._decoding_cache.run(
-                input_ids, is_prefill, is_last_in_chunk
+                input_ids, is_prefill, is_last_in_mini_batch
             ).squeeze(dim=1)  # [BS,decode_len,vocab_size]
 
         return logits[..., :vocab_size] if vocab_size is not None else logits
@@ -331,7 +331,7 @@ def update_graph_cache(
     dtype=None,
     n_warmups=2,
     is_prefill=False,
-    is_last_in_chunk=False,
+    is_last_in_mini_batch=False,
 ):
     if cache is None:
         cache = DecodingCGCache()
@@ -364,10 +364,10 @@ def update_graph_cache(
     ###
     for decoding_seqlen in decoding_seqlens:
 
-        if (batch_size, decoding_seqlen, is_prefill, is_last_in_chunk) not in cache.callables:
+        if (batch_size, decoding_seqlen, is_prefill, is_last_in_mini_batch) not in cache.callables:
 
             # key: (batch_size, decoding_seqlen)=(bs, 1), val: a function returned by capture_graph
-            cache.callables[batch_size, decoding_seqlen, is_prefill, is_last_in_chunk] = capture_graph(
+            cache.callables[batch_size, decoding_seqlen, is_prefill, is_last_in_mini_batch] = capture_graph(
                 model,
                 cache.inference_params,
                 batch_size,
@@ -376,12 +376,12 @@ def update_graph_cache(
                 mempool=cache.mempool,
                 n_warmups=n_warmups,
                 is_prefill=is_prefill,
-                is_last_in_chunk=is_last_in_chunk,
+                is_last_in_mini_batch=is_last_in_mini_batch,
             )
 
-    def dispatch(input_ids, is_prefill, is_last_in_chunk):
+    def dispatch(input_ids, is_prefill, is_last_in_mini_batch):
         batch_size, decoding_seqlen = input_ids.shape[:2]
-        return cache.callables[batch_size, decoding_seqlen, is_prefill, is_last_in_chunk](input_ids)
+        return cache.callables[batch_size, decoding_seqlen, is_prefill, is_last_in_mini_batch](input_ids)
 
     cache.run = dispatch
     cache.inference_params.seqlen_offset = 0  # Reset so it's not confusing
@@ -395,7 +395,7 @@ def capture_graph(
         mempool=None,
         n_warmups=2,
         is_prefill=False,
-        is_last_in_chunk=False
+        is_last_in_mini_batch=False
 ):
     device = next(iter(model.parameters())).device
     input_ids = torch.full((batch_size, decoding_seqlen), 0, dtype=torch.long, device=device)
@@ -414,7 +414,7 @@ def capture_graph(
                 input_ids,
                 cache_params=inference_params,
                 is_prefill=is_prefill,
-                is_last_in_chunk=is_last_in_chunk,
+                is_last_in_mini_batch=is_last_in_mini_batch,
             ).logits
         s.synchronize()
         # This might be needed for correctness if we run with NCCL_GRAPH_MIXING_SUPPORT=0,
@@ -433,7 +433,7 @@ def capture_graph(
             input_ids,
             cache_params=inference_params,
             is_prefill=is_prefill,
-            is_last_in_chunk=is_last_in_chunk,
+            is_last_in_mini_batch=is_last_in_mini_batch,
         ).logits
 
     def run(new_input_ids):

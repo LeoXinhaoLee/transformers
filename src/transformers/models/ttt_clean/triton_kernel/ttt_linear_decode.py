@@ -20,16 +20,18 @@ import triton.language as tl
     restore_value=['__W1', '__b1', '__W1_grad', '__b1_grad']
 )
 @triton.jit
-def _m1_decode_kernel(__W1, __W1_grad, __b1, __b1_grad,
-                      __XV, __XK, __XQ,
-                      __ln_weight, __ln_bias,
-                      __ilr_gated, __token_idx, __Out,
-                      stride_w_batch, stride_w_head, stride_w_fin,
-                      stride_b_batch, stride_b_head, stride_b_f,
-                      stride_x_batch, stride_x_head, stride_x_n,
-                      stride_ln_head, stride_ln_f,
-                      stride_ilr_batch, stride_ilr_head,
-                      CS: tl.constexpr, HF: tl.constexpr):
+def _decode_token_ker(
+    __W1, __W1_grad, __b1, __b1_grad,
+    __XV, __XK, __XQ,
+    __ln_weight, __ln_bias,
+    __ilr_gated, __token_idx, __Out,
+    stride_w_batch, stride_w_head, stride_w_fin,
+    stride_b_batch, stride_b_head, stride_b_f,
+    stride_x_batch, stride_x_head, stride_x_n,
+    stride_ln_head, stride_ln_f,
+    stride_ilr_batch, stride_ilr_head,
+    CS: tl.constexpr, HF: tl.constexpr
+):
     batch = tl.program_id(0)
     head = tl.program_id(1)
 
@@ -145,16 +147,18 @@ def _m1_decode_kernel(__W1, __W1_grad, __b1, __b1_grad,
     restore_value=['__W1', '__b1', '__W1_grad', '__b1_grad']
 )
 @triton.jit
-def _m1_decode_end_chunk_kernel(__W1, __W1_grad, __b1, __b1_grad,
-                                __XV, __XK, __XQ,
-                                __ln_weight, __ln_bias,
-                                __ilr_gated, __token_idx, __Out,
-                                stride_w_batch, stride_w_head, stride_w_fin,
-                                stride_b_batch, stride_b_head, stride_b_f,
-                                stride_x_batch, stride_x_head, stride_x_n,
-                                stride_ln_head, stride_ln_f,
-                                stride_ilr_batch, stride_ilr_head,
-                                CS: tl.constexpr, HF: tl.constexpr):
+def _decode_last_token_in_mini_batch_ker(
+    __W1, __W1_grad, __b1, __b1_grad,
+    __XV, __XK, __XQ,
+    __ln_weight, __ln_bias,
+    __ilr_gated, __token_idx, __Out,
+    stride_w_batch, stride_w_head, stride_w_fin,
+    stride_b_batch, stride_b_head, stride_b_f,
+    stride_x_batch, stride_x_head, stride_x_n,
+    stride_ln_head, stride_ln_f,
+    stride_ilr_batch, stride_ilr_head,
+    CS: tl.constexpr, HF: tl.constexpr
+):
     batch = tl.program_id(0)
     head = tl.program_id(1)
 
