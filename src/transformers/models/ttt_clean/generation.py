@@ -25,7 +25,7 @@ class TTTCache:
         self.seqlen_offset = 0
         self.dtype = model.config.dtype
         self.inner_net = model.config.inner_net
-        self.inner_chunk_size = model.config.inner_net_chunk_size
+        self.mini_batch_size = model.config.mini_batch_size
         self.params_dict = defaultdict(dict)
         if 'mlp_1' in self.inner_net:
             self.param_names = ["W1", "b1"]
@@ -209,7 +209,7 @@ def decode(
                 ).logits[:, -1, :]  # [BS,prompt_len,vocab] -> [BS,1,vocab] -> [BS,vocab]
             else:
                 ## decoding, but doesn't use cg (should only be used for profiling)
-                is_last_in_mini_batch = ((inference_params.seqlen_offset + 1) % inference_params.inner_chunk_size == 0)
+                is_last_in_mini_batch = ((inference_params.seqlen_offset + 1) % inference_params.mini_batch_size == 0)
                 # is_last_in_mini_batch = False
                 is_prefill = False
                 logits = model(
@@ -222,7 +222,7 @@ def decode(
             ## cg and decoding
             # after prompt: continue generating
             is_prefill = False
-            is_last_in_mini_batch = ((inference_params.seqlen_offset + 1) % inference_params.inner_chunk_size == 0)
+            is_last_in_mini_batch = ((inference_params.seqlen_offset + 1) % inference_params.mini_batch_size == 0)
             # is_last_in_mini_batch = False
             logits = model._decoding_cache.run(
                 input_ids, is_prefill, is_last_in_mini_batch

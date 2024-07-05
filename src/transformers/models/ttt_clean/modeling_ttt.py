@@ -495,7 +495,7 @@ class TTTBase(nn.Module):
         B = B_mul_NH // self.num_heads
         inputs = {'XQ': XQ, 'XK': XK, 'XV': XV, 'token_idx': token_idx, 'ilr_gated': ilr_gated}
 
-        XQW_batch = self.process_inner_loop(
+        XQW_batch = self.TTT_process(
             inputs,
             cache_params=cache_params,
             is_prefill=is_prefill,
@@ -580,15 +580,6 @@ def ttt_linear_decode_last_token_in_mini_batch(states, inputs, ln_weight, ln_bia
     W1_grad.zero_()
     b1_grad.zero_()
 
-    # residual + postln
-    # mu_bar = Z1_bar.mean(dim=-1, keepdim=True)  # [B*nh,K=1,f] -> [B*nh,K=1,1]
-    # var_bar = Z1_bar.var(dim=-1, keepdim=True, unbiased=False)
-    # std_bar = torch.sqrt(var_bar + 1e-6)
-    # Z1_bar_hat = (Z1_bar - mu_bar) / std_bar  # [B*nh,K,f]
-    # LN_out_bar = ln_weight * Z1_bar_hat.reshape(-1, NH, K, HF) + ln_bias
-    # LN_out_bar = LN_out_bar.reshape(-1, K, HF)
-    # Z1_bar = XQ + LN_out_bar
-
     return Z1_bar
 
 def ttt_linear_decode_token(states, inputs, ln_weight, ln_bias):
@@ -642,15 +633,6 @@ def ttt_linear_decode_token(states, inputs, ln_weight, ln_bias):
     W1_bar = W1 - (token_idx * W1_grad)  # [B*nh,f,f] - [1,N=1,1] * [B*nh,f,f]
     b1_bar = b1 - (token_idx * b1_grad)  # [B*nh,1,f] - [1,N=1,1] * [B*nh,1,f]
     Z1_bar = XQ @ W1_bar + b1_bar  # [B*nh,K=1,f] @ [B*nh,f,f]
-
-    # residual + postln
-    # mu_bar = Z1_bar.mean(dim=-1, keepdim=True)  # [B*nh,K=1,f] -> [B*nh,K=1,1]
-    # var_bar = Z1_bar.var(dim=-1, keepdim=True, unbiased=False)
-    # std_bar = torch.sqrt(var_bar + 1e-6)
-    # Z1_bar_hat = (Z1_bar - mu_bar) / std_bar  # [B*nh,K,f]
-    # LN_out_bar = ln_weight * Z1_bar_hat.reshape(-1, NH, K, HF) + ln_bias
-    # LN_out_bar = LN_out_bar.reshape(-1, K, HF)
-    # Z1_bar = XQ + LN_out_bar
 
     return Z1_bar
 
@@ -876,7 +858,7 @@ class TTTMLP(TTTBase):
             self.decode_last_token_in_mini_batch = ttt_mlp_decode_last_token_in_mini_batch
             self.decode_token = ttt_mlp_decode_token
 
-    def process_inner_loop(
+    def TTT_process(
         self,
         inputs,
         is_prefill=False,
@@ -953,7 +935,7 @@ class TTTLinearFast(TTTBase):
         self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim, self.head_dim)))
         self.b1 = nn.Parameter(torch.ones(size=(self.num_heads, 1, self.head_dim)))
 
-    def process_inner_loop(
+    def TTT_process(
         self,
         inputs,
         is_prefill=False,
@@ -1062,7 +1044,7 @@ class TTTMLPFast(TTTBase):
         self.W2 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, 4 * self.head_dim, self.head_dim)))
         self.b2 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, 1, self.head_dim)))
 
-    def process_inner_loop(
+    def TTT_process(
         self,
         inputs,
         is_prefill=False,
