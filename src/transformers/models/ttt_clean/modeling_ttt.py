@@ -1,5 +1,6 @@
 """PyTorch TTT model."""
 import pdb
+
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, Union
 
@@ -8,8 +9,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from transformers.models.ttt_clean.configuration_ttt import TTTConfig
-# from transformers.models.ttt_clean.generation import GenerationMixin, TTTCache
-from transformers.models.ttt_clean.generation_logits import GenerationMixin, TTTCache
+from transformers.models.ttt_clean.generation import GenerationMixin, TTTCache
 
 from transformers.models.mamba_ssm.ops.triton.layernorm import RMSNorm, rms_norm_fn
 from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
@@ -52,18 +52,9 @@ def tree_map(fn, inputs):
 
 def tanh(x):
     return 2 * F.sigmoid(2 * x) - 1
-    # return 2 * (1.0 / (1. + torch.exp(-2. * x))) - 1
-    # return x
 
 def gelu(x):
-    # O_dtype = x.dtype
-    # x = x.float()  # fp32 for higher precision
-    # y = 0.5 * x * (1 + tanh(0.79788456 * (x + 0.044715 * x * x * x)))
-    # y = y.to(O_dtype)
-    # return y
     return 0.5 * x * (1 + tanh(0.79788456 * (x + 0.044715 * x * x * x)))
-    # return 0.5 * x * (1 + tanh(0.798 * (x + 0.04471 * x * x * x)))
-    # return (0.5 * x) * (1.0 + x)
 
 def diff_gelu(x):
     tanh_out = torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x))
@@ -808,23 +799,17 @@ def m2_prefill_chunk(states, inputs, i, ln_weight, ln_bias, Attn_b):
                                     inputs['coeff'][i], inputs['coeff_last'][i]  # [B*nh,CS,CS], [B*nh,1,CS]
 
     Z1 = XK_chunk @ W1_init + b1_init  # [B*nh,K,f] @ [B*nh,f,4f] + [B*nh,1,4f] -> [B*nh,K,4f]
-    # X2 = F.gelu(Z1, approximate='tanh')
     X2 = gelu(Z1)
-    # X2 = Z1
     Z2 = X2 @ W2_init + b2_init
 
     l2_target = XV_chunk - XK_chunk
     dl_dZ2 = ln_fused_l2_bwd(Z2, l2_target, ln_weight, ln_bias)  # [B*nh,K=1,f]
-    # dl_dZ1 = dl_dZ2 @ W2_init.transpose(-1, -2) * diff_gelu(Z1)
-    dl_dZ1 = dl_dZ2 @ W2_init.transpose(-1, -2)
+    dl_dZ1 = dl_dZ2 @ W2_init.transpose(-1, -2) * diff_gelu(Z1)
 
     b1_bar = b1_init - (coeff_chunk * Attn_b) @ dl_dZ1  # [B*nh,1,4f] - ([B*nh,K,K] * [K,K]) @ [B*nh,K,4f]
     Attn1 = torch.tril(XQ_chunk @ XK_chunk.transpose(-1, -2))  # [B*nh,K,K]
     Z1_bar = XQ_chunk @ W1_init - (coeff_chunk * Attn1) @ dl_dZ1 + b1_bar  # [B*nh,K,f] @ [B*nh,f,4f] - ([K,K] * [B*nh,K,K]) @ [B*nh,K,4f] + [B*nh,K,4f]
-
-    # X2_bar = F.gelu(Z1_bar, approximate='tanh')
     X2_bar = gelu(Z1_bar)
-    # X2_bar = Z1_bar
 
     b2_bar = b2_init - (coeff_chunk * Attn_b) @ dl_dZ2  # [B*nh,1,4f] - ([B*nh,K,K] * [K,K]) @ [B*nh,K,4f]
     Attn2 = torch.tril(X2_bar @ X2.transpose(-1, -2))  # [B*nh,K,K]
@@ -852,7 +837,7 @@ def m2_decode_end_chunk(states, inputs, ln_weight, ln_bias):
                                      inputs['token_idx'], inputs['ilr_gated']  # [B*nh,N=1,f], [1,1,1], [B*nh,N=1,1]
 
     Z1 = XK_chunk @ W1_init + b1_init  # [B*nh,K=1,f] @ [B*nh,f,f] + [B*nh,1,f] -> [B*nh,K=1,f]
-    X2 = F.gelu(Z1, approximate='tanh')
+    X2 = gelu(Z1)
     Z2 = X2 @ W2_init + b2_init
 
     l2_target = XV_chunk - XK_chunk
@@ -866,8 +851,7 @@ def m2_decode_end_chunk(states, inputs, ln_weight, ln_bias):
     W1_init.sub_(token_idx * W1_grad)
     b1_init.sub_(token_idx * b1_grad)
     Z1_bar = XQ_chunk @ W1_init + b1_init  # [B*nh,K=1,f] @ ([B*nh,f,f] - [B*nh,1,1] * [B*nh,f,f])
-
-    X2_bar = F.gelu(Z1_bar, approximate='tanh')
+    X2_bar = gelu(Z1_bar)
 
     W2_grad.add_(X2.transpose(-1, -2) @ ilr_mul_dl_dZ2)  # [B*nh,K,4f].t @ [B*nh,K,f]
     b2_grad.add_(ilr_mul_dl_dZ2)
@@ -897,7 +881,7 @@ def m2_decode(states, inputs, ln_weight, ln_bias):
                                      inputs['token_idx'], inputs['ilr_gated']  # [B*nh,N=1,f], [1,1,1], [B*nh,N=1,1]
 
     Z1 = XK_chunk @ W1_init + b1_init  # [B*nh,K=1,f] @ [B*nh,f,f] + [B*nh,1,f] -> [B*nh,K=1,f]
-    X2 = F.gelu(Z1, approximate='tanh')
+    X2 = gelu(Z1)
     Z2 = X2 @ W2_init + b2_init
 
     l2_target = XV_chunk - XK_chunk
@@ -911,8 +895,7 @@ def m2_decode(states, inputs, ln_weight, ln_bias):
     W1_last = W1_init - token_idx * W1_grad
     b1_last = b1_init - token_idx * b1_grad
     Z1_bar = XQ_chunk @ W1_last + b1_last  # [B*nh,K=1,f] @ ([B*nh,f,f] - [B*nh,1,1] * [B*nh,f,f])
-
-    X2_bar = F.gelu(Z1_bar, approximate='tanh')
+    X2_bar = gelu(Z1_bar)
 
     W2_grad.add_(X2.transpose(-1, -2) @ ilr_mul_dl_dZ2)  # [B*nh,K,4f].t @ [B*nh,K,f]
     b2_grad.add_(ilr_mul_dl_dZ2)
@@ -1147,7 +1130,6 @@ class TTTM2BMMTKModule(TTTBaseModule):
             CS = self.inner_chunk_size
             NC = N // CS
             token_idx = inputs.pop('token_idx')
-            # XQ_residual = inputs['XQ']
             inputs = tree_map(lambda x: x.reshape(B, NH, NC, CS, -1).contiguous(), inputs)  # [B*nh,N,f/1] -> [B,nh,nc,cs,f/1]
             ilr_gated = inputs.pop('ilr_gated').transpose(-1, -2)  # [B,nh,nc,1,cs]
             inputs['coeff'] = token_idx[None, :] * ilr_gated  # [1,1,1,cs,1] * [B,nh,nc,1,cs] -> [B,nh,nc,CS,CS]
@@ -1169,25 +1151,7 @@ class TTTM2BMMTKModule(TTTBaseModule):
             make_last_coeff_1_matrix[-1, :] = 1.
             make_last_coeff_2_matrix[-1, :] = 1.
 
-            # tk_m2_prefill.prefill_whole_loop_gelu_coeff_bias_LN_fp16(
-            #     W1_init, W2_init, b1_init, b2_init,
-            #     ln_weight, ln_bias,
-            #     cumsum_matrix,
-            #     make_last_b_matrix,
-            #     make_last_coeff_1_matrix, make_last_coeff_2_matrix,
-            #     XV, XK, XQ, coeff,
-            #     output
-            # )
-            # tk_m2_prefill.prefill_whole_loop_gelu_coeff_bias_LN_res_PLN_fp16(
-            #     W1_init, W2_init, b1_init, b2_init,
-            #     ln_weight, ln_bias,
-            #     cumsum_matrix,
-            #     make_last_b_matrix,
-            #     make_last_coeff_1_matrix, make_last_coeff_2_matrix,
-            #     XV, XK, XQ, coeff,
-            #     output
-            # )
-            tk_m2_prefill.prefill_whole_loop_coeff_bias_LN_res_PLN_fp16(
+            tk_m2_prefill.prefill_whole_loop_gelu_coeff_bias_LN_res_PLN_fp16(
                 W1_init, W2_init, b1_init, b2_init,
                 ln_weight, ln_bias,
                 cumsum_matrix,
@@ -1196,14 +1160,12 @@ class TTTM2BMMTKModule(TTTBaseModule):
                 XV, XK, XQ, coeff,
                 output
             )
+
             b1_init = b1_init[:, :, -1:, :].reshape(B_mul_NH, 1, -1)
             b2_init = b2_init[:, :, -1:, :].reshape(B_mul_NH, 1, -1)
             cache_params.params_dict["b1_states"][self.layer_idx].copy_(b1_init)
             cache_params.params_dict["b2_states"][self.layer_idx].copy_(b2_init)
-
             output = output.reshape(B_mul_NH, N, HF)
-
-            # output = self.residual_add_post_LN(XQ_residual, output)
 
         else:
             W1 = cache_params.params_dict["W1_states"][self.layer_idx].reshape(B, NH, HF, HF_prime)
@@ -1415,7 +1377,6 @@ class TTTPreTrainedModel(nn.Module, GenerationMixin):
 class TTTModel(TTTPreTrainedModel):
 
     def __init__(self, config: TTTConfig):
-        # super().__init__(config)
         super().__init__()
         self.config = config
         self.padding_idx = config.pad_token_id
@@ -1431,9 +1392,6 @@ class TTTModel(TTTPreTrainedModel):
         self.fused_add_norm = config.fused_add_norm
         self.residual_in_fp32 = config.residual_in_fp32
         self.norm_f = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-        # Initialize weights and apply final processing
-        # self.post_init()
 
     def forward(
         self,
@@ -1459,9 +1417,9 @@ class TTTModel(TTTPreTrainedModel):
             seqlen_offset, seqlen_offset+ inputs_embeds.shape[1], dtype=torch.long, device=inputs_embeds.device
         ).unsqueeze(0)
 
-        # embed positions
         hidden_states = inputs_embeds
         residual = None
+
         for decoder_layer in self.layers:
             hidden_states, residual = decoder_layer(
                 hidden_states,
@@ -1473,7 +1431,6 @@ class TTTModel(TTTPreTrainedModel):
                 is_last_in_chunk=is_last_in_chunk,
             )
 
-        # hidden_states = self.norm(hidden_states)
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states
             hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
@@ -1497,7 +1454,7 @@ class TTTModel(TTTPreTrainedModel):
 
 
 class TTTForCausalLM(TTTPreTrainedModel):
-    _tied_weights_keys = ["lm_head.weight"]
+    # _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config):
         super().__init__()
@@ -1505,7 +1462,8 @@ class TTTForCausalLM(TTTPreTrainedModel):
         self.model = TTTModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.tie_weights()
+        if self.config.tie_word_embeddings:
+            self.tie_weights()
 
     def tie_weights(self):
         self.lm_head.weight = self.model.embed_tokens.weight
@@ -1540,12 +1498,10 @@ class TTTForCausalLM(TTTPreTrainedModel):
             is_last_in_chunk=is_last_in_chunk,
         )
 
-        hidden_states = outputs.last_hidden_state  # TODO: for matching logits
-        # hidden_states = outputs.last_hidden_state[:,-1:,:]  # [BS,N,F] -> [BS,1,F] to avoid OOM when prefilling
+        hidden_states = outputs.last_hidden_state[:,-1:,:]  # [BS,N,F] -> [BS,1,F]: only need to classify the last token
         logits = self.lm_head(hidden_states)
 
         return TTTCausalLMOutput(
             logits=logits,
             cache_params=outputs.cache_params,
         )
-
