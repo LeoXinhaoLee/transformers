@@ -50,6 +50,21 @@ def tree_map(fn, inputs):
         out = fn(inputs)
     return out
 
+def tanh(x):
+    return 2 * F.sigmoid(2 * x) - 1
+    # return 2 * (1.0 / (1. + torch.exp(-2. * x))) - 1
+    # return x
+
+def gelu(x):
+    # O_dtype = x.dtype
+    # x = x.float()  # fp32 for higher precision
+    # y = 0.5 * x * (1 + tanh(0.79788456 * (x + 0.044715 * x * x * x)))
+    # y = y.to(O_dtype)
+    # return y
+    return 0.5 * x * (1 + tanh(0.79788456 * (x + 0.044715 * x * x * x)))
+    # return 0.5 * x * (1 + tanh(0.798 * (x + 0.04471 * x * x * x)))
+    # return (0.5 * x) * (1.0 + x)
+
 def diff_gelu(x):
     tanh_out = torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x))
     ff = 0.5 * x * ((1 - tanh_out * tanh_out) * (0.79788456 + 0.1070322243 * x * x)) + 0.5 * (1 + tanh_out)
@@ -793,18 +808,23 @@ def m2_prefill_chunk(states, inputs, i, ln_weight, ln_bias, Attn_b):
                                     inputs['coeff'][i], inputs['coeff_last'][i]  # [B*nh,CS,CS], [B*nh,1,CS]
 
     Z1 = XK_chunk @ W1_init + b1_init  # [B*nh,K,f] @ [B*nh,f,4f] + [B*nh,1,4f] -> [B*nh,K,4f]
-    X2 = F.gelu(Z1, approximate='tanh')
+    # X2 = F.gelu(Z1, approximate='tanh')
+    X2 = gelu(Z1)
+    # X2 = Z1
     Z2 = X2 @ W2_init + b2_init
 
     l2_target = XV_chunk - XK_chunk
     dl_dZ2 = ln_fused_l2_bwd(Z2, l2_target, ln_weight, ln_bias)  # [B*nh,K=1,f]
-    dl_dZ1 = dl_dZ2 @ W2_init.transpose(-1, -2) * diff_gelu(Z1)
+    # dl_dZ1 = dl_dZ2 @ W2_init.transpose(-1, -2) * diff_gelu(Z1)
+    dl_dZ1 = dl_dZ2 @ W2_init.transpose(-1, -2)
 
     b1_bar = b1_init - (coeff_chunk * Attn_b) @ dl_dZ1  # [B*nh,1,4f] - ([B*nh,K,K] * [K,K]) @ [B*nh,K,4f]
     Attn1 = torch.tril(XQ_chunk @ XK_chunk.transpose(-1, -2))  # [B*nh,K,K]
     Z1_bar = XQ_chunk @ W1_init - (coeff_chunk * Attn1) @ dl_dZ1 + b1_bar  # [B*nh,K,f] @ [B*nh,f,4f] - ([K,K] * [B*nh,K,K]) @ [B*nh,K,4f] + [B*nh,K,4f]
 
-    X2_bar = F.gelu(Z1_bar, approximate='tanh')
+    # X2_bar = F.gelu(Z1_bar, approximate='tanh')
+    X2_bar = gelu(Z1_bar)
+    # X2_bar = Z1_bar
 
     b2_bar = b2_init - (coeff_chunk * Attn_b) @ dl_dZ2  # [B*nh,1,4f] - ([B*nh,K,K] * [K,K]) @ [B*nh,K,4f]
     Attn2 = torch.tril(X2_bar @ X2.transpose(-1, -2))  # [B*nh,K,K]
@@ -1127,6 +1147,7 @@ class TTTM2BMMTKModule(TTTBaseModule):
             CS = self.inner_chunk_size
             NC = N // CS
             token_idx = inputs.pop('token_idx')
+            # XQ_residual = inputs['XQ']
             inputs = tree_map(lambda x: x.reshape(B, NH, NC, CS, -1).contiguous(), inputs)  # [B*nh,N,f/1] -> [B,nh,nc,cs,f/1]
             ilr_gated = inputs.pop('ilr_gated').transpose(-1, -2)  # [B,nh,nc,1,cs]
             inputs['coeff'] = token_idx[None, :] * ilr_gated  # [1,1,1,cs,1] * [B,nh,nc,1,cs] -> [B,nh,nc,CS,CS]
@@ -1148,7 +1169,25 @@ class TTTM2BMMTKModule(TTTBaseModule):
             make_last_coeff_1_matrix[-1, :] = 1.
             make_last_coeff_2_matrix[-1, :] = 1.
 
-            tk_m2_prefill.prefill_whole_loop_gelu_coeff_bias_LN_res_PLN_fp16(
+            # tk_m2_prefill.prefill_whole_loop_gelu_coeff_bias_LN_fp16(
+            #     W1_init, W2_init, b1_init, b2_init,
+            #     ln_weight, ln_bias,
+            #     cumsum_matrix,
+            #     make_last_b_matrix,
+            #     make_last_coeff_1_matrix, make_last_coeff_2_matrix,
+            #     XV, XK, XQ, coeff,
+            #     output
+            # )
+            # tk_m2_prefill.prefill_whole_loop_gelu_coeff_bias_LN_res_PLN_fp16(
+            #     W1_init, W2_init, b1_init, b2_init,
+            #     ln_weight, ln_bias,
+            #     cumsum_matrix,
+            #     make_last_b_matrix,
+            #     make_last_coeff_1_matrix, make_last_coeff_2_matrix,
+            #     XV, XK, XQ, coeff,
+            #     output
+            # )
+            tk_m2_prefill.prefill_whole_loop_coeff_bias_LN_res_PLN_fp16(
                 W1_init, W2_init, b1_init, b2_init,
                 ln_weight, ln_bias,
                 cumsum_matrix,
@@ -1163,6 +1202,8 @@ class TTTM2BMMTKModule(TTTBaseModule):
             cache_params.params_dict["b2_states"][self.layer_idx].copy_(b2_init)
 
             output = output.reshape(B_mul_NH, N, HF)
+
+            # output = self.residual_add_post_LN(XQ_residual, output)
 
         else:
             W1 = cache_params.params_dict["W1_states"][self.layer_idx].reshape(B, NH, HF, HF_prime)

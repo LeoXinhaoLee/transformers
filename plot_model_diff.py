@@ -20,7 +20,9 @@ dir = './exp/A_matching'
 # name = '07_04_M2_1B_decode_no_compile_no_cg'
 # name = '07_04_M2_1B_decode'
 
-name = '07_04_M2_1B_prefill_no_compile'
+# name = '07_04_M2_no_gelu_1B_prefill_no_compile'
+name = '07_04_M2_no_diff_gelu_1B_prefill_no_compile'
+# name = '07_04_M2_1B_prefill_no_compile'
 # name = '07_04_M2_1B_prefill'
 
 folder = os.path.join(dir, name)
