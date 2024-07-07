@@ -305,7 +305,7 @@ class TTTBase(nn.Module):
             self.prefill_gate_and_norm = self._prefill_gate_and_norm
 
     def _get_QKV_ttt_lr(self, hidden_states):
-        B, L, D = hidden_states.shape
+        B, N, D = hidden_states.shape
 
         XQKV_ttt_lr = self.qkv_learnable_ttt_lr_proj(hidden_states)  # [B,N, 3*F + nh]
 
@@ -315,15 +315,15 @@ class TTTBase(nn.Module):
         # since the loss used in the TTT process is MSE, which averages over feature dimension of each head,
         # we can absorb the division of `head_dim` into ttt_lr for convenience
         ttt_lr = self.config.ttt_base_lr * F.sigmoid(
-            (ttt_lr + self.learnable_ttt_lr_bias).permute(0, 2, 1).reshape(-1, L, 1)
+            (ttt_lr + self.learnable_ttt_lr_bias).permute(0, 2, 1).reshape(-1, N, 1)
         ) / self.head_dim  # ([B,N,nh] + [1,1,nh]) -> [B,nh,N] -> [B*nh,N,1]
 
         XQK, XGate_XV = torch.split(XQKV, split_size_or_sections=[self.hidden_size, 2 * self.hidden_size], dim=-1)
 
         XGate, XV = torch.split(
             XGate_XV.reshape(
-                B, L, self.num_heads, 2 * self.head_dim
-            ).permute(0, 2, 1, 3).reshape(-1, L, 2 * self.head_dim),
+                B, N, self.num_heads, 2 * self.head_dim
+            ).permute(0, 2, 1, 3).reshape(-1, N, 2 * self.head_dim),
             split_size_or_sections=self.head_dim, dim=-1
         )  # [B*nh,N=1,f] x2
 
@@ -389,7 +389,7 @@ class TTTBase(nn.Module):
         cache_params: Optional[TTTCache] = None,
         is_prefill: bool = False,
     ):
-        B, L, D = hidden_states.shape
+        B, N, D = hidden_states.shape
         # @xinhao: decoding from a prompt of length 1 will always have `mini_batch_size=remainder=1`
         if is_prefill:
             inner_mini_batch_step_offset = 0
@@ -404,14 +404,14 @@ class TTTBase(nn.Module):
         XQK, XV, XGate, ttt_lr = self.get_QKV_ttt_lr(hidden_states)
 
         XQ, XK = self.conv_qk_fused(XQK, cache_params, is_prefill)  # [B,N,F] -> conv1: [B,N,F], conv2: [B,N,F]
-        XQ = XQ.reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # [B,N,nh,f] -> [B,nh,N,f]
-        XK = XK.reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        XQ = XQ.reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # [B,N,nh,f] -> [B,nh,N,f]
+        XK = XK.reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
         # Apply rotary on XQ, XK
         cos, sin = self.rotary_emb(XV, position_ids % self.mini_batch_size)  # [B,N,f]
         XQ, XK = self.apply_rotary_pos_emb(XQ, XK, cos, sin)
-        XQ = XQ.reshape(-1, L, self.head_dim)  # [B,nh,N,f] -> [B*nh,N,f]
-        XK = XK.reshape(-1, L, self.head_dim)
+        XQ = XQ.reshape(-1, N, self.head_dim)  # [B,nh,N,f] -> [B*nh,N,f]
+        XK = XK.reshape(-1, N, self.head_dim)
 
         XV = XV.contiguous()
         XK = XK.contiguous()
@@ -485,9 +485,9 @@ class TTTBase(nn.Module):
         is_prefill: Optional[bool] = None,
         is_last_in_mini_batch: Optional[bool] = None,
     ):
-        L = hidden_states.shape[1]
+        B, N = hidden_states.shape[:2]
         # Simplification in benchmark: prefill length is a multiple of mini-batch size
-        assert (is_prefill and L % self.mini_batch_size == 0) or ((not is_prefill) and L == 1)
+        assert (is_prefill and N % self.mini_batch_size == 0) or ((not is_prefill) and N == 1)
 
         XQ, XK, XV, token_idx, ttt_lr, XGate = self.get_inner_loop_inputs(
             hidden_states,
@@ -495,8 +495,8 @@ class TTTBase(nn.Module):
             cache_params=cache_params,
             is_prefill=is_prefill
         )
-        B_mul_NH, N, HF = XV.shape
-        B = B_mul_NH // self.num_heads
+        # B_mul_NH = XV.shape[0]
+        # B = B_mul_NH // self.num_heads
         inputs = {'XQ': XQ, 'XK': XK, 'XV': XV, 'token_idx': token_idx, 'ttt_lr': ttt_lr}
 
         ttt_process_output = self.TTT_process(

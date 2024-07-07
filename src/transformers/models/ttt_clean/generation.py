@@ -132,8 +132,8 @@ def decode(
         inference_params.allocate_inference_cache()
 
     def get_logits(input_ids, inference_params):
-        # decoding = inference_params.seqlen_offset > 0  # after prompt
-        decoding = inference_params.seqlen_offset > 0 or input_ids.shape[1] == 1  # prompt=1 use decode mode directly as a hack
+        # If prompt=1, use decode mode directly
+        decoding = inference_params.seqlen_offset > 0 or input_ids.shape[1] == 1
 
         if not cg or not decoding:
             if not decoding:
@@ -174,7 +174,7 @@ def decode(
             return True
         return False
 
-    sequences = []
+    sequences = [input_ids]
     while not should_stop(sequences[-1], inference_params):
         logits = get_logits(sequences[-1], inference_params)  # [BS, V]
         inference_params.seqlen_offset += sequences[-1].shape[1]
@@ -182,7 +182,7 @@ def decode(
         sequences.append(new_token)
 
     output_cls = GreedySearchDecoderOnlyOutput
-    return output_cls(sequences=torch.cat(sequences, dim=1))
+    return output_cls(sequences=torch.cat(sequences, dim=1), scores=None)
 
 
 class GenerationMixin:
@@ -199,7 +199,7 @@ class GenerationMixin:
         output = decode(
             input_ids, self, max_length, **kwargs
         )
-        return output.sequences
+        return output
 
 
 @dataclass

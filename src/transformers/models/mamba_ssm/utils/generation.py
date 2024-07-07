@@ -35,75 +35,15 @@ class InferenceParams:
             self.lengths_per_sample.zero_()
 
 
-# https://github.com/NVIDIA/Megatron-LM/blob/0bb597b42c53355a567aba2a1357cc34b9d99ddd/megatron/text_generation/sampling.py
-# https://github.com/huggingface/transformers/blob/a44985b41cfa2de48a5e1de7f1f93b7483da25d1/src/transformers/generation/logits_process.py#L231
-def modify_logits_for_top_k_filtering(logits, top_k):
-    """Set the logits for none top-k values to -inf. Done in-place."""
-    indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
-    logits.masked_fill_(indices_to_remove, float("-Inf"))
-
-
-# https://github.com/NVIDIA/Megatron-LM/blob/0bb597b42c53355a567aba2a1357cc34b9d99ddd/megatron/text_generation/sampling.py
-# https://github.com/huggingface/transformers/blob/a44985b41cfa2de48a5e1de7f1f93b7483da25d1/src/transformers/generation/logits_process.py#L170
-def modify_logits_for_top_p_filtering(logits, top_p):
-    """Set the logits for none top-p values to -inf. Done in-place."""
-    if top_p <= 0.0 or top_p >= 1.0:
-        return
-    # First sort and calculate cumulative sum of probabilities.
-    sorted_logits, sorted_indices = torch.sort(logits, descending=False)
-    cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
-    # Remove tokens with cumulative top_p above the threshold (token with 0 are kept)
-    sorted_indices_to_remove = cumulative_probs <= (1 - top_p)
-    # scatter sorted tensors to original indexing
-    indices_to_remove = sorted_indices_to_remove.scatter(
-        1, sorted_indices, sorted_indices_to_remove
-    )
-    logits.masked_fill_(indices_to_remove, float("-inf"))
-
-
-def sample(logits, top_k=1, top_p=0.0, temperature=1.0):
-    """Sample from top-k logits.
-    Arguments:
-        logits: Tensor of shape (batch_size, vocab_size)
-    """
-    if top_k == 1:  # Short-circuit for greedy decoding
-        return logits.argmax(dim=-1)
-    else:
-        if top_p > 0.0:
-            assert top_p <= 1.0, "top-p should be in (0, 1]."
-        if top_k > 0:
-            top_k = min(top_k, logits.size(-1))  # Safety check
-            logits_top, indices = torch.topk(logits, top_k, dim=-1)
-            if temperature != 1.0:
-                logits_top /= temperature
-            modify_logits_for_top_p_filtering(logits_top, top_p)
-            return indices[
-                torch.arange(indices.shape[0], device=indices.device),
-                torch.multinomial(torch.softmax(logits_top, dim=-1), num_samples=1).squeeze(dim=-1),
-            ]
-        else:
-            # Clone so that when we modify for top_p we don't change the original logits
-            logits_top = logits / temperature if temperature != 1.0 else logits.clone()
-            modify_logits_for_top_p_filtering(logits_top, top_p)
-            return torch.multinomial(torch.softmax(logits_top, dim=-1), num_samples=1).squeeze(
-                dim=-1
-            )
-
-
 @torch.inference_mode()
 def decode(
     input_ids,
     model,
     max_length,
-    top_k=1,
-    top_p=0.0,
-    temperature=1.0,
     eos_token_id=None,
-    teacher_outputs=None,
     vocab_size=None,
     tensor_parallel=1,
     cg=False,
-    enable_timing=False,
 ):
     """Decoding, either greedy or with top-k or top-p sampling.
     If top-k = 0, don't limit the number of candidates (pure sampling).
@@ -121,11 +61,9 @@ def decode(
         scores: tuples of (batch, vocab_size)
     """
     batch_size, seqlen_og = input_ids.shape
-    teacher_output_len = teacher_outputs.shape[1] if teacher_outputs is not None else 0
     if cg:
         if not hasattr(model, "_decoding_cache"):
             model._decoding_cache = None
-
         model._decoding_cache = update_graph_cache(
             model,
             model._decoding_cache,
@@ -134,17 +72,14 @@ def decode(
             max_length,
             tensor_parallel=tensor_parallel,
         )
-
         inference_params = model._decoding_cache.inference_params
-
         inference_params.reset(max_length, batch_size)
-
     else:
         inference_params = InferenceParams(max_seqlen=max_length, max_batch_size=batch_size)
 
-
     def get_logits(input_ids, inference_params):
-        decoding = inference_params.seqlen_offset > 0  # after prompt
+        # prompt=1 use decode mode directly
+        decoding = inference_params.seqlen_offset > 0 or input_ids.shape[1] == 1
         if decoding:
             position_ids = torch.full(
                 (batch_size, 1),
@@ -156,30 +91,19 @@ def decode(
             position_ids = None
 
         if not cg or not decoding:
-            # before prompt
             logits = model(
                 input_ids,
-                position_ids=position_ids,  # None
+                position_ids=position_ids,
                 inference_params=inference_params,
                 num_last_tokens=1,
             ).logits.squeeze(dim=1)
 
         else:
-            # after prompt: continue generating
             logits = model._decoding_cache.run(
                 input_ids, position_ids, inference_params.seqlen_offset
             ).squeeze(dim=1)
 
         return logits[..., :vocab_size] if vocab_size is not None else logits
-
-
-    def sample_tokens(logits, inference_params):
-        if teacher_outputs is None or teacher_output_len <= inference_params.seqlen_offset:
-            token = sample(logits, top_k=top_k, top_p=top_p, temperature=temperature)
-        else:
-            token = teacher_outputs[:, inference_params.seqlen_offset]
-        # return rearrange(token, "b -> b 1")
-        return token.unsqueeze(1)
 
     def should_stop(current_token, inference_params):
         if inference_params.seqlen_offset == 0:
@@ -190,47 +114,15 @@ def decode(
             return True
         return False
 
-    start = torch.cuda.Event(enable_timing=enable_timing)
-    end = torch.cuda.Event(enable_timing=enable_timing)
-
-    if enable_timing:
-        if tensor_parallel > 1:
-            torch.distributed.barrier()
-        start.record()
-
-    scores, sequences = [], [input_ids]
-    if input_ids.shape[1] == 1:
-        inference_params.seqlen_offset = 1  # TODO: @xinhao: prompt=1 use decode mode directly as a hack
-
+    sequences = [input_ids]
     while not should_stop(sequences[-1], inference_params):
-
-        # scores.append(
-        #     get_logits(sequences[-1], inference_params)
-        # )
-        #
-        # inference_params.seqlen_offset += sequences[-1].shape[1]
-        #
-        # sequences.append(
-        #     sample_tokens(scores[-1], inference_params)
-        # )
-
-        # @xinhao: avoid appending logits, which will OOM as generation length gets longer
         logits = get_logits(sequences[-1], inference_params)  # [BS, V]
         inference_params.seqlen_offset += sequences[-1].shape[1]
         new_token = logits.argmax(dim=-1).unsqueeze(-1)  # [BS,1]
         sequences.append(new_token)
 
-
-    if enable_timing:
-        end.record()
-        if tensor_parallel > 1:
-            torch.distributed.barrier()
-        torch.cuda.synchronize()
-        print(f"Prompt processing + decoding time: {(start.elapsed_time(end)):.0f}ms")
-
-    output_cls = GreedySearchDecoderOnlyOutput if top_k == 1 else SampleDecoderOnlyOutput
-
-    return output_cls(sequences=torch.cat(sequences, dim=1), scores=tuple(scores))
+    output_cls = GreedySearchDecoderOnlyOutput
+    return output_cls(sequences=torch.cat(sequences, dim=1))
 
 
 class GenerationMixin:
@@ -241,19 +133,12 @@ class GenerationMixin:
         self,
         input_ids,
         max_length,
-        top_k=1,
-        top_p=0.0,
-        temperature=1.0,
-        return_dict_in_generate=False,
-        output_scores=False,
         **kwargs,
     ):
         output = decode(
-            input_ids, self, max_length, top_k=top_k, top_p=top_p, temperature=temperature, **kwargs
+            input_ids, self, max_length, **kwargs
         )
-        if not output_scores:
-            output.scores = None
-        return output if return_dict_in_generate else output.sequences
+        return output
 
 
 def allocate_inference_cache(

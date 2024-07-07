@@ -224,9 +224,8 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         num_last_tokens: if > 0, only return the logits for the last n tokens
         """
         hidden_states = self.backbone(input_ids, inference_params=inference_params)
-        # if num_last_tokens > 0:
-        #     hidden_states = hidden_states[:, -num_last_tokens:]
-        hidden_states = hidden_states[:, -1:]
+        if num_last_tokens > 0:
+            hidden_states = hidden_states[:, -num_last_tokens:]
         lm_logits = self.lm_head(hidden_states)
         CausalLMOutput = namedtuple("CausalLMOutput", ["logits"])
         return CausalLMOutput(logits=lm_logits)

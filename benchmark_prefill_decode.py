@@ -145,12 +145,6 @@ if is_mamba:
         input_ids=input_ids,
         max_length=max_length,
         cg=(not args.no_cg),
-        return_dict_in_generate=True,
-        output_scores=False,
-        enable_timing=False,
-        temperature=1.0,
-        top_k=1, # @xinhao: mamba src code: shortcut for greedy
-        top_p=0,
     )
 elif is_ttt:
     fn = lambda: model.generate(
