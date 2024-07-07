@@ -50,7 +50,7 @@ config_str = print_args(args)
 logger.info(config_str)
 
 torch.random.manual_seed(0)
-# follow mamba's benchmark: https://github.com/state-spaces/mamba/blob/8ffd905c91d207f5c0cc84fc2a2fb748655094f0/benchmarks/benchmark_generation_mamba_simple.py#L32
+# follow Mamba's benchmark: https://github.com/state-spaces/mamba/blob/8ffd905c91d207f5c0cc84fc2a2fb748655094f0/benchmarks/benchmark_generation_mamba_simple.py#L32
 repeats = 3
 device = "cuda"
 dtype = torch.float16
@@ -96,7 +96,7 @@ fn = lambda: model.generate(
 )
 
 # Capture graph if cg=True.
-# This is not timed, following Mamba:
+# This is not timed, following Mamba's benchmark:
 # https://github.com/state-spaces/mamba/blob/8ffd905c91d207f5c0cc84fc2a2fb748655094f0/benchmarks/benchmark_generation_mamba_simple.py#L82
 out = fn()
 logger.info("Succeeded.")
