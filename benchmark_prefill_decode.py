@@ -50,11 +50,10 @@ parser.add_argument("--promptlen", type=int, default=1)
 parser.add_argument("--genlen", type=int, default=128)
 parser.add_argument("--batch", type=int, default=1)
 parser.add_argument("--attn_impl", type=str, default='flash_attention_2', choices=['eager', 'flash_attention_2'])
-parser.add_argument("--inner_net", type=str, default='mlp_2_dual', choices=['ttt_linear', 'ttt_mlp',
+parser.add_argument("--seq_modeling_block", type=str, default='mlp_2_dual', choices=['ttt_linear', 'ttt_mlp',
                                                                             'ttt_linear_fast', 'ttt_mlp_fast'])
 parser.add_argument("--use_compile", action='store_true')
 parser.add_argument("--no_cg", action='store_true')    # @xinhao: currently only implemented for Mamba and TTT
-parser.add_argument("--profile", action='store_true')  # @xinhao: pytorch profiler, different from nsys in micro-benchmark
 args = parser.parse_args()
 
 def print_args(args):
@@ -116,20 +115,16 @@ if is_mamba:
     model = MambaLMHeadModel(**config, device=device, dtype=dtype)
 elif is_ttt:
     ttt_size = args.model_name.split('-')[-1]
-    if ttt_size == 'profile':
-        ttt_size = '1b'
-    elif ttt_size not in TTT_STANDARD_CONFIGS.keys():
+    if ttt_size not in TTT_STANDARD_CONFIGS.keys():
         raise NotImplementedError(f"TTT Config {args.model_name} Not Implemented!")
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
     ttt_config = TTTConfig(**TTT_STANDARD_CONFIGS[ttt_size], vocab_size=32000)
-    ttt_config.inner_net = args.inner_net
+    ttt_config.seq_modeling_block = args.seq_modeling_block
     ttt_config.use_compile = args.use_compile
     ttt_config.dtype = dtype
     # @xinhao: follow mamba-1.4b
     ttt_config.fused_add_norm = True
     ttt_config.residual_in_fp32 = True
-    if args.model_name.split('-')[-1] == 'profile':
-        ttt_config.num_hidden_layers = 1
     model = TTTForCausalLM(ttt_config).to(device=device, dtype=dtype)
 else:
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")  # meta-llama/Llama-2-7b
@@ -162,12 +157,6 @@ elif is_ttt:
         input_ids=input_ids,
         max_length=max_length,
         cg=(not args.no_cg),
-        return_dict_in_generate=True,
-        output_scores=False,
-        enable_timing=False,
-        temperature=1.0,
-        top_k=1,  # @xinhao: mamba src code: shortcut for greedy
-        top_p=0,
     )
 else:
     if args.use_compile:
@@ -191,36 +180,16 @@ out_len = len(out.sequences[0])
 in_len = len(input_ids[0])
 del out
 
-if args.profile:
+torch.cuda.synchronize()
+start = time.time()
+for i in range(repeats):
+    fn()
+torch.cuda.synchronize()
+avg_time = (time.time() - start) / repeats
 
-    torch.cuda.synchronize()
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                 record_shapes=True, profile_memory=True, use_cuda=True,
-                 with_flops=True, with_stack=True, with_modules=True
-        ) as prof:
-           fn()
-    prof.export_chrome_trace(osp.join(args.logdir, f"trace.json"))
-    prof.export_stacks(osp.join(args.logdir, f"cuda_flamedata.txt"), "self_cuda_time_total")
-    prof.export_stacks(osp.join(args.logdir, f"cpu_flamedata.txt"), "self_cpu_time_total")
-    torch.cuda.synchronize()
-
-    logger.info(f"Prompt length: {in_len}, generation length: {out_len - in_len}")
-    logger.info(f"SUCCESS: RECORDED TRACE TO {args.logdir}/trace.json")
-    logger.info(f"SUCCESS: RECORDED FLAME DATA TO {args.logdir}/[cuda,cpu]_flamedata.txt")
-    logger.info("==================================")
-
-else:
-
-    torch.cuda.synchronize()
-    start = time.time()
-    for i in range(repeats):
-        fn()
-    torch.cuda.synchronize()
-    avg_time = (time.time() - start) / repeats
-
-    logger.info(f"Prompt length: {in_len}, generation length: {out_len - in_len}")
-    logger.info(f"Prompt processing + Decoding time: {avg_time * 1000:.0f}ms")
-    logger.info(f"Throughput (total tok = prefill): {args.batch * in_len / avg_time:.3f} tokens / s")
-    logger.info(f"Throughput (total tok = prefill + decode): {args.batch * out_len / avg_time:.3f} tokens / s")
-    logger.info(f"Throughput (total tok = decode): {args.batch * (out_len - in_len) / avg_time:.3f} tokens / s")
-    logger.info("==================================")
+logger.info(f"Prompt length: {in_len}, generation length: {out_len - in_len}")
+logger.info(f"Prompt processing + Decoding time: {avg_time * 1000:.0f}ms")
+logger.info(f"Throughput (total tok = prefill): {args.batch * in_len / avg_time:.3f} tokens / s")
+logger.info(f"Throughput (total tok = prefill + decode): {args.batch * out_len / avg_time:.3f} tokens / s")
+logger.info(f"Throughput (total tok = decode): {args.batch * (out_len - in_len) / avg_time:.3f} tokens / s")
+logger.info("==================================")

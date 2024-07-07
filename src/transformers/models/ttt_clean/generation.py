@@ -17,6 +17,7 @@ from transformers.generation import GreedySearchDecoderOnlyOutput, SampleDecoder
 
 
 class TTTCache:
+
     def __init__(self, max_seqlen, max_batch_size, model):
         self.config = model.config
         self.model = model
@@ -24,53 +25,52 @@ class TTTCache:
         self.max_batch_size = max_batch_size
         self.seqlen_offset = 0
         self.dtype = model.config.dtype
-        self.inner_net = model.config.inner_net
+        self.seq_modeling_block = model.config.seq_modeling_block
         self.mini_batch_size = model.config.mini_batch_size
         self.params_dict = defaultdict(dict)
-        if self.inner_net == 'ttt_linear' or self.inner_net == 'ttt_linear_fast':
+        if self.seq_modeling_block == 'ttt_linear' or self.seq_modeling_block == 'ttt_linear_fast':
             self.param_names = ["W1", "b1"]
-        elif self.inner_net == 'ttt_mlp' or self.inner_net == 'ttt_mlp_fast':
+        elif self.seq_modeling_block == 'ttt_mlp' or self.seq_modeling_block == 'ttt_mlp_fast':
             self.param_names = ["W1", "b1", "W2", "b2"]
         else:
-            raise NotImplementedError(f"Inner Net: {self.inner_net} Not Implemented")
+            raise NotImplementedError(f"Sequence Modeling Block: {self.seq_modeling_block} Not Implemented")
 
     def allocate_inference_cache(self):
         for layer_idx in range(self.model.config.num_hidden_layers):
             for name in self.param_names:
-                weight = getattr(self.model.model.layers[layer_idx].self_attn, name)
+                weight = getattr(self.model.model.layers[layer_idx].seq_modeling_block, name)
                 tiled_weight = torch.tile(weight, (self.max_batch_size,) + (1,) * (weight.dim() - 1))  # [B*nh,f,f]
-                self.params_dict[f"{name}_states"][layer_idx] = tiled_weight
+                self.params_dict[f"{name}_init"][layer_idx] = tiled_weight
                 self.params_dict[f"{name}_grad"][layer_idx] = torch.zeros_like(tiled_weight)
-            self.params_dict[f"conv_states"][layer_idx] = torch.zeros(
+            self.params_dict[f"conv_cache"][layer_idx] = torch.zeros(
                 size=(self.max_batch_size, self.config.hidden_size, self.config.conv_kernel),
                 dtype=self.dtype, device=weight.device
             )
             if self.config.conv_before_ttt:
-                self.params_dict[f"pre_ttt_conv_states"][layer_idx] = torch.zeros(
+                self.params_dict[f"pre_ttt_conv_cache"][layer_idx] = torch.zeros(
                     size=(self.max_batch_size, self.config.hidden_size, self.config.conv_kernel),
                     dtype=self.dtype, device=weight.device
                 )
 
-    def reset(self, max_seqlen, max_batch_size, model, i=0):
+    def reset(self, max_seqlen, max_batch_size, model):
         self.max_seqlen = max_seqlen
         self.max_batch_size = max_batch_size
         self.seqlen_offset = 0
         self.model = model
         for layer_idx in range(self.model.config.num_hidden_layers):
             for name in self.param_names:
-                weight = getattr(self.model.model.layers[layer_idx].self_attn, name)
+                weight = getattr(self.model.model.layers[layer_idx].seq_modeling_block, name)
                 tiled_weight = torch.tile(weight, (max_batch_size,) + (1,) * (weight.dim() - 1))  # [B*nh,f,f]
-                self.params_dict[f"{name}_states"][layer_idx].copy_(tiled_weight  + i * 0.1)  # @xinhao: debug cg update
+                self.params_dict[f"{name}_init"][layer_idx].copy_(tiled_weight)
                 self.params_dict[f"{name}_grad"][layer_idx].zero_()
-            self.params_dict[f"conv_states"][layer_idx].zero_()
+            self.params_dict[f"conv_cache"][layer_idx].zero_()
             if self.config.conv_before_ttt:
-                self.params_dict[f"pre_ttt_conv_states"][layer_idx].zero_()
+                self.params_dict[f"pre_ttt_conv_cache"][layer_idx].zero_()
 
 
-def sample(logits, top_k=1, top_p=0.0, temperature=1.0):
-    """Sample from top-k logits.
-    Arguments:
-        logits: Tensor of shape (batch_size, vocab_size)
+def sample(logits):
+    """
+    Use Greedy Sampling for speed benchmarking
     """
     return logits.argmax(dim=-1)
 
@@ -80,34 +80,19 @@ def decode(
     input_ids,
     model,
     max_length,
-    top_k=1,
-    top_p=0.0,
-    temperature=1.0,
     eos_token_id=None,
-    teacher_outputs=None,
     vocab_size=None,
     tensor_parallel=1,
     cg=False,
-    enable_timing=False,
-    i = 0,
 ):
-    """Decoding, either greedy or with top-k or top-p sampling.
-    If top-k = 0, don't limit the number of candidates (pure sampling).
-    Top-k and top-p can be used together. If top_k > 0 and top_p > 0, then top-k is applied first,
-    then top-p.
-    We assume that all sequences in the same batch have the same length.
-
+    """Decoding
     Arguments:
         input_ids: (batch, seq_len)
         max_length: int
-        teacher_outputs (optional): (batch, seq_len). If provided, instead of sampling from the
-            logits, the next token is taken from the teacher_outputs. Useful for testing.
     Returns: GreedySearchDecoderOnlyOutput or SampleDecoderOnlyOutput, with the following fields:
         sequences: (batch, max_length)
-        scores: tuples of (batch, vocab_size)
     """
     batch_size, seqlen_og = input_ids.shape
-    teacher_output_len = teacher_outputs.shape[1] if teacher_outputs is not None else 0
     if cg:
         if not hasattr(model, "_decoding_cache"):
             model._decoding_cache = None
@@ -126,7 +111,7 @@ def decode(
 
         inference_params = model._decoding_cache.inference_params
 
-        inference_params.reset(max_length, batch_size, model, i)  # TODO: must reset keep the shape of inference_params?
+        inference_params.reset(max_length, batch_size, model)
 
         ## Capture is_last_in_mini_batch = True
         model._decoding_cache = update_graph_cache(
@@ -140,32 +125,29 @@ def decode(
             is_last_in_mini_batch=True,
         )
         inference_params = model._decoding_cache.inference_params
-        inference_params.reset(max_length, batch_size, model)  # TODO: must reset keep the shape of inference_params?
+        inference_params.reset(max_length, batch_size, model)
 
     else:
         inference_params = TTTCache(max_seqlen=max_length, max_batch_size=batch_size, model=model)
         inference_params.allocate_inference_cache()
 
-
     def get_logits(input_ids, inference_params):
         # decoding = inference_params.seqlen_offset > 0  # after prompt
-        decoding = inference_params.seqlen_offset > 0 or input_ids.shape[1] == 1  # TODO: @xinhao: prompt=1 use decode mode directly as a hack
+        decoding = inference_params.seqlen_offset > 0 or input_ids.shape[1] == 1  # prompt=1 use decode mode directly as a hack
 
         if not cg or not decoding:
             if not decoding:
-                ## prefilling never uses cg
-                is_last_in_mini_batch = True  # TODO: assume prompt is always a multiple of CS
+                # assume prompt is always a multiple of CS
+                is_last_in_mini_batch = True
                 is_prefill = True
                 logits = model(
                     input_ids,
                     is_prefill=is_prefill,
                     is_last_in_mini_batch=is_last_in_mini_batch,
                     cache_params=inference_params,
-                ).logits[:, -1, :]  # [BS,prompt_len,vocab] -> [BS,1,vocab] -> [BS,vocab]
+                ).logits[:, -1, :]     # [BS,prompt_len,vocab] -> [BS,1,vocab] -> [BS,vocab]
             else:
-                ## decoding, but doesn't use cg (should only be used for profiling)
                 is_last_in_mini_batch = ((inference_params.seqlen_offset + 1) % inference_params.mini_batch_size == 0)
-                # is_last_in_mini_batch = False
                 is_prefill = False
                 logits = model(
                     input_ids,
@@ -175,24 +157,13 @@ def decode(
                 ).logits.squeeze(dim=1)  # [BS,1,vocab] -> [BS,vocab]
         else:
             ## cg and decoding
-            # after prompt: continue generating
             is_prefill = False
             is_last_in_mini_batch = ((inference_params.seqlen_offset + 1) % inference_params.mini_batch_size == 0)
-            # is_last_in_mini_batch = False
             logits = model._decoding_cache.run(
                 input_ids, is_prefill, is_last_in_mini_batch
             ).squeeze(dim=1)  # [BS,decode_len,vocab_size]
 
         return logits[..., :vocab_size] if vocab_size is not None else logits
-
-
-    def sample_tokens(logits, inference_params):
-        if teacher_outputs is None or teacher_output_len <= inference_params.seqlen_offset:
-            token = sample(logits, top_k=top_k, top_p=top_p, temperature=temperature)
-        else:
-            token = teacher_outputs[:, inference_params.seqlen_offset]
-        # return rearrange(token, "b -> b 1")
-        return token.unsqueeze(1)
 
     def should_stop(current_token, inference_params):
         if inference_params.seqlen_offset == 0:
@@ -203,36 +174,19 @@ def decode(
             return True
         return False
 
-    start = torch.cuda.Event(enable_timing=enable_timing)
-    end = torch.cuda.Event(enable_timing=enable_timing)
-
-    if enable_timing:
-        if tensor_parallel > 1:
-            torch.distributed.barrier()
-        start.record()
-
-    scores, sequences = [], [input_ids]
-
+    sequences = []
     while not should_stop(sequences[-1], inference_params):
-        # @xinhao: avoid appending logits, which will OOM as generation length gets longer
         logits = get_logits(sequences[-1], inference_params)  # [BS, V]
         inference_params.seqlen_offset += sequences[-1].shape[1]
         new_token = logits.argmax(dim=-1).unsqueeze(-1)  # [BS,1]
         sequences.append(new_token)
 
-    if enable_timing:
-        end.record()
-        if tensor_parallel > 1:
-            torch.distributed.barrier()
-        torch.cuda.synchronize()
-        print(f"Prompt processing + decoding time: {(start.elapsed_time(end)):.0f}ms")
-
-    output_cls = GreedySearchDecoderOnlyOutput if top_k == 1 else SampleDecoderOnlyOutput
-
-    return output_cls(sequences=torch.cat(sequences, dim=1), scores=tuple(scores))
+    output_cls = GreedySearchDecoderOnlyOutput
+    return output_cls(sequences=torch.cat(sequences, dim=1))
 
 
 class GenerationMixin:
+
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         raise NotImplementedError
 
@@ -240,19 +194,12 @@ class GenerationMixin:
         self,
         input_ids,
         max_length,
-        top_k=1,
-        top_p=0.0,
-        temperature=1.0,
-        return_dict_in_generate=False,
-        output_scores=False,
-        **kwargs,  # include cg
+        **kwargs,
     ):
         output = decode(
-            input_ids, self, max_length, top_k=top_k, top_p=top_p, temperature=temperature, **kwargs
+            input_ids, self, max_length, **kwargs
         )
-        if not output_scores:
-            output.scores = None
-        return output if return_dict_in_generate else output.sequences
+        return output.sequences
 
 
 @dataclass
@@ -294,7 +241,7 @@ def update_graph_cache(
         (device, dtype) != (cache.device, cache.dtype)
         or batch_size > cache.max_batch_size
         or max_seqlen > cache.max_seqlen
-    ):  # Invalidate the cache (@xinhao: always activated the first time enter updte_graph_cache)
+    ):
         cache.callables = {}
         cache.mempool = None
         cache.inference_params = None
@@ -309,12 +256,8 @@ def update_graph_cache(
         cache.inference_params.allocate_inference_cache()
         cache.mempool = torch.cuda.graphs.graph_pool_handle()
 
-    ###
     for decoding_seqlen in decoding_seqlens:
-
         if (batch_size, decoding_seqlen, is_prefill, is_last_in_mini_batch) not in cache.callables:
-
-            # key: (batch_size, decoding_seqlen)=(bs, 1), val: a function returned by capture_graph
             cache.callables[batch_size, decoding_seqlen, is_prefill, is_last_in_mini_batch] = capture_graph(
                 model,
                 cache.inference_params,

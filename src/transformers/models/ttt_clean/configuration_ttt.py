@@ -20,11 +20,6 @@
 """ TTT model configuration"""
 
 from ...configuration_utils import PretrainedConfig
-from ...utils import logging
-
-
-logger = logging.get_logger(__name__)
-
 
 TTT_STANDARD_CONFIGS = {
     "1b": {
@@ -140,30 +135,16 @@ class TTTConfig(PretrainedConfig):
         intermediate_size=11008,
         num_hidden_layers=32,
         num_attention_heads=32,
-        hidden_act="silu",
         max_position_embeddings=2048,
         initializer_range=0.02,
         rms_norm_eps=1e-6,
-        use_cache=False,
-        pad_token_id=None,
-        bos_token_id=0,
-        eos_token_id=0,
-        pretraining_tp=1,
         tie_word_embeddings=False,
         rope_theta=10000.0,
-        rope_scaling=None,
-        use_mixer=False,
-        share_qk=False,
-        inner_net_type='m1',
-        inner_net_lr=1.0,
+        seq_modeling_block='ttt_linear',
+        ttt_base_lr=1.0,
         mini_batch_size=16,
-        use_vjp=True,
-        use_post_ln=False,
-        inner_net_on_residual=False,
         conv_before_ttt=False,
         conv_kernel=4,
-        use_learnable_token_idx=False,
-        inner_net_gate_activation="sigmoid",
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -173,53 +154,16 @@ class TTTConfig(PretrainedConfig):
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
 
-        self.hidden_act = hidden_act
         self.initializer_range = initializer_range
-        self.rms_norm_eps = rms_norm_eps
-        self.pretraining_tp = pretraining_tp
-        self.use_cache = use_cache
         self.rope_theta = rope_theta
-        self.rope_scaling = rope_scaling
-        self._rope_scaling_validation()
-
-        self.use_mixer = use_mixer
-        self.share_qk = share_qk
-        self.inner_net_type = inner_net_type
-        self.inner_net_lr = inner_net_lr
+        self.rms_norm_eps = rms_norm_eps
+        self.seq_modeling_block = seq_modeling_block
+        self.ttt_base_lr = ttt_base_lr
         self.mini_batch_size = mini_batch_size
-
-        self.use_vjp = use_vjp
-        self.use_post_ln = use_post_ln
-        self.inner_net_on_residual = inner_net_on_residual
         self.conv_before_ttt = conv_before_ttt
         self.conv_kernel = conv_kernel
-        self.use_learnable_token_idx = use_learnable_token_idx
-        self.inner_net_gate_activation = inner_net_gate_activation
 
         super().__init__(
-            pad_token_id=pad_token_id,
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
-
-    def _rope_scaling_validation(self):
-        """
-        Validate the `rope_scaling` configuration.
-        """
-        if self.rope_scaling is None:
-            return
-
-        if not isinstance(self.rope_scaling, dict) or len(self.rope_scaling) != 2:
-            raise ValueError(
-                "`rope_scaling` must be a dictionary with two fields, `type` and `factor`, " f"got {self.rope_scaling}"
-            )
-        rope_scaling_type = self.rope_scaling.get("type", None)
-        rope_scaling_factor = self.rope_scaling.get("factor", None)
-        if rope_scaling_type is None or rope_scaling_type not in ["linear", "dynamic"]:
-            raise ValueError(
-                f"`rope_scaling`'s type field must be one of ['linear', 'dynamic'], got {rope_scaling_type}"
-            )
-        if rope_scaling_factor is None or not isinstance(rope_scaling_factor, float) or rope_scaling_factor <= 1.0:
-            raise ValueError(f"`rope_scaling`'s factor field must be a float > 1, got {rope_scaling_factor}")
