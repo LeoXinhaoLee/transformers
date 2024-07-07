@@ -13,12 +13,12 @@ from transformers.models.ttt_clean import TTTForCausalLM
 
 parser = argparse.ArgumentParser(description="Speed Benchmark")
 parser.add_argument("--logdir", type=str, default="./exp/clean")
-parser.add_argument("--model-name", type=str, default="ttt", choices=['ttt-1.3b', 'mamba-1.3b'])
+parser.add_argument("--model-name", type=str, default="ttt", choices=['ttt-1b', 'mamba-1b'])
 parser.add_argument("--promptlen", type=int, default=1)
 parser.add_argument("--genlen", type=int, default=128)
 parser.add_argument("--batch", type=int, default=1)
 parser.add_argument("--seq_modeling_block", type=str,
-                    default='mlp_2_dual', choices=['ttt_linear', 'ttt_mlp', 'ttt_linear_fast', 'ttt_mlp_fast'])
+                    default='ttt_linear_fast', choices=['ttt_linear', 'ttt_mlp', 'ttt_linear_fast', 'ttt_mlp_fast'])
 parser.add_argument("--use_compile", action='store_true')
 parser.add_argument("--no_cg", action='store_true')
 args = parser.parse_args()
@@ -60,7 +60,7 @@ is_mamba = args.model_name.startswith("mamba")
 is_ttt = args.model_name.startswith("ttt")
 if is_mamba:
     assert not args.use_compile, "Mamba does not support torch.compile!"
-    # Copied from https://huggingface.co/state-spaces/mamba-1.4b/blob/main/config.json
+    # Copy Mamba 1.4b's config https://huggingface.co/state-spaces/mamba-1.4b/blob/main/config.json
     # except changing vocab size to llama2 tokenizer's vocab size
     config = {
         "d_model": 2048,
