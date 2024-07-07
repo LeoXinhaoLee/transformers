@@ -68,13 +68,6 @@ class TTTCache:
                 self.params_dict[f"pre_ttt_conv_cache"][layer_idx].zero_()
 
 
-def sample(logits):
-    """
-    Use Greedy Sampling for speed benchmarking
-    """
-    return logits.argmax(dim=-1)
-
-
 @torch.inference_mode()
 def decode(
     input_ids,
@@ -137,7 +130,7 @@ def decode(
 
         if not cg or not decoding:
             if not decoding:
-                # assume prompt is always a multiple of CS
+                # assume prompt is a multiple of ttt mini-batch size
                 is_last_in_mini_batch = True
                 is_prefill = True
                 logits = model(
@@ -145,7 +138,8 @@ def decode(
                     is_prefill=is_prefill,
                     is_last_in_mini_batch=is_last_in_mini_batch,
                     cache_params=inference_params,
-                ).logits[:, -1, :]     # [BS,prompt_len,vocab] -> [BS,1,vocab] -> [BS,vocab]
+                    num_last_tokens=1,
+                ).squeeze(dim=1)     # [BS,1,vocab] -> [BS,vocab]
             else:
                 is_last_in_mini_batch = ((inference_params.seqlen_offset + 1) % inference_params.mini_batch_size == 0)
                 is_prefill = False
@@ -178,7 +172,7 @@ def decode(
     while not should_stop(sequences[-1], inference_params):
         logits = get_logits(sequences[-1], inference_params)  # [BS, V]
         inference_params.seqlen_offset += sequences[-1].shape[1]
-        new_token = logits.argmax(dim=-1).unsqueeze(-1)  # [BS,1]
+        new_token = logits.argmax(dim=-1).unsqueeze(-1)  # greedy sampling for speed benchmark: [BS,1]
         sequences.append(new_token)
 
     output_cls = GreedySearchDecoderOnlyOutput

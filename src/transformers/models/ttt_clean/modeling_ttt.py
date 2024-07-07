@@ -1407,7 +1407,7 @@ class TTTForCausalLM(nn.Module, GenerationMixin):
         is_prefill: Optional[bool] = None,
         is_last_in_mini_batch: Optional[bool] = None,
         *,
-        output_attentions: Optional[bool] = None,
+        num_last_tokens=0,
     ) -> Union[Tuple, TTTCausalLMOutput]:
 
         outputs = self.model(
@@ -1424,7 +1424,8 @@ class TTTForCausalLM(nn.Module, GenerationMixin):
         )
 
         # [BS,N,F] -> [BS,1,F]: only need to classify the last token
-        hidden_states = outputs.last_hidden_state[:,-1:,:]
+        if num_last_tokens > 0:
+            hidden_states = outputs.last_hidden_state[:, -num_last_tokens:]
         logits = self.lm_head(hidden_states)
 
         return TTTCausalLMOutput(
