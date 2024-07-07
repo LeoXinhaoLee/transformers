@@ -139,7 +139,7 @@ def decode(
                     is_last_in_mini_batch=is_last_in_mini_batch,
                     cache_params=inference_params,
                     num_last_tokens=1,
-                ).squeeze(dim=1)     # [BS,1,vocab] -> [BS,vocab]
+                ).logits.squeeze(dim=1)     # [BS,1,vocab] -> [BS,vocab]
             else:
                 is_last_in_mini_batch = ((inference_params.seqlen_offset + 1) % inference_params.mini_batch_size == 0)
                 is_prefill = False

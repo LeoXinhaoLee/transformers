@@ -1,4 +1,4 @@
-"""PyTorch TTT model."""
+"""PyTorch TTT model for speed benchmarking"""
 import pdb
 
 from dataclasses import dataclass
@@ -48,7 +48,8 @@ def tanh(x):
 def gelu(x):
     return 0.5 * x * (1 + tanh(0.79788456 * (x + 0.044715 * x * x * x)))
 
-def diff_gelu(x):
+# Modified from https://github.com/NVIDIA/Megatron-LM/blob/e33c8f78a35765d5aa37475a144da60e8a2349d1/megatron/core/fusions/fused_bias_gelu.py#L26
+def gelu_bwd(x):
     tanh_out = torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x))
     ff = 0.5 * x * ((1 - tanh_out * tanh_out) * (0.79788456 + 0.1070322243 * x * x)) + 0.5 * (1 + tanh_out)
     return ff
@@ -83,16 +84,16 @@ def ln_fwd(x, gamma, beta, eps=1e-6):
     return y
 
 def ln_fused_l2_bwd(x, l2_target, gamma, beta, eps=1e-6):
-    """
+    """Batch backward for LayerNorm fused with L2 loss
     Args:
-        x: [B*nh,N=1,f]
-        l2_target: [B*nh,N=1,f]
+        x: [B*nh,N,f]
+        l2_target: [B*nh,N,f]
         gamma: [1,nh,1,f]
         beta: [1,nh,1,f]
         eps:
 
     Returns:
-        grad_l_x: [B*nh,N=1,f]
+        grad_l_x: [B*nh,N,f]
     """
     B_nh, N, HF = x.shape
     nh = gamma.shape[1]
@@ -132,11 +133,9 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     Args:
         q, k: [B,nh,N,f]
         cos, sin: [B,N,f]
-        position_ids: [B,N]
-        unsqueeze_dim:
 
     Returns:
-
+        q_embed, k_embed: [B,nh,N,f]
     """
     cos = cos.unsqueeze(1)
     sin = sin.unsqueeze(1)
@@ -145,6 +144,7 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     return q_embed, k_embed
 
 
+# Modified from https://github.com/huggingface/transformers/blob/1082361a1978d30db5c3932d1ee08914d74d9697/src/transformers/models/llama/modeling_llama.py#L94
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_position_embeddings=16, base=10000, device=None, scaling_factor=1.0):
         """
@@ -177,6 +177,7 @@ class RotaryEmbedding(nn.Module):
 
 
 class SwiGLUMLP(nn.Module):
+
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -209,7 +210,7 @@ class ConvModule(nn.Module):
         )
 
     def forward(self, x, is_prefill=False, cache_params=None):
-        B, N, D = x.shape
+        B, N, _ = x.shape
 
         conv_weights = self.conv.weight.view(self.conv.weight.size(0), self.conv.weight.size(2))
 
@@ -516,8 +517,20 @@ class TTTBase(nn.Module):
         return output_hidden_states
 
 
-####### M1 Decode Module #######
+##########################################
+
 def ttt_linear_prefill_mini_batch(states, inputs, i, ttt_norm_weight, ttt_norm_bias, Attn_b):
+    """
+    Args:
+        states: W1_init: [B*nh,f,f], b1_init: [B*nh,1,f]
+        inputs: XQ/XK/XV: [B*nh,bs,f], eta: [B*nh,bs,bs], eta_last: [B*nh,1,bs]
+        ttt_norm_weight: [1,nh,1,f]
+        ttt_norm_bias: [1,nh,1,f]
+        Attn_b: [bs,bs]
+
+    Returns:
+        Z1_bar: [B*nh,bs,f]
+    """
     W1_init = states['W1_init']
     b1_init = states['b1_init']
     XV_mini_batch, XK_mini_batch, XQ_mini_batch, \
@@ -539,6 +552,16 @@ def ttt_linear_prefill_mini_batch(states, inputs, i, ttt_norm_weight, ttt_norm_b
     return Z1_bar
 
 def ttt_linear_decode_last_token_in_mini_batch(states, inputs, ttt_norm_weight, ttt_norm_bias):
+    """
+    Args:
+        states: W1_init/W1_grad: [B*nh,f,f], b1_init/b1_grad: [B*nh,1,f]
+        inputs: XQ/XK/XV: [B*nh,1,f], token_idx: [1,1,1], ttt_lr: [B*nh,1,1]
+        ttt_norm_weight: [1,nh,1,f]
+        ttt_norm_bias: [1,nh,1,f]
+
+    Returns:
+        Z1_bar: [B*nh,1,f]
+    """
     W1 = states['W1_init']  # [B*nh,f,f]
     b1 = states['b1_init']
     W1_grad = states['W1_grad']
@@ -588,13 +611,13 @@ def ttt_linear_decode_last_token_in_mini_batch(states, inputs, ttt_norm_weight, 
 def ttt_linear_decode_token(states, inputs, ttt_norm_weight, ttt_norm_bias):
     """
     Args:
-        states: W: [B*nh,f,f], b: [B*nh,1,f]
-        inputs: X: [B*nh,1,f], token_idx: [1,1,1], ttt_lr: [1024, 1, 1]
+        states: W1_init/W1_grad: [B*nh,f,f], b1_init/b1_grad: [B*nh,1,f]
+        inputs: X: [B*nh,1,f], token_idx: [1,1,1], ttt_lr: [B*nh,1,1]
         ttt_norm_weight: [1,nh,1,f]
         ttt_norm_bias: [1,nh,1,f]
 
     Returns:
-
+        Z1_bar: [B*nh,1,f]
     """
     W1 = states['W1_init']  # [B*nh,f,f]
     b1 = states['b1_init']
@@ -724,8 +747,20 @@ class TTTLinear(TTTBase):
 
 ##########################################
 
-####### M2 Decode Module #######
+##########################################
+
 def ttt_mlp_prefill_mini_batch(states, inputs, i, ttt_norm_weight, ttt_norm_bias, Attn_b):
+    """
+    Args:
+        states: W1: [B*nh,f,4f], b1: [B*nh,1,4f], W2: [B*nh,4f,f], b2: [B*nh,1,f]
+        inputs: XQ/XK/XV: [B*nh,bs,f], eta: [B*nh,bs,bs], eta_last: [B*nh,1,bs]
+        ttt_norm_weight: [1,nh,1,f]
+        ttt_norm_bias: [1,nh,1,f]
+        Attn_b: [bs,bs]
+
+    Returns:
+        Z2_bar: [B*nh,bs,f]
+    """
     W1_init = states['W1_init']
     b1_init = states['b1_init']
     W2_init = states['W2_init']
@@ -740,7 +775,7 @@ def ttt_mlp_prefill_mini_batch(states, inputs, i, ttt_norm_weight, ttt_norm_bias
 
     l2_target = XV_mini_batch - XK_mini_batch
     dl_dZ2 = ln_fused_l2_bwd(Z2, l2_target, ttt_norm_weight, ttt_norm_bias)  # [B*nh,K=1,f]
-    dl_dZ1 = dl_dZ2 @ W2_init.transpose(-1, -2) * diff_gelu(Z1)
+    dl_dZ1 = dl_dZ2 @ W2_init.transpose(-1, -2) * gelu_bwd(Z1)
 
     b1_bar = b1_init - (eta_mini_batch * Attn_b) @ dl_dZ1  # [B*nh,1,4f] - ([B*nh,K,K] * [K,K]) @ [B*nh,K,4f]
     Attn1 = torch.tril(XQ_mini_batch @ XK_mini_batch.transpose(-1, -2))  # [B*nh,K,K]
@@ -759,6 +794,18 @@ def ttt_mlp_prefill_mini_batch(states, inputs, i, ttt_norm_weight, ttt_norm_bias
     return Z2_bar
 
 def ttt_mlp_decode_last_token_in_mini_batch(states, inputs, ttt_norm_weight, ttt_norm_bias):
+    """
+    Args:
+        states:
+            W1_init/W1_grad: [B*nh,f,4f], b1_init/b1_grad: [B*nh,1,4f]
+            W2_init/W2_grad: [B*nh,4f,f], b2_init/b2_grad: [B*nh,1,f]
+        inputs: XQ/XK/XV: [B*nh,1,f], token_idx: [1,1,1], ttt_lr: [B*nh,1,1]
+        ttt_norm_weight: [1,nh,1,f]
+        ttt_norm_bias: [1,nh,1,f]
+
+    Returns:
+        Z2_bar: [B*nh,1,f]
+    """
     W1_init = states['W1_init']
     W1_grad = states['W1_grad']
     b1_init = states['b1_init']
@@ -779,7 +826,7 @@ def ttt_mlp_decode_last_token_in_mini_batch(states, inputs, ttt_norm_weight, ttt
     l2_target = XV_mini_batch - XK_mini_batch
     dl_dZ2 = ln_fused_l2_bwd(Z2, l2_target, ttt_norm_weight, ttt_norm_bias)  # [B*nh,K=1,f]
     ilr_mul_dl_dZ2 = ttt_lr * dl_dZ2
-    dl_dZ1 = dl_dZ2 @ W2_init.transpose(-1, -2) * diff_gelu(Z1)  # [B*nh,K=1,4f]
+    dl_dZ1 = dl_dZ2 @ W2_init.transpose(-1, -2) * gelu_bwd(Z1)  # [B*nh,K=1,4f]
     ilr_mul_dl_dZ1 = ttt_lr * dl_dZ1
 
     W1_grad.add_(XK_mini_batch.transpose(-1, -2) @ ilr_mul_dl_dZ1)  # [B*nh,1,f].t @ [B*nh,1,4f]
@@ -803,6 +850,18 @@ def ttt_mlp_decode_last_token_in_mini_batch(states, inputs, ttt_norm_weight, ttt
     return Z2_bar
 
 def ttt_mlp_decode_token(states, inputs, ttt_norm_weight, ttt_norm_bias):
+    """
+    Args:
+        states:
+            W1_init/W1_grad: [B*nh,f,4f], b1_init/b1_grad: [B*nh,1,4f]
+            W2_init/W2_grad: [B*nh,4f,f], b2_init/b2_grad: [B*nh,1,f]
+        inputs: XQ/XK/XV: [B*nh,1,f], token_idx: [1,1,1], ttt_lr: [B*nh,1,1]
+        ttt_norm_weight: [1,nh,1,f]
+        ttt_norm_bias: [1,nh,1,f]
+
+    Returns:
+        Z2_bar: [B*nh,1,f]
+    """
     W1_init = states['W1_init']
     W1_grad = states['W1_grad']
     b1_init = states['b1_init']
@@ -823,7 +882,7 @@ def ttt_mlp_decode_token(states, inputs, ttt_norm_weight, ttt_norm_bias):
     l2_target = XV_mini_batch - XK_mini_batch
     dl_dZ2 = ln_fused_l2_bwd(Z2, l2_target, ttt_norm_weight, ttt_norm_bias)  # [B*nh,K=1,f]
     ilr_mul_dl_dZ2 = ttt_lr * dl_dZ2
-    dl_dZ1 = dl_dZ2 @ W2_init.transpose(-1, -2) * diff_gelu(Z1)  # [B*nh,K=1,4f]
+    dl_dZ1 = dl_dZ2 @ W2_init.transpose(-1, -2) * gelu_bwd(Z1)  # [B*nh,K=1,4f]
     ilr_mul_dl_dZ1 = ttt_lr * dl_dZ1
 
     W1_grad.add_(XK_mini_batch.transpose(-1, -2) @ ilr_mul_dl_dZ1)  # [B*nh,1,f].t @ [B*nh,1,4f]
@@ -1325,7 +1384,7 @@ class TTTModel(nn.Module, GenerationMixin):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        cache_params: Optional[TTTCache] = None,  # @xinhao: must pass in non-none cache_params from generation.py
+        cache_params: Optional[TTTCache] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         use_cache: Optional[bool] = None,
@@ -1423,9 +1482,11 @@ class TTTForCausalLM(nn.Module, GenerationMixin):
             is_last_in_mini_batch=is_last_in_mini_batch,
         )
 
-        # [BS,N,F] -> [BS,1,F]: only need to classify the last token
         if num_last_tokens > 0:
             hidden_states = outputs.last_hidden_state[:, -num_last_tokens:]
+        else:
+            hidden_states = outputs.last_hidden_state
+
         logits = self.lm_head(hidden_states)
 
         return TTTCausalLMOutput(
