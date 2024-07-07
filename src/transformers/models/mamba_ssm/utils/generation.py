@@ -1,3 +1,8 @@
+'''
+Copied from the official repo of Mamba: https://github.com/state-spaces/mamba/blob/main/mamba_ssm/utils/generation.py,
+but only keep the functions needed for speed benchmarking.
+E.g., sampling methods such as beam search is removed since benchmarking only uses greedy sampling.
+'''
 # Copyright (c) 2023, Albert Gu, Tri Dao.
 import gc
 import pdb

@@ -95,7 +95,10 @@ fn = lambda: model.generate(
     cg=(not args.no_cg),
 )
 
-out = fn()  # capture graph if cg=True, will not be timed
+# Capture graph if cg=True.
+# This is not timed, following Mamba:
+# https://github.com/state-spaces/mamba/blob/8ffd905c91d207f5c0cc84fc2a2fb748655094f0/benchmarks/benchmark_generation_mamba_simple.py#L82
+out = fn()
 logger.info("Succeeded.")
 out_len = len(out.sequences[0])
 in_len = len(input_ids[0])
