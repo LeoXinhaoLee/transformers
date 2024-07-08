@@ -45,19 +45,23 @@ logger.info(f"\n============== Model Name: {args.model_name} ==============")
 config_str = print_args(args)
 logger.info(config_str)
 
-torch.random.manual_seed(0)  # @xinhao: make sure model init is fixed
-
+torch.random.manual_seed(0)
 repeats = 1
 device = "cuda"
-dtype = torch.float16  # @xinhao: follow mamba benchmark
+dtype = torch.float16
 logger.info("dtype: " + str(dtype))
 
 in_len = args.promptlen
 out_len = args.promptlen + args.genlen
 
-sampling_params = SamplingParams(top_p=1.0, ignore_eos=True, max_tokens=args.genlen, min_tokens=args.genlen)  # @xinhao: max_tokens should not include prompt length
+sampling_params = SamplingParams(
+    top_p=1.0,
+    ignore_eos=True,
+    max_tokens=args.genlen,
+    min_tokens=args.genlen
+)  # @xinhao: max_tokens should not include prompt length
 llm = LLM(model=args.model_name, skip_tokenizer_init=True)
-prompts = [torch.randint(low=10, high=100, size=(args.promptlen,)).tolist() for _ in range(args.batch)]
+prompts = [torch.randint(low=10, high=32000, size=(args.promptlen,)).tolist() for _ in range(args.batch)]
 
 outputs = llm.generate(prompt_token_ids=prompts, sampling_params=sampling_params)
 del outputs
@@ -73,6 +77,6 @@ avg_time = (time.time() - start) / repeats
 logger.info(f"Mode: {args.mode}")
 logger.info(f"Prompt length: {in_len}, generation length: {out_len - in_len}")
 logger.info(f"{args.model_name} prompt processing + decoding time: {avg_time * 1000:.0f}ms")
-logger.info(f"Throughput (total tok = prefill + decode): {args.batch * out_len / avg_time:.3f} tokens / s")
+logger.info(f"Throughput (total tok = prefill): {args.batch * in_len / avg_time:.3f} tokens / s")
 logger.info(f"Throughput (total tok = decode): {args.batch * (out_len - in_len) / avg_time:.3f} tokens / s")
 logger.info("==================================")
